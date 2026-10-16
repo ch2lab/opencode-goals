@@ -4,6 +4,10 @@ OpenCode v2 目标循环插件：给模型一个"设定目标 → 自主执行 �
 
 An OpenCode v2 goal-loop plugin: gives the model a "set goal → work autonomously → evidence-gated completion" loop, built for unattended long-running tasks.
 
+源码仓库（MIT 协议）：[github.com/ch2lab/opencode-goals](https://github.com/ch2lab/opencode-goals) · 问题与反馈走 [GitHub Issues](https://github.com/ch2lab/opencode-goals/issues)
+
+Source (MIT): [github.com/ch2lab/opencode-goals](https://github.com/ch2lab/opencode-goals) · Feedback via [GitHub Issues](https://github.com/ch2lab/opencode-goals/issues)
+
 ## 它解决什么问题 · What It Solves
 
 无人值守的长任务（跨夜重构、迁移、"改到测试全绿为止"）有三种典型失败：
@@ -64,9 +68,13 @@ The host hot-reloads the plugin when the config changes (verified on 2.0.29+; re
 > 入口是剥离 wrapper 的零 import 变体（活宿主验证过的形态），对 `@opencode/plugin` 宿主版本漂移免疫。
 > The entry is a wrapper-stripped, zero-import variant (the host-verified form), immune to `@opencode/plugin` version drift.
 
-本地源码目录（开发/自测，入口 `index.ts` 可直接加载、无需构建；`@opencode/plugin` 需 pin 到宿主版本作类型依赖：`bun add -d @opencode/plugin@2.0.29`）：
+本地源码目录（开发/自测）：克隆源码仓库，入口 `index.ts` 可直接加载、无需构建（`@opencode/plugin` 需 pin 到宿主版本作类型依赖：`bun add -d @opencode/plugin@2.0.29`）：
 
-Local source directory (for development; `index.ts` loads directly, no build needed; `@opencode/plugin` pinned to the host version as a type-only dev dependency: `bun add -d @opencode/plugin@2.0.29`):
+Local source directory (for development): clone the source repo; `index.ts` loads directly, no build needed (`@opencode/plugin` pinned to the host version as a type-only dev dependency: `bun add -d @opencode/plugin@2.0.29`):
+
+```bash
+git clone https://github.com/ch2lab/opencode-goals
+```
 
 ```jsonc
 {
