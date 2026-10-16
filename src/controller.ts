@@ -1,0 +1,2326 @@
+// Goal lifecycle controller (Task 7 + Task 8 + Task 10 + Task 11): command + tool
+// surface, storage discipline, snapshot, the boundary arbiter + wake loop
+// (spec §6 arbitration sequence, §11 budget, §15-9 blocked resume) AND the
+// shell-wait watchdog (spec §7.1: per-goal tick, three-way decision per
+// shell, check-in dual signal, fast path, restart reconciliation).
+// Composes the tested pure modules (state / options / evidence / judge /
+// wake) over the WakeProbe host surface — none of their logic is
+// reimplemented here.
+//
+// Fault-tolerance discipline (Task 7 + Task 8 briefs):
+// - every command/tool handler converts ALL failures into synthetic / text
+//   feedback and never throws into the host;
+// - storage writes, archiving, and synthetic delivery are best-effort:
+//   failures are logged and swallowed (the event loop must never break);
+// - every event is processed behind its own try/catch: a single event
+//   failure is logged and the loop continues.
+//
+// Task 9: at the stall threshold the ONLY non-mechanical step is the
+// deps.judge call; its verdict is disposed inline (continue / complete /
+// needs_human / give_up) — see disposeVerdict + stallGoal (spec §8).
+import {
+  GOAL_TASK_LIMIT,
+  TaskLimitError,
+  addTask,
+  archivedGoalKey,
+  createGoal,
+  goalStorageKey,
+  isCapReached,
+  isTerminal,
+  resolveTaskRef,
+  type GoalRecord,
+  type GoalStatus,
+  type GoalTaskStatus,
+} from "./state";
+import type { Options } from "./options";
+import {
+  CLEAR_KEYWORD_RE,
+  MIN_CLEAR_REQUEST_LENGTH,
+  validateClearRequest,
+  validateEvidence,
+  type TranscriptMessage,
+} from "./evidence";
+import type { Judge, JudgeVerdict } from "./judge";
+import { buildWakeMessage } from "./wake";
+import { buildCompactionPrompt, composeCompactionSummary, goalSystemPart } from "./compact";
+import { decidePermission, GOAL_CONTROL_ACTION } from "./permission";
+import type { HostEvent, PermissionDecision, PermissionHookInput, SessionMessage, WakeProbe } from "./types";
+
+export interface ShellProbe {
+  list(): Promise<Array<{ id: string; state: "running" | "exited"; exitCode?: number; outputTail?: string }>>;
+}
+
+export interface ControllerDeps {
+  judge?: Judge;
+  shellProbe?: ShellProbe;
+  tickMs?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Task 10 (I2): RpcShellProbe — ShellProbe over the host RPC channel
+// ---------------------------------------------------------------------------
+
+/**
+ * RPC method name for the shell fact query (shell records + output tails).
+ * Confirmed on 2.0.29 in Task 13 (live smoke + static discovery):
+ * @opencode/protocol@2.0.29 dist/groups/shell.js —
+ * HttpApiEndpoint.get("shell.list", "/api/shell"), group "server.shell"
+ * (REST reply: { location, data: Shell.Info[] }, status ∈
+ * running|exited|timeout|killed, exit=number; output via the separate
+ * "shell.output" endpoint). test/watchdog.test.ts asserts the constant
+ * equals the discovered identifier (regression guard).
+ * Live-probe caveat (2.0.29): the plugin RPC bridge only dispatches
+ * plugin-registered methods — core host methods (server.shell/…) are
+ * NOT reachable through it (400 "RPC is unavailable"). So on this host
+ * version the shell-facts channel degrades to "facts unavailable"
+ * (fail-safe: no "lost" classification, watchdog keeps re-arming); see
+ * README "已知限制" and .superpowers/sdd/2026-10-15-opencode-goal/task-13-report.md.
+ */
+export const SHELL_LIST_RPC_METHOD = "shell.list";
+
+/**
+ * Thrown by RpcShellProbe when shell facts CANNOT be trusted: the RPC failed
+ * OR the reply is not the expected array shape. Callers must treat this as
+ * "no facts" (fail-safe: no state change, no "lost" classification) — it
+ * must NEVER be read as "no shells" (that would fabricate facts in the
+ * opposite direction, review finding C1).
+ */
+export class ShellFactsUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ShellFactsUnavailableError";
+  }
+}
+
+export type ShellFact = { id: string; state: "running" | "exited"; exitCode?: number; outputTail?: string };
+
+/**
+ * ShellProbe over `probe.rpcCall`: list() asks the host for the live shell
+ * records. Reply parsing is DEFENSIVE — a bad/missing shape throws
+ * ShellFactsUnavailableError (facts missing), it never returns a guessed or
+ * empty list (an empty list IS a fact: "no shells", and fabricating it from a
+ * malformed reply would turn every waiting shell into a false "lost").
+ * index.ts wires this as the production shellProbe (the only host-touching
+ * file keeps being index.ts — this class only sees the narrow probe surface).
+ */
+export class RpcShellProbe implements ShellProbe {
+  constructor(private readonly rpc: { rpcCall(method: string, input: unknown): Promise<unknown> }) {}
+
+  async list(): Promise<ShellFact[]> {
+    let raw: unknown;
+    try {
+      raw = await this.rpc.rpcCall(SHELL_LIST_RPC_METHOD, {});
+    } catch (err) {
+      throw new ShellFactsUnavailableError(
+        `shell facts RPC (${SHELL_LIST_RPC_METHOD}) failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return parseShellFacts(raw);
+  }
+}
+
+/**
+ * Defensive reply parse: Array<{ id: string, state: "running"|"exited",
+ * exitCode?: number, outputTail?: string }>. ANY malformed shape (non-array,
+ * entry without string id, entry with unknown state) → throw
+ * ShellFactsUnavailableError (facts missing, not "no shells").
+ * TODO(task13): the placeholder shape is what the live smoke will confirm.
+ */
+function parseShellFacts(raw: unknown): ShellFact[] {
+  if (!Array.isArray(raw)) throw new ShellFactsUnavailableError("shell facts reply is not an array");
+  const out: ShellFact[] = [];
+  for (const item of raw) {
+    if (!isPlainObject(item) || typeof item.id !== "string" || item.id === "") {
+      throw new ShellFactsUnavailableError("malformed shell fact entry (missing id)");
+    }
+    const state = item.state;
+    if (state !== "running" && state !== "exited") {
+      throw new ShellFactsUnavailableError(`malformed shell fact state: ${String(state)}`);
+    }
+    const fact: ShellFact = { id: item.id, state };
+    if (typeof item.exitCode === "number") fact.exitCode = item.exitCode;
+    if (typeof item.outputTail === "string") fact.outputTail = item.outputTail;
+    out.push(fact);
+  }
+  return out;
+}
+
+const TASK_STATUSES: readonly GoalTaskStatus[] = ["todo", "doing", "done"];
+
+const USAGE =
+  "usage: /goal set <objective> [--turns N] [--tokens N] [--unbounded] | /goal view | /goal pause | " +
+  "/goal resume | /goal complete <evidence> | /goal block <reason> | /goal clear | " +
+  "/goal task add <title> | /goal task <n> <todo|doing|done> | /goal history";
+
+/** All 8 goal_* tools are gated by the goal.control permission (Task 3). */
+const GOAL_PERMISSION = GOAL_CONTROL_ACTION;
+
+/** In-memory dedup cap for processed eventIDs (brief: "上限如 1000"). */
+const HANDLED_ID_LIMIT = 1000;
+
+/**
+ * "Last enqueued inbox item" attribution (spec §6-⑤). Sources:
+ * - `session.inbox.enqueued` events (item type read from properties —
+ *   schema/dist/session-event.d.ts InboxEnqueued.data = { item, inboxID,
+ *   sessionID });
+ * - this plugin's own wake injections (InboxRef.id from probe.prompt —
+ *   verified lastInbox mode in the reference project);
+ * - this plugin's own goalControl synthetics (self-recorded, because the
+ *   harness emits no enqueued events for probe.synthetic — controller
+ *   ruling fallback; in the real host the enqueued echo lands the same way).
+ */
+type LastInboxEntry =
+  // watchdog?: true marks OUR watchdog wakes (check-in / shell exit / lost —
+  // Task 10). The boundary fast path (spec §7.1: a pure-text check-in reply
+  // counts per the stall ladder) keeps normal arbitration exactly for these.
+  | { id: string; kind: "wake"; goalID: string; watchdog?: true }
+  | { id: string; kind: "user" }
+  | { id: string; kind: "control" }
+  // compaction / move / unmarked synthetic / untracked — pinned in
+  // test/arbiter.test.ts as counting toward the stall ladder.
+  | { id: string; kind: "other" };
+
+function isPlainObject(input: unknown): input is Record<string, unknown> {
+  return typeof input === "object" && input !== null && !Array.isArray(input);
+}
+
+/**
+ * stallReport (Task 9): the objective verbatim, the todo snapshot
+ * (`N. [status] title` per task — same line shape as the wake message),
+ * the last ≤3 no-action texts verbatim, and the judge's reason (or a note
+ * on why the judge did not rule).
+ */
+function buildStallReport(goal: GoalRecord, noActionTexts: string[], judgeReason: string): string {
+  const tasks =
+    goal.tasks.length === 0
+      ? "  （无待办）"
+      : goal.tasks.map((t, i) => `  ${i + 1}. [${t.status}] ${t.title}`).join("\n");
+  const tails =
+    noActionTexts.length === 0
+      ? "  （无）"
+      : noActionTexts.map((t) => `  - ${t}`).join("\n");
+  return [
+    `[STALL REPORT goal ${goal.id}]`,
+    `目标: ${goal.objective}`,
+    "待办快照:",
+    tasks,
+    "最后无动作文本:",
+    tails,
+    `裁判: ${judgeReason}`,
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Task 10: watchdog text builders + shell-event payload normalization
+// ---------------------------------------------------------------------------
+
+/**
+ * ShellInfo from either shell event family (schema-verified, 2.0.29):
+ * - `session.shell.started` / `session.shell.ended` (durable, session-scoped —
+ *   the mechanically attributable family): data = { shell: ShellInfo,
+ *   sessionID }, and `output: { output, cursor, size, truncated }` on ended
+ *   (schema/dist/session-event.d.ts Shell.Started/Ended).
+ * - `shell.created`: data = { info: ShellInfo }; `shell.exited`:
+ *   data = { id, exit?, status } (schema/dist/shell.d.ts — EPHEMERAL, no
+ *   sessionID in 2.0.29 → they never pass the session gate above; handled for
+ *   a future host that adds attribution. TODO(task13) live-smoke).
+ * ShellInfo.status ∈ "running" | "exited" | "timeout" | "killed" (Shell.Status
+ * — there is no "completed" value; "exited" is the plain exit).
+ */
+function shellInfoFrom(props: Record<string, unknown>): {
+  id: string;
+  status?: string;
+  command?: string;
+  cwd?: string;
+  exit?: number;
+} | undefined {
+  const src = (isPlainObject(props.shell) ? props.shell : isPlainObject(props.info) ? props.info : undefined) as
+    | Record<string, unknown>
+    | undefined;
+  if (src !== undefined) {
+    const id = typeof src.id === "string" ? src.id : undefined;
+    if (id === undefined) return undefined;
+    return {
+      id,
+      status: typeof src.status === "string" ? src.status : undefined,
+      command: typeof src.command === "string" ? src.command : undefined,
+      cwd: typeof src.cwd === "string" ? src.cwd : undefined,
+      exit: typeof src.exit === "number" ? src.exit : undefined,
+    };
+  }
+  // shell.exited shape: data = { id, exit?, status } (schema/dist/shell.d.ts)
+  const id = typeof props.id === "string" ? props.id : undefined;
+  if (id === undefined) return undefined;
+  return {
+    id,
+    status: typeof props.status === "string" ? props.status : undefined,
+    exit: typeof props.exit === "number" ? props.exit : undefined,
+  };
+}
+
+/** Result wake (fast path / event-lost self-heal / reconcile): status wording. */
+function shellExitText(shellID: string, status: "exited" | "timeout" | "killed", exitCode?: number, tail?: string): string {
+  const head =
+    status === "timeout"
+      ? `你等待的脚本 ${shellID} 已超时 (timeout, 被宿主超时终止)`
+      : status === "killed"
+        ? `你等待的脚本 ${shellID} 已被杀 (killed, 被外部终止)`
+        : `你等待的脚本 ${shellID} 已退出 (exit${exitCode !== undefined ? `, 退出码 ${exitCode}` : ""})`;
+  return `${head}——最新输出尾部:\n${tail ?? "(无)"}\n决定下一步,用工具调用结束本轮。`;
+}
+
+/** Check-in ("状态核查") wake: reason wording 疑似卡死 / 等待已久需确认推进 + tail. */
+function shellCheckInText(
+  goal: GoalRecord,
+  shellID: string,
+  reason: "stall" | "long",
+  ms: number,
+  tail?: string,
+): string {
+  const why =
+    reason === "stall"
+      ? `你等待的脚本 ${shellID} 已 ${ms}ms 零增长,疑似卡死`
+      : `你等待的脚本 ${shellID} 有增长但已等待 ${ms}ms,等待已久需确认推进`;
+  return (
+    `[SHELL CHECK-IN goal ${goal.id}] ${why}——最新输出尾部:\n${tail ?? "(无)"}\n` +
+    "判断它是否在实质推进:是 → goal_wait(N) 显式声明继续等 / 用工具核对并给出依据;否 → 杀掉换路或 goal_block。"
+  );
+}
+
+/** Restart-reconcile lost-script wake (spec §7.1 step 3). */
+function shellLostText(ids: string[]): string {
+  return (
+    `宿主已重启,你等待的脚本 ${ids.join(", ")} 已随重启丢失/取消 (lost/cancelled, 见会话中的取消通知)——` +
+    "决定下一步(重跑/改路/放弃),用工具调用结束本轮。"
+  );
+}
+
+export class GoalController {
+  // deps.judge feeds the stall ladder (Task 9); deps.shellProbe + deps.tickMs
+  // drive the Task 10 watchdog (shell fact-checking + tick period).
+  constructor(
+    private readonly probe: WakeProbe,
+    private readonly options: Options,
+    private readonly deps: ControllerDeps = {},
+  ) {}
+
+  // ------------------------------------------------------------------
+  // Task 8: boundary arbiter + wake loop (spec §6 / §11 / §15-9)
+  // ------------------------------------------------------------------
+
+  /**
+   * Per-session turn bookkeeping (in-memory, per controller instance —
+   * controller ruling: goal state-machine facts (stalls / turns /
+   * lastHandledEventID) live in storage, these runtime flags do not).
+   * `session.execution.started` → active=true, toolCalled=false,
+   * continuationPending cleared; `session.tool.called` → toolCalled=true;
+   * a consumed terminal boundary → active=false (toolCalled kept for the
+   * next attribution, overwritten by the next started).
+   */
+  private turns = new Map<string, { active: boolean; toolCalled: boolean }>();
+  /** continuationPending window: set at wake injection, cleared by execution.started. */
+  private contPending = new Map<string, boolean>();
+  /**
+   * First boundary skipped INSIDE the current pending window, per session
+   * ("" when the skipped boundary had no id). Bounded-fallback bookkeeping:
+   * the window may skip at most ONE boundary before a second DISTINCT
+   * boundary closes it (controller ruling I1).
+   */
+  private pendingSkipped = new Map<string, string>();
+  /** "Last enqueued inbox item" per session (spec §6-⑤) — attribution source. */
+  private lastInbox = new Map<string, LastInboxEntry>();
+  /** Latest wake inbox per session: reclassifies the host's enqueued echo of OUR prompt. */
+  private wakeInbox = new Map<string, { inboxID: string; goalID: string; watchdog?: boolean }>();
+  /** Blocked-resume dedup: inboxIDs already resumed (bounded). */
+  private resumeInbox = new Set<string>();
+  /** Processed eventIDs (in-memory dedup, bounded at HANDLED_ID_LIMIT). */
+  private handledIDs = new Set<string>();
+  private handledOrder: string[] = [];
+  /**
+   * Judge instruction channel (Task 9): a `continue` verdict's optional
+   * `instruction` is parked here per session and rides into the NEXT wake as
+   * the judge paragraph of buildWakeMessage. Cleared on every terminal
+   * transition (finishGoal / budget_limited) and when a new goal starts
+   * (setGoal). In-memory by design: a restart loses it (acceptable).
+   */
+  private judgeInstruction = new Map<string, string>();
+  private loopIter: AsyncIterator<HostEvent> | undefined;
+  private loopPromise: Promise<void> | undefined;
+  private stopped = false;
+
+  // ------------------------------------------------------------------
+  // Task 10: watchdog (spec §7.1) — per-goal tick timers + per-shell
+  // in-memory watch state (tail / lastTailAt / checkedIn live ONLY here,
+  // never in storage; waitingShells itself is the persisted fact anchor).
+  // ------------------------------------------------------------------
+
+  /** One tick timer per armed goal (sessionID key — one active goal per session). */
+  private wdTimers = new Map<string, ReturnType<typeof setInterval>>();
+  /** Per-goal in-flight tick guard (a tick never overlaps itself). */
+  private wdBusy = new Set<string>();
+  /**
+   * Per-shell watch state (in-memory): `tail`/`lastTailAt` track output growth;
+   * `checkedIn` = this stall segment already got its one check-in (no loop
+   * self-rotation). Cleared on shell exit / terminal goal / cleanup.
+   */
+  private shellWatch = new Map<
+    string,
+    { tail: string | undefined; lastTailAt: number; checkedIn: boolean; changed: boolean }
+  >();
+  /**
+   * (command, cwd) → host timeout (ms) captured on create.before (timeout > 0
+   * only; timeout 0 = no timeout → not recorded). Correlated onto shell
+   * events by command+cwd; correlation failure = no timeout (conservative:
+   * earlier check-in — direction safe). Bounded FIFO at 200 entries.
+   */
+  private shellTimeouts = new Map<string, number>();
+  private shellTimeoutOrder: string[] = [];
+  /**
+   * Shell ids whose exit wake is already delivered / in flight (event path
+   * or tick path) — closes the race where a tick whose probe snapshot is a
+   * moment stale would synthesize a second exit wake. Bounded FIFO at 500.
+   */
+  private exitNotified = new Set<string>();
+  private exitNotifiedOrder: string[] = [];
+
+  /**
+   * Registers the /goal command and the 8 goal_* tools on the probe and
+   * returns the cleanup function (awaited by the plugin entry on dispose).
+   */
+  async start(): Promise<() => Promise<void>> {
+    this.probe.registerCommand("goal", (text, sessionID) => this.handleCommand(sessionID, text));
+
+    this.probe.registerTool(
+      "goal_set",
+      {
+        description:
+          "Use only when the user explicitly asks you to set a goal. Start a new goal " +
+          "(objective required; optional turns/tokens cap, unbounded for no cap). " +
+          "Gating: goal.control permission; refused while a goal is still non-terminal — the old " +
+          "goal is left untouched (complete, block or clear it first, then set again).",
+        input: {
+          type: "object",
+          properties: {
+            objective: { type: "string" },
+            turns: { type: "number" },
+            tokens: { type: "number" },
+            unbounded: { type: "boolean" },
+          },
+          required: ["objective"],
+        },
+        permission: GOAL_PERMISSION,
+      },
+      (input, sessionID) => this.guarded("goal_set", () => this.toolSet(sessionID, input)),
+    );
+    this.probe.registerTool(
+      "goal_complete",
+      {
+        description:
+          "Terminal: mark the ACTIVE goal completed with concrete, checkable evidence " +
+          "(\u226524 chars, anchored, grounded in the transcript). Gating: goal.control permission; " +
+          "refused when no goal is active.",
+        input: {
+          type: "object",
+          properties: { evidence: { type: "string" } },
+          required: ["evidence"],
+        },
+        permission: GOAL_PERMISSION,
+      },
+      (input, sessionID) => this.guarded("goal_complete", () => this.toolComplete(sessionID, input)),
+    );
+    this.probe.registerTool(
+      "goal_block",
+      {
+        description:
+          "Terminal: mark the ACTIVE goal blocked with a concrete reason. " +
+          "Gating: goal.control permission; refused when no goal is active or the reason is missing.",
+        input: {
+          type: "object",
+          properties: { reason: { type: "string" } },
+          required: ["reason"],
+        },
+        permission: GOAL_PERMISSION,
+      },
+      (input, sessionID) => this.guarded("goal_block", () => this.toolBlock(sessionID, input)),
+    );
+    this.probe.registerTool(
+      "goal_clear",
+      {
+        description:
+          "Terminal: clear the ACTIVE goal. The request must quote the user's own words " +
+          "(grounded in non-assistant transcript messages; fail-closed). " +
+          "Gating: goal.control permission; refused when no goal is active.",
+        input: {
+          type: "object",
+          properties: { request: { type: "string" } },
+          required: ["request"],
+        },
+        permission: GOAL_PERMISSION,
+      },
+      (input, sessionID) => this.guarded("goal_clear", () => this.toolClear(sessionID, input)),
+    );
+    this.probe.registerTool(
+      "goal_history",
+      {
+        description:
+          "Read-only: list the archived goals of this session. Gating: goal.control permission; no goal required.",
+        input: { type: "object", properties: {} },
+        permission: GOAL_PERMISSION,
+      },
+      (input, sessionID) => this.guarded("goal_history", () => this.toolHistory(sessionID, input)),
+    );
+    this.probe.registerTool(
+      "goal_add_task",
+      {
+        description:
+          `Add a todo task (title required; at most ${GOAL_TASK_LIMIT} tasks per goal). ` +
+          "Gating: goal.control permission; requires a non-terminal goal.",
+        input: {
+          type: "object",
+          properties: { title: { type: "string" } },
+          required: ["title"],
+        },
+        permission: GOAL_PERMISSION,
+      },
+      (input, sessionID) => this.guarded("goal_add_task", () => this.toolAddTask(sessionID, input)),
+    );
+    this.probe.registerTool(
+      "goal_update_task",
+      {
+        description:
+          "Set a task's status (todo|doing|done); ref is the 1-based index or the task id. " +
+          "Gating: goal.control permission; requires a non-terminal goal with tasks.",
+        input: {
+          type: "object",
+          properties: {
+            ref: { type: ["string", "number"] },
+            status: { type: "string" },
+          },
+          required: ["ref", "status"],
+        },
+        permission: GOAL_PERMISSION,
+      },
+      (input, sessionID) => this.guarded("goal_update_task", () => this.toolUpdateTask(sessionID, input)),
+    );
+    this.probe.registerTool(
+      "goal_wait",
+      {
+        description:
+          "Suspend wake-ups for N minutes (integer 1..60) while waiting on something. " +
+          "Gating: goal.control permission; requires an ACTIVE goal.",
+        input: {
+          type: "object",
+          properties: { minutes: { type: "number" } },
+          required: ["minutes"],
+        },
+        permission: GOAL_PERMISSION,
+      },
+      (input, sessionID) => this.guarded("goal_wait", () => this.toolWait(sessionID, input)),
+    );
+
+    // Task 10: shell timeout correlation — the host hands { command, cwd,
+    // timeout } to create.before BEFORE spawn (timeout 0 = no timeout; payload
+    // is mutable — spec §7.1 timeout awareness). Task 14 Fix 3b (timeoutWrap,
+    // spec §15 决定 7): when the host gives NO timeout (timeout === 0) and this
+    // instance holds an ACTIVE goal, rewrite input.timeout to options.shellStallMs
+    // in place (the payload is mutable) — a stalled spawn then gets reaped
+    // (and the check-in threshold raised) like any host-timeout shell.
+    // Simplified ruling (controller): "this instance has ANY active goal"
+    // (activeGoalSessions, synced in loadGoal/saveGoal) — no per-shell session
+    // attribution; the multi-session false-positive cost is only an extra
+    // timeout granted by the host (direction-safe).
+    this.probe.onShellCreateBefore((input) => {
+      if (this.options.timeoutWrap && input.timeout === 0 && this.activeGoalSessions.size > 0) {
+        input.timeout = this.options.shellStallMs;
+      }
+      this.rememberShellTimeout(input.command, input.cwd, input.timeout);
+    });
+
+    // Task 11: compaction-proof goal state (spec §10 defense lines 2 + 3).
+    // context hook — before EVERY model call, re-ground the active goal as a
+    // system part (objectiveBlock contract). compaction hook — take over the
+    // compaction summary: SessionCompaction.result is a WHOLE REPLACEMENT that
+    // skips the host model request (session.d.ts), so the summary carries the
+    // conversation history (probe.generate) + a mandatory trailing
+    // [GOAL STATE] block. Both callbacks return their async work (narrow
+    // `=> void` registration signature is assignable; tests await it) and
+    // neither ever throws (fault-tolerance discipline).
+    this.probe.onSessionHook("context", (sessionID, payload) => this.contextHook(sessionID, payload));
+    this.probe.onSessionHook("compaction", (sessionID, payload) => this.compactionHook(sessionID, payload));
+
+    // Task 12: permission sandbox — the goal.control self-grant + path
+    // containment, expressed on the host permission surface (R9 contract).
+    this.probe.onPermissionHook((input) => this.permissionHook(input));
+
+    // Task 10: restart reconciliation (spec §7.1) — rebuild watchdog state from
+    // persisted facts for every active goal BEFORE the event loop starts.
+    // One-shot: it runs once per start(), never loops.
+    await this.reconcile();
+
+    // Task 8: single event loop (boundary arbiter + wake loop) over
+    // probe.eventSubscribe() — spec §6 arbitration, §11 budget,
+    // §15-9 blocked resume. One consumer per controller instance.
+    this.stopped = false;
+    this.loopIter = this.probe.eventSubscribe()[Symbol.asyncIterator]();
+    this.loopPromise = this.runLoop(this.loopIter);
+    return async () => {
+      this.stopped = true;
+      // Task 10: cleanup stops EVERYTHING — all per-goal watchdog timers,
+      // watch state and pending tick work (test/watchdog.test.ts #10).
+      for (const timer of this.wdTimers.values()) clearInterval(timer);
+      this.wdTimers.clear();
+      this.wdBusy.clear();
+      this.shellWatch.clear();
+      this.exitNotified.clear();
+      this.exitNotifiedOrder.length = 0;
+      const iter = this.loopIter;
+      this.loopIter = undefined;
+      try {
+        await iter?.return?.();
+      } catch {
+        // stream already closed
+      }
+      const p = this.loopPromise;
+      this.loopPromise = undefined;
+      try {
+        await p;
+      } catch {
+        // runLoop swallows per-event failures (fault-tolerance discipline)
+      }
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // Task 8 + 9: event loop + arbitration (mechanical checks only; the judge
+  // call is the sole exception, with inline verdict disposition — Task 9)
+  // ------------------------------------------------------------------
+
+  private async runLoop(iter: AsyncIterator<HostEvent>): Promise<void> {
+    for (;;) {
+      let result: IteratorResult<HostEvent>;
+      try {
+        result = await iter.next();
+      } catch (err) {
+        console.warn("opencode-goal: event stream errored, stopping wake loop:", err);
+        return;
+      }
+      if (result.done || this.stopped) return;
+      try {
+        await this.handleEvent(result.value);
+      } catch (err) {
+        // Fault-tolerance discipline: a single event failure never breaks the loop.
+        console.warn(
+          `opencode-goal: failed to handle event ${result.value.type} (${result.value.id ?? "no id"}):`,
+          err,
+        );
+      }
+    }
+  }
+
+  private async handleEvent(event: HostEvent): Promise<void> {
+    const sessionID = event.properties?.sessionID;
+    if (typeof sessionID !== "string" || sessionID === "") return; // 无归属：无 sessionID
+    if (!(await this.sessionBelongs(sessionID))) return; // 无归属：非本实例 project
+    switch (event.type) {
+      case "session.execution.started":
+        await this.onExecutionStarted(sessionID);
+        return;
+      case "session.tool.called":
+        await this.onToolCalled(sessionID);
+        return;
+      case "session.usage.updated":
+        await this.onUsageUpdated(sessionID, event.properties);
+        return;
+      case "session.inbox.enqueued":
+        await this.onInboxEnqueued(sessionID, event.properties);
+        return;
+      case "session.execution.succeeded":
+      case "session.execution.failed":
+      case "session.idle":
+        // session.idle is a valid terminal boundary (brief ruling): the
+        // payload carries sessionID (schema/dist/event-manifest.d.ts:
+        // session.idle data = { sessionID }, ephemeral) — not unreliable.
+        await this.arbitrateBoundary(sessionID, event);
+        return;
+      case "session.execution.interrupted":
+        await this.onInterrupted(sessionID, event);
+        return;
+      case "session.shell.started":
+        // Task 10 watchdog: arm — the durable, session-scoped family carries
+        // sessionID + full ShellInfo (schema/dist/session-event.d.ts).
+        await this.onShellStarted(sessionID, event.properties);
+        return;
+      case "session.shell.ended":
+        // Task 10 watchdog fast path: status ∈ running|exited|timeout|killed
+        // (+ data.output tail) — a normal wake carrying the exit wording.
+        await this.onShellEnded(sessionID, event.properties);
+        return;
+      case "shell.created":
+        // TODO(task13): the ephemeral family (data = { info }, no sessionID in
+        // 2.0.29 — schema/dist/shell.d.ts) never passes the session gate above;
+        // handled here for a future host that adds session attribution.
+        await this.onShellStarted(sessionID, event.properties);
+        return;
+      case "shell.exited":
+        // TODO(task13): same as shell.created — data = { id, exit?, status }.
+        await this.onShellEnded(sessionID, event.properties);
+        return;
+      default:
+        // session.compaction.* (Task 11), session.inbox.delivered — not
+        // consumed by this task.
+        return;
+    }
+  }
+
+  /** "非本实例 project" check: when the plugin knows its projectID, only
+   *  sessions of that project are attributed (best-effort, fail-closed). */
+  private async sessionBelongs(sessionID: string): Promise<boolean> {
+    const pid = this.probe.projectID;
+    if (pid === undefined) return true;
+    try {
+      const info = await this.probe.sessionGet(sessionID);
+      return info?.projectID === pid;
+    } catch {
+      return false;
+    }
+  }
+
+  private async onExecutionStarted(sessionID: string): Promise<void> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined || goal.status !== "active") return;
+    let t = this.turns.get(sessionID);
+    if (t === undefined) {
+      t = { active: false, toolCalled: false };
+      this.turns.set(sessionID, t);
+    }
+    t.active = true;
+    t.toolCalled = false;
+    this.contPending.delete(sessionID); // 唤醒已落地 → 关闭 continuationPending 窗口
+    this.pendingSkipped.delete(sessionID);
+    // Task 10: the session went active (spec §7.1 cancel ②) — stop the
+    // watchdog's tick for the whole goal (止表). The per-shell watch state
+    // (checkedIn / tail / since) SURVIVES: a re-arm at the next idle boundary
+    // resumes with the same stall segment (no double check-in).
+    this.disarmWatchdog(sessionID);
+  }
+
+  private async onToolCalled(sessionID: string): Promise<void> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined || goal.status !== "active") return;
+    const t = this.turns.get(sessionID);
+    if (t !== undefined && t.active) t.toolCalled = true;
+    // Task 10: a model action (tool.called) ends the current stall segment —
+    // fresh countdown from here (checkedIn reset, since re-anchored and
+    // persisted as the restart-reconcile fact). No action → segment persists.
+    const waiting = goal.waitingShells;
+    if (waiting !== undefined && waiting.length > 0) {
+      const now = Date.now();
+      for (const w of waiting) {
+        w.since = now;
+        const st = this.shellWatch.get(w.id);
+        if (st !== undefined) {
+          st.checkedIn = false;
+          st.tail = undefined;
+          st.lastTailAt = now;
+          st.changed = false;
+        }
+      }
+      await this.saveGoal(goal);
+    }
+  }
+
+  /** spec §11: used.tokens = the CUMULATIVE value from the event (direct
+   *  assignment, never accumulated). .d.ts (session-event.d.ts UsageUpdated):
+   *  data.tokens = { input, output, reasoning, cache: { read, write } } —
+   *  the total sums all five fields (token-usage.d.ts `total` semantics). */
+  private async onUsageUpdated(sessionID: string, props: Record<string, unknown>): Promise<void> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined || isTerminal(goal.status)) return;
+    const tokens = props.tokens;
+    if (typeof tokens !== "object" || tokens === null || Array.isArray(tokens)) return;
+    const t = tokens as Record<string, unknown>;
+    const cache = (typeof t.cache === "object" && t.cache !== null && !Array.isArray(t.cache)
+      ? t.cache
+      : {}) as Record<string, unknown>;
+    const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+    const total = num(t.input) + num(t.output) + num(t.reasoning) + num(cache.read) + num(cache.write);
+    goal.used.tokens = total;
+    await this.saveGoal(goal);
+  }
+
+  private async onInboxEnqueued(sessionID: string, props: Record<string, unknown>): Promise<void> {
+    // .d.ts (session-event.d.ts InboxEnqueued): data = { item: { type,
+    // payload, delivery }, inboxID, sessionID }.
+    const inboxID = typeof props.inboxID === "string" ? props.inboxID : undefined;
+    const item = props.item as Record<string, unknown> | undefined;
+    if (inboxID === undefined || typeof item !== "object" || item === null || Array.isArray(item)) return;
+    const itemType = typeof item.type === "string" ? item.type : undefined;
+    const payload = (typeof item.payload === "object" && item.payload !== null && !Array.isArray(item.payload)
+      ? item.payload
+      : {}) as Record<string, unknown>;
+    const isControl =
+      itemType === "synthetic" &&
+      typeof payload.metadata === "object" &&
+      payload.metadata !== null &&
+      !Array.isArray(payload.metadata) &&
+      (payload.metadata as Record<string, unknown>).goalControl === true;
+
+    let entry: LastInboxEntry;
+    if (isControl) {
+      entry = { id: inboxID, kind: "control" };
+    } else if (itemType === "user") {
+      // The host also emits enqueued for items WE enqueued via prompt();
+      // reclassify our own wake by its inbox id (the watchdog flag rides
+      // along — the Task 10 fast path needs it).
+      const wake = this.wakeInbox.get(sessionID);
+      if (wake !== undefined && wake.inboxID === inboxID) {
+        const reentry: LastInboxEntry = { id: inboxID, kind: "wake", goalID: wake.goalID };
+        if (wake.watchdog === true) reentry.watchdog = true;
+        entry = reentry;
+      } else {
+        entry = { id: inboxID, kind: "user" };
+      }
+    } else {
+      // compaction / move / unmarked synthetic — TODO(task13): pinned in
+      // test/arbiter.test.ts (counts toward the stall ladder via "other").
+      entry = { id: inboxID, kind: "other" };
+    }
+    this.lastInbox.set(sessionID, entry);
+
+    // spec §15-9 blocked resume: blocked goal + user inbox item → active.
+    if (itemType === "user") {
+      const goal = await this.loadGoal(sessionID);
+      if (goal !== undefined && goal.status === "blocked" && !this.resumeInbox.has(inboxID)) {
+        this.resumeInbox.add(inboxID);
+        if (this.resumeInbox.size > 100) {
+          const first = this.resumeInbox.values().next().value;
+          if (first !== undefined) this.resumeInbox.delete(first);
+        }
+        goal.status = "active";
+        goal.stalls = 0;
+        // injectWake bumps used.turns / continuations in memory; the save
+        // below persists everything (status, stalls, usage) in one write.
+        await this.injectWake(goal);
+        await this.saveGoal(goal);
+      }
+    }
+  }
+
+  /**
+   * Interrupt three-way (brief §3; .d.ts reason literals: user | shutdown |
+   * superseded | inactivity):
+   * - inactivity → the mechanical form of a silent stall: ordinary boundary (wake);
+   * - user (人工喊停) → record the eventID only (save), no wake;
+   * - shutdown → record only (lastHandledEventID, no other state change).
+   * - "superseded" is a 4th .d.ts value the brief does not cover → treated
+   *   record-only like "user". TODO(task13).
+   */
+  private async onInterrupted(sessionID: string, event: HostEvent): Promise<void> {
+    const props = event.properties;
+    const reason = typeof props.reason === "string" ? props.reason : undefined;
+    if (reason === "inactivity") {
+      await this.arbitrateBoundary(sessionID, event);
+      return;
+    }
+    const eventID = typeof event.id === "string" ? event.id : undefined;
+    const goal = await this.loadGoal(sessionID);
+    await this.recordHandled(sessionID, eventID, goal);
+  }
+
+  /**
+   * Record a consumed eventID: memory dedup Set + persisted
+   * lastHandledEventID (best-effort save; a failed save never re-wakes —
+   * the in-memory Set already marks it handled). `sessionID` is part of
+   * the call-site contract; the storage key derives from goal.sessionID.
+   */
+  private async recordHandled(sessionID: string, eventID: string | undefined, goal?: GoalRecord): Promise<void> {
+    void sessionID;
+    this.rememberHandled(eventID);
+    if (goal !== undefined && eventID !== undefined) {
+      goal.lastHandledEventID = eventID;
+      await this.saveGoal(goal);
+    }
+  }
+
+  /**
+   * Terminal-boundary arbitration (spec §6, mechanical in order):
+   * ① dedup (memory Set + persisted lastHandledEventID + continuationPending
+   *    window) → ② active goal? → ④ budget (spec §11) → ⑤ attribution →
+   *    stall ladder → ⑥ judge (spec §8): once per goal (judgeUsed gate);
+   *    the verdict is disposed inline (continue re-wakes with the optional
+   *    instruction; complete / needs_human / give_up end the goal).
+   */
+  private async arbitrateBoundary(sessionID: string, event: HostEvent): Promise<void> {
+    const eventID = typeof event.id === "string" ? event.id : undefined;
+    // ① dedup: already handled (memory, bounded) or persisted as handled.
+    if (eventID !== undefined && this.handledIDs.has(eventID)) return;
+    const goal = await this.loadGoal(sessionID);
+    if (goal !== undefined && eventID !== undefined && goal.lastHandledEventID === eventID) return;
+    if (this.contPending.get(sessionID) === true) {
+      // continuationPending window: the wake has not landed (no execution.
+      // started yet). Bounded fallback (controller ruling I1): a window
+      // that survives TWO DISTINCT boundaries means the host lost the
+      // started signal — skip at most ONE boundary, then close the window
+      // and arbitrate normally. Bounded skip is preferred over permanent
+      // silence; the residual double-wake risk is acceptable because wakes
+      // are ordinary state-carrying messages by design.
+      const skipped = this.pendingSkipped.get(sessionID);
+      if (skipped === undefined) {
+        // First boundary inside the window → skip it (record only) and
+        // remember it so a second DISTINCT boundary can close the window.
+        if (eventID !== undefined) this.pendingSkipped.set(sessionID, eventID);
+        else this.pendingSkipped.set(sessionID, "");
+        this.markTurnInactive(sessionID);
+        await this.recordHandled(sessionID, eventID, goal);
+        return;
+      }
+      if (eventID === skipped) {
+        // Replay of the skipped boundary (dedup-equivalent) → keep ignoring.
+        await this.recordHandled(sessionID, eventID, goal);
+        return;
+      }
+      // Second distinct boundary → close the window and fall through to
+      // normal arbitration below (this boundary proceeds).
+      this.contPending.delete(sessionID);
+      this.pendingSkipped.delete(sessionID);
+    }
+    if (goal === undefined || goal.status !== "active") {
+      // ② no active goal → ignore (no storage write when there is no goal;
+      // a terminal goal is only recorded, never woken).
+      this.markTurnInactive(sessionID);
+      await this.recordHandled(sessionID, eventID, goal);
+      return;
+    }
+    // ④ budget (spec §11): ANY terminal boundary (incl. inactivity interrupt)
+    // checks the caps BEFORE attribution; missing cap dimensions don't compare.
+    if (isCapReached(goal)) {
+      goal.status = "budget_limited";
+      this.judgeInstruction.delete(sessionID); // terminal: drop any pending judge paragraph
+      if (eventID !== undefined) goal.lastHandledEventID = eventID;
+      await this.saveGoal(goal);
+      await this.archiveGoal(goal);
+      try {
+        await this.probe.synthetic({
+          sessionID,
+          text: `goal ${goal.id} stopped: budget_limited (used ${goal.used.turns} turns / ` +
+            `${goal.used.tokens} tokens; cap: ${this.capText(goal)})`,
+          metadata: { goalControl: true },
+        });
+      } catch (err) {
+        console.warn(`opencode-goal: failed to deliver budget_limited notice for goal ${goal.id}:`, err);
+      }
+      this.markTurnInactive(sessionID);
+      this.rememberHandled(eventID);
+      return;
+    }
+    // Task 10 fast path (spec §6-② / §7.1): a boundary while the goal is
+    // waiting on shells does NOT inject the ordinary wake — (re)arming the
+    // watchdog IS this boundary's entire action. Two exceptions keep normal
+    // arbitration: (a) the last inbox item is one of OUR watchdog wakes —
+    // spec §7.1: a check-in replied with pure text counts per the stall
+    // ladder; (b) goal_wait's waitUntil window silences EVERYTHING (record
+    // only: no wake, no stall accounting — "不消耗 stall 预算").
+    const waitingCount = goal.waitingShells?.length ?? 0;
+    if (waitingCount > 0) {
+      const quiet = goal.waitUntil !== undefined && Date.now() < goal.waitUntil;
+      const last = this.lastInbox.get(sessionID);
+      const lastWatchdog = last !== undefined && last.kind === "wake" && last.watchdog === true;
+      if (quiet || !lastWatchdog) {
+        this.rearmWatchdog(sessionID, goal);
+        this.markTurnInactive(sessionID);
+        await this.recordHandled(sessionID, eventID, goal);
+        return;
+      }
+      // Proceeding (a reply to OUR watchdog wake) is still a boundary while
+      // waiting on shells → re-arm the watchdog (spec §6-②: a boundary with
+      // running shells arms; execution.started having disarmed it).
+      this.rearmWatchdog(sessionID, goal);
+    }
+    // ⑤ attribution (lastInbox) → stall ladder.
+    const toolCalled = this.turns.get(sessionID)?.toolCalled === true;
+    const last = this.lastInbox.get(sessionID);
+    let wake = true;
+    let stalls: number;
+    if (toolCalled) {
+      stalls = 0; // acted this turn
+    } else if (last !== undefined && last.kind === "control") {
+      // This plugin's control notification (e.g. a /goal command): record
+      // only — no wake (防自触发双唤醒).
+      wake = false;
+      stalls = goal.stalls;
+    } else if (last !== undefined && last.kind === "user") {
+      stalls = 0; // person present is not a stall
+    } else {
+      // wake-originated (ours, goalID match or mismatch) or other/untracked
+      // (compaction/move/unmarked synthetic): no action, no user → stall.
+      stalls = goal.stalls + 1;
+    }
+    goal.stalls = stalls;
+    // ⑥ stall ladder (Task 9): at the threshold the side-channel judge
+    // arbitrates — at most ONCE per goal (persistent gate `judgeUsed`;
+    // options.judgeMaxPerGoal is still resolved but the behavior is spec-
+    // fixed to one, to prevent a judge/agent mutual-kick loop). Every path
+    // here either ends the goal (stallReport + archive + synthetic) or
+    // re-wakes with the judge's optional instruction.
+    if (wake && goal.stalls >= this.options.stallLimit) {
+      this.markTurnInactive(sessionID);
+      const texts = await this.noActionTexts(sessionID);
+      const judge = this.deps.judge;
+      if (this.options.judgeEnabled && goal.judgeUsed !== true && judge !== undefined) {
+        let verdict: JudgeVerdict;
+        try {
+          verdict = await judge.judge(goal, texts);
+        } catch (err) {
+          // Controller ruling: a REJECTING judge = give_up semantics
+          // (stalled), fail-closed; the loop must never break.
+          console.warn(`opencode-goal: judge failed for goal ${goal.id}:`, err);
+          await this.stallGoal(sessionID, goal, texts, "裁判调用失败（fail-closed 按 give_up 处置）");
+          return;
+        }
+        await this.disposeVerdict(sessionID, goal, texts, verdict);
+        return;
+      }
+      // Judge unavailable at the limit (disabled / already used / not wired)
+      // → directly stalled, with the report saying why the judge did not rule.
+      await this.stallGoal(
+        sessionID,
+        goal,
+        texts,
+        !this.options.judgeEnabled
+          ? "裁判未启用（judgeEnabled=false）"
+          : goal.judgeUsed === true
+            ? "裁判已用过（每目标至多一次，不再复核）"
+            : "裁判未接入",
+      );
+      return;
+    }
+    if (wake) await this.injectWake(goal);
+    this.markTurnInactive(sessionID);
+    // Regression fix (Task 9 brief, Task 8 M4 extract lost this): the tail
+    // ALWAYS persists this boundary's increments (used.turns / continuations
+    // from injectWake, stalls) — unconditionally, even for id-less events.
+    // lastHandledEventID is still set only when the event carries an id.
+    if (eventID !== undefined) goal.lastHandledEventID = eventID;
+    await this.saveGoal(goal);
+  }
+
+  /** Turn bookkeeping on a consumed terminal boundary: active=false, keep toolCalled. */
+  private markTurnInactive(sessionID: string): void {
+    const t = this.turns.get(sessionID);
+    if (t !== undefined) t.active = false;
+  }
+
+  /**
+   * Wake injection (spec §6-③): used.turns += 1, continuations += 1,
+   * continuationPending = true, lastInbox = this wake (InboxRef.id).
+   * Judge instruction channel (Task 9): a pending instruction (if any) rides
+   * into THIS wake as the buildWakeMessage judge paragraph, then is dropped.
+   */
+  private async injectWake(goal: GoalRecord): Promise<void> {
+    const sessionID = goal.sessionID;
+    goal.used.turns += 1;
+    goal.continuations += 1;
+    let judgeInstruction: string | undefined;
+    const pending = this.judgeInstruction.get(sessionID);
+    if (pending !== undefined) {
+      judgeInstruction = pending;
+      this.judgeInstruction.delete(sessionID);
+    }
+    try {
+      const ref = await this.probe.prompt({
+        sessionID,
+        // Task 14 Fix 3a: options.wakeText rides every buildWakeMessage wake
+        // (boundary wake / judge-demoted wake). The watchdog check-in wakes
+        // below are an INDEPENDENT text family (shellCheckInText/…) and do
+        // NOT carry wakeText (ruling: wakeText does not apply to check-ins).
+        text: buildWakeMessage(goal, this.capText(goal), judgeInstruction, this.options.wakeText),
+        delivery: "queue",
+        metadata: { goalWake: true, goalID: goal.id, goalTurn: goal.used.turns },
+      });
+      this.lastInbox.set(sessionID, { id: ref.id, kind: "wake", goalID: goal.id });
+      this.wakeInbox.set(sessionID, { inboxID: ref.id, goalID: goal.id });
+      this.contPending.set(sessionID, true);
+      this.pendingSkipped.delete(sessionID); // fresh window → fresh bounded skip
+    } catch (err) {
+      // Fault tolerance: a failed injection must not break the loop and must
+      // not leave the continuationPending window open forever.
+      console.warn(`opencode-goal: failed to inject wake for goal ${goal.id}:`, err);
+      this.contPending.delete(sessionID);
+    }
+  }
+
+  /**
+   * noActionTexts for the judge (brief ⑥): from probe.context, find the LAST
+   * user/synthetic message as the bound; take assistant text parts AFTER it;
+   * no bound found → use all. At most the 3 most recent (reference project
+   * executionTail rule).
+   */
+  private async noActionTexts(sessionID: string): Promise<string[]> {
+    let messages: SessionMessage[];
+    try {
+      messages = await this.probe.context(sessionID);
+    } catch {
+      return [];
+    }
+    let cut = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const type = messages[i].type;
+      if (type === "user" || type === "synthetic") {
+        cut = i;
+        break;
+      }
+    }
+    const texts: string[] = [];
+    for (let i = cut + 1; i < messages.length; i++) {
+      const m = messages[i];
+      if (m.type !== "assistant") continue;
+      const content = m.content;
+      if (!Array.isArray(content)) continue;
+      for (const part of content) {
+        if (typeof part === "object" && part !== null && typeof (part as { text?: unknown }).text === "string") {
+          const t = (part as { text: string }).text;
+          if (t.length > 0) texts.push(t);
+        }
+      }
+    }
+    return texts.slice(-3);
+  }
+
+  // ------------------------------------------------------------------
+  // Task 11: compaction-proof goal state — session hooks (context + compaction)
+  // ------------------------------------------------------------------
+
+  /**
+   * Context hook (before every model call, spec §10 defense line 2): an
+   * ACTIVE goal appends its objective block as ONE system part; no goal or a
+   * non-active goal (incl. paused) → no-op. The part shape follows
+   * @opencode/ai SystemPart (schema/messages.d.ts: `{ type: "text", text:
+   * string, cache?, metadata? }` — the host type is unambiguous in 2.0.29,
+   * no TODO(task13) needed). Never throws (fault-tolerance discipline).
+   */
+  private async contextHook(sessionID: string, payload: Record<string, unknown>): Promise<void> {
+    try {
+      const goal = await this.loadGoal(sessionID);
+      if (goal === undefined || goal.status !== "active") return;
+      const system = payload.system;
+      if (!Array.isArray(system)) return; // host payload is malformed — leave it untouched
+      // Dedup guard: a host retry re-firing the hook on the SAME payload
+      // object would otherwise double-append. A system part whose text
+      // already grounds this goal means the block is in.
+      const alreadyGrounded = system.some(
+        (p) => typeof (p as { text?: unknown })?.text === "string" && (p as { text: string }).text.includes(`[GOAL ${goal.id}`),
+      );
+      if (alreadyGrounded) return;
+      system.push({ type: "text", text: goalSystemPart(goal, this.capText(goal)) });
+    } catch (err) {
+      console.warn(`opencode-goal: context hook failed for ${sessionID} (goal block not appended):`, err);
+    }
+  }
+
+  /**
+   * Compaction hook (spec §10 defense line 3): SessionCompaction.result is a
+   * WHOLE REPLACEMENT that skips the host model request — so the summary must
+   * carry the conversation, not just the state block. Steps (brief):
+   * 1. probe.context first (history BEFORE any generate — the summary must
+   *    not lose the conversation);
+   * 2. probe.generate with the compaction prompt (history key points + the
+   *    full state block);
+   * 3. payload.result = { summary: generated text + mandatory trailing
+   *    [GOAL STATE] block };
+   * 4. generate failure → do NOT set result (the host's default compaction
+   *    runs — fail-safe). context fetch failure → same (no history, no
+   *    summary). No active goal → no-op. The hook never throws.
+   */
+  private async compactionHook(sessionID: string, payload: Record<string, unknown>): Promise<void> {
+    try {
+      const goal = await this.loadGoal(sessionID);
+      if (goal === undefined || goal.status !== "active") return;
+      let messages: SessionMessage[];
+      try {
+        messages = await this.probe.context(sessionID);
+      } catch (err) {
+        // No history available → the host's default compaction (which keeps
+        // the conversation) is strictly better than a state-only summary.
+        console.warn(`opencode-goal: compaction context fetch failed for ${sessionID}; keeping host default compaction:`, err);
+        return;
+      }
+      let generated: string;
+      try {
+        const res = await this.probe.generate({
+          sessionID,
+          prompt: buildCompactionPrompt(goal, this.compactionHistory(messages)),
+        });
+        generated = res.text;
+      } catch (err) {
+        console.warn(`opencode-goal: compaction summary generation failed for ${sessionID}; keeping host default compaction:`, err);
+        return;
+      }
+      if (typeof generated !== "string") {
+        // Same stance as the judge's fail-closed generator guard: a
+        // non-string generation is not a summary — no half-baked result.
+        console.warn(`opencode-goal: compaction generate returned non-string text for ${sessionID}; keeping host default compaction`);
+        return;
+      }
+      if (generated.trim() === "") {
+        // Empty/whitespace generation is NOT a summary: setting result would
+        // produce a state-only summary AND make the host skip its default
+        // compaction — the conversation would be LOST. Fail-safe: keep the
+        // host default (it keeps the conversation).
+        console.warn(`opencode-goal: compaction generate returned empty text for ${sessionID}; keeping host default compaction`);
+        return;
+      }
+      payload.result = { summary: composeCompactionSummary(generated, goal, this.capText(goal)) };
+    } catch (err) {
+      console.warn(`opencode-goal: compaction hook failed for ${sessionID}; keeping host default compaction:`, err);
+    }
+  }
+
+  /**
+   * SessionMessage[] → { role, text } key points for the compaction prompt:
+   * role = the message type tag; text = `text` verbatim when present, else
+   * the text parts of `content` joined. Messages without extractable text
+   * are dropped (they carry no conversation facts to summarize).
+   */
+  private compactionHistory(messages: SessionMessage[]): Array<{ role: string; text: string }> {
+    const out: Array<{ role: string; text: string }> = [];
+    for (const m of messages) {
+      const role = typeof m.type === "string" ? m.type : "unknown";
+      let text = "";
+      if (typeof m.text === "string") {
+        text = m.text;
+      } else if (Array.isArray(m.content)) {
+        const parts: string[] = [];
+        for (const part of m.content) {
+          if (typeof part === "object" && part !== null && typeof (part as { text?: unknown }).text === "string") {
+            const t = (part as { text: string }).text;
+            if (t.length > 0) parts.push(t);
+          }
+        }
+        text = parts.join(" ");
+      }
+      if (text.length > 0) out.push({ role, text });
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------------------
+  // Task 12: permission sandbox — goal.control self-grant + path containment
+  // ------------------------------------------------------------------
+
+  /**
+   * Permission callback (registration surface; hot path — the goal + session
+   * facts are LOOKED UP on every call, never cached, to avoid stale state).
+   * Wiring order (all mechanical, brief-verbatim):
+   * ① incoming === "deny" → no stance (never relax; decidePermission carries
+   *    the same rule — belt and braces);
+   * ② no sessionID → no stance (unattributable, fail-closed);
+   * ③ attribution: probe.projectID set AND the session's projectID is a
+   *    DIFFERENT known value → no stance (multi-location safety; an unknown
+   *    projectID is attributed — the host may simply not report it);
+   * ④ goalActive is OUR fact (storage lookup), never host input (R9);
+   * ⑤ decidePermission (Task 3 pure logic, untouched): sessionDirectory
+   *    prefers the per-session location.directory, falls back to the
+   *    instance default probe.locationDirectory;
+   * ⑥ leave → undefined (no stance); allow/deny → the decision (message?
+   *    copied only when present).
+   * try/catch over the whole body: ANY failure → undefined (no stance) +
+   * warn — the permission path must never break the host.
+   */
+  private async permissionHook(input: PermissionHookInput): Promise<PermissionDecision | undefined> {
+    try {
+      if (input.incoming === "deny") return undefined;
+      const sessionID = input.sessionID;
+      if (sessionID === undefined) return undefined;
+      const session = await this.probe.sessionGet(sessionID);
+      const pid = this.probe.projectID;
+      if (pid !== undefined && session?.projectID !== undefined && session.projectID !== pid) {
+        return undefined; // another project's session — no stance
+      }
+      const goal = await this.loadGoal(sessionID);
+      const goalActive = goal !== undefined && goal.status === "active";
+      const decision = decidePermission({
+        action: input.action,
+        resources: input.resources,
+        sessionDirectory: session?.location?.directory ?? this.probe.locationDirectory,
+        goalActive,
+        incoming: input.incoming,
+      });
+      if (decision.effect === "leave") return undefined;
+      const out: PermissionDecision = { effect: decision.effect };
+      if (decision.message !== undefined) out.message = decision.message;
+      return out;
+    } catch (err) {
+      console.warn("opencode-goal: permission hook failed (no stance):", err);
+      return undefined;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Task 9: judge verdict disposition (spec §8)
+  // ------------------------------------------------------------------
+
+  /**
+   * Inline disposition of the judge's verdict (replaces the Task 8
+   * `pendingJudge` stash — the stash field is gone). The gate `judgeUsed`
+   * closes on EVERY verdict: spec §8 fixes one judge per goal (the
+   * options.judgeMaxPerGoal option stays resolved, behavior follows
+   * judgeUsed). Terminal paths reuse the Task 7 finishGoal flow
+   * (save + archive); every notification is best-effort.
+   *
+   * - continue    → stalls zeroed; optional instruction parked for the wake
+   * - complete    → evidence must pass validateEvidence against the LIVE
+   *                 transcript; ungrounded/weak evidence is DEMOTED to
+   *                 continue (stalls zeroed, judgeUsed set, never completed)
+   * - needs_human → blocked with the judge's reason; the Task 8 user-inbox
+   *                 resume path (§15-9) then re-activates it (no new wiring)
+   * - give_up     → stalled + stallReport + archive + synthetic
+   */
+  private async disposeVerdict(
+    sessionID: string,
+    goal: GoalRecord,
+    noActionTexts: string[],
+    verdict: JudgeVerdict,
+  ): Promise<void> {
+    goal.judgeUsed = true;
+    switch (verdict.verdict) {
+      case "continue":
+        goal.stalls = 0;
+        if (verdict.instruction !== undefined) {
+          this.judgeInstruction.set(sessionID, verdict.instruction);
+        }
+        await this.saveGoal(goal);
+        await this.injectWake(goal); // carries the judge paragraph (if any)
+        return;
+      case "complete": {
+        const transcript = await this.transcript(sessionID);
+        const problem =
+          verdict.evidence !== undefined
+            ? validateEvidence(verdict.evidence, transcript)
+            : "Goal NOT completed: the judge's complete verdict carries no evidence";
+        if (problem !== undefined) {
+          // Demote to continue: an uncheckable evidence claim never completes
+          // the goal (fail-closed). This verdict has no instruction → the
+          // wake carries no judge paragraph (buildWakeMessage contract).
+          goal.stalls = 0;
+          await this.saveGoal(goal);
+          await this.injectWake(goal);
+          return;
+        }
+        const done = await this.finishGoal(goal, "completed", { evidence: verdict.evidence });
+        // Task 14 Fix 1 (async face): a stale write was dropped — continue
+        // SILENTLY. No archive (finishGoal already skipped it), no synthetic
+        // claiming a terminal state, the loop just goes on (the loop must
+        // never break, and no user-visible claim may assert a transition
+        // storage never received).
+        if (!done) {
+          console.warn(`opencode-goal: judge "complete" verdict dropped for goal ${goal.id} (stale write)`);
+          return;
+        }
+        await this.notify(goal, `goal ${goal.id} completed (judge): ${verdict.evidence}`);
+        return;
+      }
+      case "needs_human": {
+        const done = await this.finishGoal(goal, "blocked", { blocker: verdict.reason });
+        if (!done) {
+          console.warn(`opencode-goal: judge "needs_human" verdict dropped for goal ${goal.id} (stale write)`);
+          return;
+        }
+        await this.notify(goal, `goal ${goal.id} blocked (judge: needs human): ${verdict.reason}`);
+        return;
+      }
+      case "give_up":
+        await this.stallGoal(sessionID, goal, noActionTexts, verdict.reason);
+        return;
+    }
+  }
+
+  /**
+   * Terminal `stalled` (Task 9): the give_up verdict, a rejecting judge, or a
+   * judge that cannot run (disabled / already used / not wired). Composes the
+   * stallReport, archives, and delivers a goalControl synthetic carrying it.
+   * `judgeReason` is the verdict's reason or a note on why the judge did not
+   * rule.
+   */
+  private async stallGoal(
+    sessionID: string,
+    goal: GoalRecord,
+    noActionTexts: string[],
+    judgeReason: string,
+  ): Promise<void> {
+    goal.stallReport = buildStallReport(goal, noActionTexts, judgeReason);
+    this.judgeInstruction.delete(sessionID);
+    const done = await this.finishGoal(goal, "stalled");
+    // Task 14 Fix 1 (async face): stale write dropped → silent continue
+    // (no synthetic claiming the terminal state storage never received).
+    if (!done) {
+      console.warn(`opencode-goal: stall goal ${goal.id} dropped (stale write)`);
+      return;
+    }
+    await this.notify(goal, `goal ${goal.id} stalled\n${goal.stallReport}`);
+  }
+
+  /** Best-effort goalControl synthetic (fault-tolerance discipline: never throw). */
+  private async notify(goal: GoalRecord, text: string): Promise<void> {
+    try {
+      await this.probe.synthetic({
+        sessionID: goal.sessionID,
+        text,
+        metadata: { goalControl: true },
+      });
+    } catch (err) {
+      console.warn(`opencode-goal: failed to deliver goal ${goal.id} notice:`, err);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Task 10: watchdog (spec §7.1) — per-goal tick, three-way decision per
+  // shell, check-in dual signal, cancellation, restart reconciliation
+  // ------------------------------------------------------------------
+
+  /** Injectable tick (deps.tickMs = 1ms in tests) else the plugin option. */
+  private tickMsValue(): number {
+    return this.deps.tickMs ?? this.options.watchdogTickMs;
+  }
+
+  /** Mark a shell's exit wake as delivered (bounded; see exitNotified). */
+  private rememberExitNotified(shellID: string): void {
+    if (!this.exitNotified.has(shellID)) this.exitNotifiedOrder.push(shellID);
+    this.exitNotified.add(shellID);
+    while (this.exitNotifiedOrder.length > 500) {
+      const old = this.exitNotifiedOrder.shift();
+      if (old !== undefined) this.exitNotified.delete(old);
+    }
+  }
+
+  /**
+   * (command, cwd) → host timeout from create.before (timeout > 0 only;
+   * payload is mutable — we snapshot the value, we never read it back later).
+   */
+  private rememberShellTimeout(command: string, cwd: string, timeout: number): void {
+    if (!(timeout > 0)) return;
+    const key = `${command}\u0000${cwd}`;
+    if (!this.shellTimeouts.has(key)) this.shellTimeoutOrder.push(key);
+    this.shellTimeouts.set(key, timeout);
+    while (this.shellTimeoutOrder.length > 200) {
+      const old = this.shellTimeoutOrder.shift();
+      if (old !== undefined) this.shellTimeouts.delete(old);
+    }
+  }
+
+  /** Arm the per-goal tick timer (idempotent; refuses after cleanup). */
+  private ensureWatchdog(sessionID: string): void {
+    if (this.stopped || this.wdTimers.has(sessionID)) return;
+    const timer = setInterval(() => this.watchdogTick(sessionID), this.tickMsValue());
+    this.wdTimers.set(sessionID, timer);
+  }
+
+  /** Stop the goal's tick (the per-shell watch state SURVIVES re-arms). */
+  private disarmWatchdog(sessionID: string): void {
+    const timer = this.wdTimers.get(sessionID);
+    if (timer !== undefined) {
+      clearInterval(timer);
+      this.wdTimers.delete(sessionID);
+    }
+  }
+
+  /**
+   * Boundary re-arm (spec §6-②: arming the watchdog IS the boundary's whole
+   * action): fresh stall point (since re-anchored + persisted — the restart-
+   * reconcile fact anchor), fresh tail bookkeeping, but `checkedIn` is KEPT
+   * (at-most-one-check-in-per-segment — the segment ends only on a model
+   * action or a new shell, never on a plain waiting boundary).
+   */
+  private rearmWatchdog(sessionID: string, goal: GoalRecord): void {
+    const now = Date.now();
+    for (const w of goal.waitingShells ?? []) {
+      w.since = now;
+      const st = this.shellWatch.get(w.id);
+      if (st !== undefined) {
+        st.tail = undefined;
+        st.lastTailAt = now;
+        st.changed = false;
+      } else {
+        this.shellWatch.set(w.id, { tail: undefined, lastTailAt: now, checkedIn: false, changed: false });
+      }
+    }
+    void this.saveGoal(goal); // waitingShells changes persist (best-effort)
+    this.ensureWatchdog(sessionID);
+  }
+
+  /** One tick per armed goal: at most one in flight (overlap guard). */
+  private watchdogTick(sessionID: string): void {
+    if (this.wdBusy.has(sessionID)) return;
+    this.wdBusy.add(sessionID);
+    void this.runWatchdogTick(sessionID)
+      .catch((err) => {
+        // Fault-tolerance discipline: a failed tick never kills the timer.
+        console.warn(`opencode-goal: watchdog tick failed for ${sessionID}:`, err);
+      })
+      .finally(() => this.wdBusy.delete(sessionID));
+  }
+
+  /**
+   * Tick body — three-way decision per waiting shell:
+   * 1. exited in probe (no corresponding exited event — event-lost self-heal)
+   *    → 止表 for that shell + synthetic result wake;
+   * 2. check-in conditions met (dual signal, idle session only, waitUntil not
+   *    in force, once per stall segment) → 状态核查 wake;
+   * 3. otherwise → keep waiting (no inject, no stall touch — zero cost).
+   * All probe calls are try/catch; a single tick failure never breaks the
+   * timer, never mutates state.
+   */
+  private async runWatchdogTick(sessionID: string): Promise<void> {
+    const goal = await this.loadGoal(sessionID);
+    // Ghost rule: terminal (or paused) goal → disarmed before ANY probe call.
+    if (goal === undefined || goal.status !== "active") {
+      for (const w of goal?.waitingShells ?? []) this.shellWatch.delete(w.id);
+      this.disarmWatchdog(sessionID);
+      return;
+    }
+    const waiting = goal.waitingShells ?? [];
+    if (waiting.length === 0) {
+      this.disarmWatchdog(sessionID);
+      return;
+    }
+    let probes: Awaited<ReturnType<NonNullable<ControllerDeps["shellProbe"]>["list"]>>;
+    try {
+      probes = await this.deps.shellProbe?.list() ?? [];
+    } catch (err) {
+      console.warn(`opencode-goal: watchdog probe.list failed for ${sessionID}:`, err);
+      return;
+    }
+    const now = Date.now();
+    const byId = new Map(probes.map((p) => [p.id, p]));
+    const idle = this.turns.get(sessionID)?.active !== true; // Task 8 per-session active flag
+    const quiet = goal.waitUntil !== undefined && now < goal.waitUntil;
+    const exitedNow: string[] = [];
+    for (const w of waiting) {
+      const p = byId.get(w.id);
+      if (p === undefined) continue; // transient probe state — keep waiting (reconcile owns "lost")
+      if (p.state === "exited") {
+        exitedNow.push(w.id);
+        this.shellWatch.delete(w.id);
+        if (this.exitNotified.has(w.id)) continue; // the event path already woke (race guard)
+        this.rememberExitNotified(w.id);
+        await this.deliverWatchdogWake(
+          goal,
+          shellExitText(w.id, "exited", p.exitCode, p.outputTail),
+        );
+        continue;
+      }
+      let st = this.shellWatch.get(w.id);
+      if (st === undefined) {
+        st = { tail: undefined, lastTailAt: now, checkedIn: false, changed: false };
+        this.shellWatch.set(w.id, st);
+      }
+      const tail = p.outputTail ?? "";
+      if (st.tail === undefined) {
+        st.tail = tail; // baseline: zero growth is measured from the first observation
+        st.lastTailAt = now;
+      } else if (st.tail !== tail) {
+        st.tail = tail;
+        st.lastTailAt = now;
+        st.changed = true; // 有增长 — evidence of "alive" (not of progress)
+      }
+      if (st.checkedIn) continue; // at most one check-in per stall segment (no loop self-rotation)
+      if (quiet) continue; // goal_wait in force: silent, no inject, no stall
+      if (!idle) continue; // active session: next boundary carries it
+      // Zero-growth threshold: max(shellStallMs, (timeoutMs ?? 0) + tick) —
+      // with a host timeout the host reaps at T; silence before T+tick is not
+      // evidence of a hang.
+      const threshold = Math.max(this.options.shellStallMs, (w.timeoutMs ?? 0) + this.tickMsValue());
+      if (now - st.lastTailAt >= threshold) {
+        st.checkedIn = true; // set BEFORE the async inject: an overlapping tick must see it
+        await this.deliverWatchdogWake(goal, shellCheckInText(goal, w.id, "stall", now - st.lastTailAt, tail));
+      } else if (st.changed && now - w.since >= this.options.waitCheckInMs) {
+        // 有增长但久等: only an ACTUALLY growing tail qualifies (spec §7.1's
+        // "活着地失败" checkpoint) — a silent shell is owned by the zero-growth
+        // branch above and by its host timeout (test 1: no check-in before T+tick).
+        st.checkedIn = true;
+        await this.deliverWatchdogWake(goal, shellCheckInText(goal, w.id, "long", now - w.since, tail));
+      }
+    }
+    if (exitedNow.length > 0) {
+      goal.waitingShells = waiting.filter((w) => !exitedNow.includes(w.id));
+      await this.saveGoal(goal);
+      if (goal.waitingShells.length === 0) this.disarmWatchdog(sessionID);
+    }
+  }
+
+  /**
+   * Watchdog wake (check-in / shell exit / lost — spec §7.1: every synthetic
+   * wake carries { goalControl: true }). Mirrors injectWake's bookkeeping
+   * (used/continuations, lastInbox + wakeInbox, continuationPending window —
+   * "唤醒注入仍置 pending") with the watchdog flag so the boundary fast path
+   * can keep normal arbitration for a reply to OUR wake.
+   */
+  private async deliverWatchdogWake(goal: GoalRecord, text: string): Promise<void> {
+    // Task 14 Fix 3a note: this wake path (check-in / shell exit / lost) uses
+    // its own watchdog text family — options.wakeText intentionally does NOT
+    // apply here (ruling: check-in wakes are independent copy).
+    const sessionID = goal.sessionID;
+    goal.used.turns += 1;
+    goal.continuations += 1;
+    try {
+      const ref = await this.probe.prompt({
+        sessionID,
+        text,
+        delivery: "queue",
+        metadata: { goalControl: true },
+      });
+      this.lastInbox.set(sessionID, { id: ref.id, kind: "wake", goalID: goal.id, watchdog: true });
+      this.wakeInbox.set(sessionID, { inboxID: ref.id, goalID: goal.id, watchdog: true });
+      this.contPending.set(sessionID, true);
+      this.pendingSkipped.delete(sessionID);
+      await this.saveGoal(goal);
+    } catch (err) {
+      // Fault tolerance: a failed injection must not break the loop and must
+      // not leave the continuationPending window open forever.
+      console.warn(`opencode-goal: failed to deliver watchdog wake for goal ${goal.id}:`, err);
+      this.contPending.delete(sessionID);
+    }
+  }
+
+  /**
+   * Arm on shell creation (spec §7.1): write the waitingShells entry
+   * (timeoutMs correlated via command+cwd; since = segment start) and start
+   * the tick. Active goal only (a terminal/paused goal is never armed — the
+   * ghost rule).
+   */
+  private async onShellStarted(sessionID: string, props: Record<string, unknown>): Promise<void> {
+    const shell = shellInfoFrom(props);
+    if (shell === undefined) return;
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined || goal.status !== "active") return;
+    if ((goal.waitingShells ?? []).some((w) => w.id === shell.id)) return; // already armed (dedup)
+    const timeoutMs =
+      shell.command !== undefined && shell.cwd !== undefined
+        ? this.shellTimeouts.get(`${shell.command}\u0000${shell.cwd}`)
+        : undefined;
+    const entry: NonNullable<GoalRecord["waitingShells"]>[number] = { id: shell.id, since: Date.now() };
+    if (timeoutMs !== undefined) entry.timeoutMs = timeoutMs;
+    goal.waitingShells = [...(goal.waitingShells ?? []), entry];
+    this.shellWatch.set(shell.id, { tail: undefined, lastTailAt: Date.now(), checkedIn: false, changed: false });
+    await this.saveGoal(goal);
+    this.ensureWatchdog(sessionID);
+  }
+
+  /**
+   * Fast path exit (spec §7.1): the shell ended (event; or reconciled) →
+   * 止表 + result wake carrying the status wording (timeout = "超时",
+   * killed = "被杀", else "退出 (exit)") and the output tail. No-op when the
+   * goal is not active (ghost) or the shell was never armed / already
+   * processed.
+   */
+  private async onShellEnded(sessionID: string, props: Record<string, unknown>): Promise<void> {
+    const shell = shellInfoFrom(props);
+    if (shell === undefined) return;
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined || goal.status !== "active") return; // ghost: no wake after terminal/paused
+    const waiting = goal.waitingShells ?? [];
+    if (!waiting.some((w) => w.id === shell.id)) return;
+    goal.waitingShells = waiting.filter((w) => w.id !== shell.id);
+    this.shellWatch.delete(shell.id);
+    const alreadyWoke = this.exitNotified.has(shell.id);
+    this.rememberExitNotified(shell.id);
+    const out = isPlainObject(props.output) ? props.output : undefined;
+    const tail = out !== undefined && typeof out.output === "string" ? out.output : undefined;
+    const status: "exited" | "timeout" | "killed" =
+      shell.status === "timeout" ? "timeout" : shell.status === "killed" ? "killed" : "exited";
+    await this.saveGoal(goal);
+    if (goal.waitingShells.length === 0) this.disarmWatchdog(sessionID);
+    if (alreadyWoke) return; // the tick path already synthesized this exit wake
+    await this.deliverWatchdogWake(goal, shellExitText(shell.id, status, shell.exit, tail));
+  }
+
+  /**
+   * Restart reconciliation (spec §7.1, once in start() before the event
+   * loop) — rebuild from persisted facts for every active goal:
+   * 1. host already took over (a context message carries metadata
+   *    notice === "restart" — the host restart.ts synthetic; TODO(task13)) →
+   *    NO new wake, only re-arm the watchdog (re-verify each waiting shell
+   *    against probe.list; the host's sweep re-runs the turn, so "session
+   *    active" is mechanically implied by the notice's presence — a fresh
+   *    controller cannot observe activity any other way at start time);
+   * 2. otherwise (truly idle — the common unattended case): per waiting
+   *    shell — gone from probe → lost wake (+ cancel OUR pending inbox
+   *    wakes so the old wake cannot double-deliver later); still running →
+   *    re-arm with since re-anchored to now; exited → result wake.
+   */
+  private async reconcile(): Promise<void> {
+    let entries: Array<{ key: string; value: unknown }>;
+    try {
+      entries = await this.probe.storageScan("goal/");
+    } catch (err) {
+      console.warn("opencode-goal: restart reconciliation skipped (storage scan failed):", err);
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.key.includes("/archived/")) continue;
+      const goal = entry.value as GoalRecord | undefined;
+      if (goal === undefined || goal.status !== "active") continue;
+      try {
+        await this.reconcileGoal(goal);
+      } catch (err) {
+        console.warn(`opencode-goal: restart reconciliation failed for goal ${goal.id}:`, err);
+      }
+    }
+  }
+
+  private async reconcileGoal(goal: GoalRecord): Promise<void> {
+    const sessionID = goal.sessionID;
+    const waiting = goal.waitingShells ?? [];
+    if (waiting.length === 0) return;
+    let context: SessionMessage[];
+    try {
+      context = await this.probe.context(sessionID);
+    } catch {
+      context = [];
+    }
+    // Probe facts must be TRUSTED before any per-shell disposition: an
+    // unavailable probe (not wired at all, or list() failed) means we have NO
+    // facts — the watchdog only checks facts, never predicts (看门狗只查事实
+    // 不预测). "No facts" is NOT "shells are gone": a lost wake or a dropped
+    // waitingShells entry on empty facts would fabricate the opposite.
+    let probes: Awaited<ReturnType<NonNullable<ControllerDeps["shellProbe"]>["list"]>> = [];
+    let probeOk = true;
+    if (this.deps.shellProbe === undefined) {
+      probeOk = false;
+      console.warn(`opencode-goal: reconcile — no shell probe wired for ${sessionID}; keeping waiting shells as-is`);
+    } else {
+      try {
+        probes = await this.deps.shellProbe.list();
+      } catch (err) {
+        probeOk = false;
+        console.warn(`opencode-goal: reconcile probe.list failed for ${sessionID}:`, err);
+      }
+    }
+    if (!probeOk) {
+      // No facts: skip per-shell disposition ENTIRELY — keep every waiting
+      // shell, re-anchor the countdown, re-arm (the running ticks keep trying
+      // and will act as soon as facts come back). No wake, no inboxCancel.
+      for (const w of waiting) {
+        w.since = Date.now();
+        this.shellWatch.set(w.id, { tail: undefined, lastTailAt: Date.now(), checkedIn: false, changed: false });
+      }
+      await this.saveGoal(goal);
+      this.ensureWatchdog(sessionID);
+      return;
+    }
+    const byId = new Map(probes.map((p) => [p.id, p]));
+    const restartNotice = context.some((m) => {
+      const md = (m as { metadata?: unknown }).metadata;
+      return isPlainObject(md) && (md as Record<string, unknown>).notice === "restart";
+    });
+    if (restartNotice) {
+      // Host took over: no new wake. Re-verify; keep only shells still
+      // running (gone ones: the host delivered the cancelled notice; exited
+      // ones: the host's fast path delivered the real result).
+      goal.waitingShells = waiting.filter((w) => byId.get(w.id)?.state === "running");
+      for (const w of goal.waitingShells) {
+        w.since = Date.now();
+        this.shellWatch.set(w.id, { tail: undefined, lastTailAt: Date.now(), checkedIn: false, changed: false });
+      }
+      await this.saveGoal(goal);
+      this.ensureWatchdog(sessionID);
+      return;
+    }
+    // Truly idle: reconcile each waiting shell against the probe facts.
+    const lostIds: string[] = [];
+    const stillWaiting: NonNullable<GoalRecord["waitingShells"]> = [];
+    for (const w of waiting) {
+      const p = byId.get(w.id);
+      if (p === undefined) {
+        lostIds.push(w.id);
+        this.shellWatch.delete(w.id);
+        continue;
+      }
+      if (p.state === "exited") {
+        this.shellWatch.delete(w.id);
+        await this.deliverWatchdogWake(goal, shellExitText(w.id, "exited", p.exitCode, p.outputTail));
+        continue;
+      }
+      w.since = Date.now(); // re-arm with a fresh countdown anchor
+      stillWaiting.push(w);
+      this.shellWatch.set(w.id, { tail: undefined, lastTailAt: Date.now(), checkedIn: false, changed: false });
+    }
+    if (lostIds.length > 0) {
+      // Cancel OUR pending inbox wakes so the old wake cannot double-deliver
+      // later (spec §7.1 step 2, verbatim "metadata goalWake": the NORMAL
+      // stall-ladder wakes from injectWake carry metadata goalWake and are
+      // what get cancelled. Watchdog wakes carry goalControl and are NOT
+      // cancelled by reconcile. TODO(task13) verify the inbox payload shape
+      // in live smoke).
+      try {
+        const items = await this.probe.inboxList(sessionID);
+        for (const item of items) {
+          const md = item.payload?.metadata;
+          if (isPlainObject(md) && (md as Record<string, unknown>).goalWake === true) {
+            try {
+              await this.probe.inboxCancel(item.id);
+            } catch {
+              // best-effort
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`opencode-goal: reconcile inboxList failed for ${sessionID}:`, err);
+      }
+      await this.deliverWatchdogWake(goal, shellLostText(lostIds));
+    }
+    goal.waitingShells = stillWaiting;
+    await this.saveGoal(goal);
+    if (stillWaiting.length > 0) this.ensureWatchdog(sessionID);
+  }
+
+  /** Bounded in-memory eventID dedup (FIFO at HANDLED_ID_LIMIT). */
+  private rememberHandled(eventID: string | undefined): void {
+    if (eventID === undefined) return;
+    if (this.handledIDs.has(eventID)) return;
+    this.handledIDs.add(eventID);
+    this.handledOrder.push(eventID);
+    while (this.handledOrder.length > HANDLED_ID_LIMIT) {
+      const old = this.handledOrder.shift();
+      if (old !== undefined) this.handledIDs.delete(old);
+    }
+  }
+
+  /** Deep-copied read of the session's goal record (undefined when none). */
+  async snapshot(sessionID: string): Promise<GoalRecord | undefined> {
+    const raw = await this.probe.storageGet(goalStorageKey(sessionID));
+    if (raw === undefined) return undefined;
+    return structuredClone(raw as GoalRecord);
+  }
+
+  // ------------------------------------------------------------------
+  // command surface
+  // ------------------------------------------------------------------
+
+  /**
+   * One /goal command handler for all subcommands. Every failure becomes
+   * synthetic feedback (with the goalControl marker) — never a throw.
+   */
+  private async handleCommand(sessionID: string, text: string): Promise<void> {
+    let out: string;
+    try {
+      out = await this.dispatchCommand(sessionID, text);
+    } catch (err) {
+      out = `goal command failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    try {
+      await this.probe.synthetic({
+        sessionID,
+        text: out,
+        metadata: { goalControl: true },
+      });
+      // LastInbox attribution (spec §6-⑤): every goal command reply is a
+      // goalControl synthetic. In the real host the session.inbox.enqueued
+      // echo records it; the harness emits no echo for probe.synthetic, so
+      // this plugin records its own delivery (controller ruling fallback).
+      this.lastInbox.set(sessionID, { id: "control", kind: "control" });
+    } catch (err) {
+      // Best-effort delivery (fault-tolerance discipline).
+      console.warn("opencode-goal: failed to deliver goal feedback:", err);
+    }
+  }
+
+  private async dispatchCommand(sessionID: string, text: string): Promise<string> {
+    let tokens = text.trim().split(/\s+/).filter((t) => t.length > 0);
+    // Accept both the full "/goal set ..." form and the host-routed remainder
+    // "set ..." (the host strips the command name before calling us).
+    if (tokens[0] === "/goal" || tokens[0] === "goal") tokens = tokens.slice(1);
+    if (tokens.length === 0) return USAGE;
+    const [sub, ...rest] = tokens;
+    switch (sub) {
+      case "set":
+        return this.cmdSet(sessionID, rest);
+      case "view":
+        return this.viewGoal(sessionID);
+      case "pause":
+        return this.pauseGoal(sessionID);
+      case "resume":
+        return this.resumeGoal(sessionID);
+      case "complete":
+        if (rest.length === 0) return "missing evidence: /goal complete <evidence>";
+        return this.completeGoal(sessionID, rest.join(" "));
+      case "block":
+        if (rest.length === 0) return "missing reason: /goal block <reason>";
+        return this.blockGoal(sessionID, rest.join(" "));
+      case "clear":
+        return this.clearGoalFromCommand(sessionID);
+      case "history":
+        return this.historyGoal(sessionID);
+      case "task":
+        return this.cmdTask(sessionID, rest);
+      default:
+        return `unknown goal subcommand: "${sub}" — ${USAGE}`;
+    }
+  }
+
+  private async cmdSet(sessionID: string, tokens: string[]): Promise<string> {
+    const objectiveParts: string[] = [];
+    let turns: number | undefined;
+    let tokenCap: number | undefined;
+    let unbounded = false;
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (t === "--turns") {
+        const v = tokens[++i];
+        if (v === undefined) return `--turns expects a positive integer value`;
+        const n = Number(v);
+        if (!Number.isInteger(n) || n <= 0) return `--turns expects a positive integer (got "${v}")`;
+        turns = n;
+      } else if (t === "--tokens") {
+        const v = tokens[++i];
+        if (v === undefined) return `--tokens expects a positive integer value`;
+        const n = Number(v);
+        if (!Number.isInteger(n) || n <= 0) return `--tokens expects a positive integer (got "${v}")`;
+        tokenCap = n;
+      } else if (t === "--unbounded") {
+        unbounded = true;
+      } else if (t.startsWith("--")) {
+        return `unknown flag "${t}" — expected --turns, --tokens or --unbounded`;
+      } else {
+        objectiveParts.push(t);
+      }
+    }
+    const objective = objectiveParts.join(" ");
+    if (objective === "") return "missing objective: /goal set <objective> [--turns N] [--tokens N] [--unbounded]";
+    const cap: GoalRecord["cap"] = unbounded
+      ? {}
+      : {
+          turns: turns ?? this.options.defaultCapTurns,
+          tokens: tokenCap ?? this.options.defaultCapTokens,
+        };
+    return this.setGoal(sessionID, objective, cap);
+  }
+
+  private async cmdTask(sessionID: string, tokens: string[]): Promise<string> {
+    if (tokens.length === 0) return "usage: /goal task add <title> | /goal task <n> <todo|doing|done>";
+    const [first, ...rest] = tokens;
+    if (first === "add") {
+      const title = rest.join(" ");
+      if (title === "") return "missing task title: /goal task add <title>";
+      return this.taskAdd(sessionID, title);
+    }
+    if (rest.length !== 1 || !TASK_STATUSES.includes(rest[0] as GoalTaskStatus)) {
+      return "usage: /goal task <n> <todo|doing|done>";
+    }
+    return this.taskUpdate(sessionID, first, rest[0] as GoalTaskStatus);
+  }
+
+  // ------------------------------------------------------------------
+  // tool surface
+  // ------------------------------------------------------------------
+
+  /** Tool handler guard: any thrown error becomes a text reply, never a throw. */
+  private async guarded(name: string, core: () => Promise<string>): Promise<string> {
+    try {
+      return await core();
+    } catch (err) {
+      return `${name} failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  private async toolSet(sessionID: string, input: unknown): Promise<string> {
+    const rec = isPlainObject(input) ? input : {};
+    if (typeof rec.objective !== "string" || rec.objective.trim() === "") {
+      return 'goal_set: "objective" is required and must be a non-empty string';
+    }
+    let turns: number | undefined;
+    if (rec.turns !== undefined) {
+      if (typeof rec.turns !== "number" || !Number.isInteger(rec.turns) || rec.turns <= 0) {
+        return `goal_set: "turns" must be a positive integer (got ${String(rec.turns)})`;
+      }
+      turns = rec.turns;
+    }
+    let tokenCap: number | undefined;
+    if (rec.tokens !== undefined) {
+      if (typeof rec.tokens !== "number" || !Number.isInteger(rec.tokens) || rec.tokens <= 0) {
+        return `goal_set: "tokens" must be a positive integer (got ${String(rec.tokens)})`;
+      }
+      tokenCap = rec.tokens;
+    }
+    let unbounded = false;
+    if (rec.unbounded !== undefined) {
+      if (rec.unbounded !== true) {
+        return `goal_set: "unbounded" must be true when present (got ${String(rec.unbounded)})`;
+      }
+      unbounded = true;
+    }
+    const cap: GoalRecord["cap"] = unbounded
+      ? {}
+      : {
+          turns: turns ?? this.options.defaultCapTurns,
+          tokens: tokenCap ?? this.options.defaultCapTokens,
+        };
+    return this.setGoal(sessionID, rec.objective, cap);
+  }
+
+  private async toolComplete(sessionID: string, input: unknown): Promise<string> {
+    const rec = isPlainObject(input) ? input : {};
+    if (typeof rec.evidence !== "string" || rec.evidence.trim() === "") {
+      return 'goal_complete: "evidence" is required and must be a non-empty string';
+    }
+    return this.completeGoal(sessionID, rec.evidence);
+  }
+
+  private async toolBlock(sessionID: string, input: unknown): Promise<string> {
+    const rec = isPlainObject(input) ? input : {};
+    if (typeof rec.reason !== "string" || rec.reason.trim() === "") {
+      return 'goal_block: "reason" is required and must be a non-empty string';
+    }
+    return this.blockGoal(sessionID, rec.reason);
+  }
+
+  private async toolClear(sessionID: string, input: unknown): Promise<string> {
+    const rec = isPlainObject(input) ? input : {};
+    if (typeof rec.request !== "string" || rec.request.trim() === "") {
+      return 'goal_clear: "request" is required and must be a non-empty string';
+    }
+    return this.clearGoalFromTool(sessionID, rec.request);
+  }
+
+  private async toolHistory(sessionID: string, _input: unknown): Promise<string> {
+    // Takes no fields: any input (including garbage) is tolerated.
+    return this.historyGoal(sessionID);
+  }
+
+  private async toolAddTask(sessionID: string, input: unknown): Promise<string> {
+    const rec = isPlainObject(input) ? input : {};
+    if (typeof rec.title !== "string" || rec.title.trim() === "") {
+      return 'goal_add_task: "title" is required and must be a non-empty string';
+    }
+    return this.taskAdd(sessionID, rec.title);
+  }
+
+  private async toolUpdateTask(sessionID: string, input: unknown): Promise<string> {
+    const rec = isPlainObject(input) ? input : {};
+    const ref = rec.ref;
+    if (typeof ref !== "string" && typeof ref !== "number") {
+      return 'goal_update_task: "ref" is required (1-based index or task id)';
+    }
+    if (typeof rec.status !== "string" || !TASK_STATUSES.includes(rec.status as GoalTaskStatus)) {
+      return `goal_update_task: invalid status "${String(rec.status)}" (expected todo|doing|done)`;
+    }
+    return this.taskUpdate(sessionID, String(ref), rec.status as GoalTaskStatus);
+  }
+
+  private async toolWait(sessionID: string, input: unknown): Promise<string> {
+    const rec = isPlainObject(input) ? input : {};
+    const minutes = rec.minutes;
+    if (typeof minutes !== "number" || !Number.isInteger(minutes) || minutes < 1 || minutes > 60) {
+      return `goal_wait: "minutes" must be an integer between 1 and 60 (got ${String(minutes)})`;
+    }
+    return this.waitGoal(sessionID, minutes);
+  }
+
+  // ------------------------------------------------------------------
+  // core actions (shared by commands and tools)
+  // ------------------------------------------------------------------
+
+  /**
+   * Sessions holding an ACTIVE goal in THIS instance (Task 14 Fix 3b,
+   * timeoutWrap): kept in sync at the two choke points — every read goes
+   * through loadGoal (active hit → add) and every write through saveGoal
+   * (status non-active → delete, active → add), so no path is missed.
+   * Simplified ruling (controller): the timeoutWrap check is "this instance
+   * has ANY active goal" — no per-shell session attribution (single active
+   * goal is the main desktop scenario; a multi-session false positive only
+   * gives the host an extra timeout — direction-safe).
+   */
+  private activeGoalSessions = new Set<string>();
+
+  private async loadGoal(sessionID: string): Promise<GoalRecord | undefined> {
+    const raw = await this.probe.storageGet(goalStorageKey(sessionID));
+    if (raw === undefined) return undefined;
+    const goal = raw as GoalRecord;
+    if (goal.status === "active") this.activeGoalSessions.add(sessionID);
+    return goal;
+  }
+
+  /**
+   * Every save bumps updatedAt (Task 1 ruling). Storage write = best-effort.
+   *
+   * Task 14 Fix 1 (compare-and-set staleness guard): the judge await can span
+   * a whole load→mutate→save sequence — if a newer record (e.g. a user
+   * `/goal clear`/pause/supersede) landed in storage meanwhile, writing this
+   * stale record back would RESURRECT an already-terminal goal. So the save
+   * probes storage first: when the stored updatedAt is strictly NEWER than
+   * this record's pre-bump load baseline, the write is dropped (no bump, no
+   * storageSet) and false is returned. A storage read failure is treated as
+   * "no current record" (ruling: storage faults don't block the write —
+   * best-effort discipline).
+   *
+   * @returns true = written, false = dropped as stale.
+   */
+  private async saveGoal(goal: GoalRecord): Promise<boolean> {
+    const base = goal.updatedAt; // load baseline (pre-bump; every bump happens here)
+    let current: GoalRecord | undefined;
+    try {
+      const raw = await this.probe.storageGet(goalStorageKey(goal.sessionID));
+      if (raw !== undefined) current = raw as GoalRecord;
+    } catch (err) {
+      // storage read fault: proceed with current=undefined (best-effort)
+      current = undefined;
+    }
+    if (current !== undefined && current.updatedAt > base) {
+      console.warn(
+        `opencode-goal: stale write dropped for goal ${goal.id} ` +
+          `(load baseline ${base}, storage now ${String(current.updatedAt)} — a newer record landed meanwhile)`,
+      );
+      return false;
+    }
+    goal.updatedAt = Date.now();
+    try {
+      await this.probe.storageSet(goalStorageKey(goal.sessionID), goal);
+    } catch (err) {
+      console.warn(`opencode-goal: failed to save goal ${goal.id}:`, err);
+    }
+    // timeoutWrap sync (Task 14 Fix 3b): reflect the record's status
+    if (goal.status === "active") this.activeGoalSessions.add(goal.sessionID);
+    else this.activeGoalSessions.delete(goal.sessionID);
+    return true;
+  }
+
+  /** Terminal transition: archive copy under archivedGoalKey (same id rewrites). */
+  private async archiveGoal(goal: GoalRecord): Promise<void> {
+    try {
+      await this.probe.storageSet(archivedGoalKey(goal.sessionID, goal.id), goal);
+    } catch (err) {
+      console.warn(`opencode-goal: failed to archive goal ${goal.id}:`, err);
+    }
+  }
+
+  /**
+   * Terminal transition: save + archive copy under archivedGoalKey.
+   * Task 14 Fix 1: when the save is dropped as stale (compare-and-set guard),
+   * the archive is SKIPPED — an archive copy would claim a terminal state
+   * that storage never received.
+   * @returns false when the write was dropped (goal changed underneath).
+   */
+  private async finishGoal(
+    goal: GoalRecord,
+    status: GoalStatus,
+    patch?: Partial<Pick<GoalRecord, "evidence" | "blocker">>,
+  ): Promise<boolean> {
+    if (patch?.evidence !== undefined) goal.evidence = patch.evidence;
+    if (patch?.blocker !== undefined) goal.blocker = patch.blocker;
+    goal.status = status;
+    this.judgeInstruction.delete(goal.sessionID); // terminal: drop any pending judge paragraph
+    const saved = await this.saveGoal(goal);
+    if (!saved) return false;
+    await this.archiveGoal(goal);
+    return true;
+  }
+
+  private capText(goal: GoalRecord): string {
+    const cap = goal.cap;
+    const turns = cap.turns !== undefined ? `${cap.turns} turns` : "unbounded turns";
+    const tokens = cap.tokens !== undefined ? `${cap.tokens} tokens` : "unbounded tokens";
+    return `${turns} / ${tokens}`;
+  }
+
+  private async setGoal(sessionID: string, objective: string, cap: GoalRecord["cap"]): Promise<string> {
+    const existing = await this.loadGoal(sessionID);
+    if (existing !== undefined && !isTerminal(existing.status)) {
+      // Ruling R7 (spec §9): a refused set must NOT touch the old goal — no
+      // status change, no updatedAt bump, no archive write. The old goal is
+      // terminated first (complete/block/clear), then a new set succeeds.
+      return `goal ${existing.id} is still in progress (status: ${existing.status}): ` +
+        `complete, block or clear it before starting a new goal (${objective}).`;
+    }
+    const goal = createGoal({ sessionID, objective, cap });
+    this.judgeInstruction.delete(sessionID); // new goal: stale instruction must not leak over
+    await this.saveGoal(goal);
+    return `goal ${goal.id} created: ${objective} (cap: ${this.capText(goal)})`;
+  }
+
+  private async viewGoal(sessionID: string): Promise<string> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined) return "no active goal for this session";
+    return (
+      `[GOAL ${goal.id}] status: ${goal.status} | objective: ${goal.objective} | ` +
+      `cap: ${this.capText(goal)} | used: ${goal.used.turns} turns, ${goal.used.tokens} tokens`
+    );
+  }
+
+  /**
+   * Task 14 Fix 1: the "changed underneath" refusal for command/tool surfaces
+   * — a dropped stale write must NEVER be reported as a successful terminal
+   * transition (ruling: the user-facing wording carries "changed").
+   */
+  private changedUnderneath(goal: GoalRecord): string {
+    return `goal ${goal.id} changed underneath: a newer write landed meanwhile — reload and retry`;
+  }
+
+  private async completeGoal(sessionID: string, evidence: string): Promise<string> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined) return "no active goal for this session";
+    if (goal.status !== "active") return `goal ${goal.id} is not active (status: ${goal.status})`;
+    const transcript = await this.transcript(sessionID);
+    const problem = validateEvidence(evidence, transcript);
+    if (problem !== undefined) return problem;
+    const done = await this.finishGoal(goal, "completed", { evidence });
+    if (!done) return this.changedUnderneath(goal);
+    return `goal ${goal.id} completed: ${evidence}`;
+  }
+
+  private async blockGoal(sessionID: string, reason: string): Promise<string> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined) return "no active goal for this session";
+    if (goal.status !== "active") return `goal ${goal.id} is not active (status: ${goal.status})`;
+    if (reason.trim() === "") return `a non-empty reason is required to block goal ${goal.id}`;
+    const done = await this.finishGoal(goal, "blocked", { blocker: reason });
+    if (!done) return this.changedUnderneath(goal);
+    return `goal ${goal.id} blocked: ${reason}`;
+  }
+
+  /** /goal clear: the request is derived from the transcript itself. */
+  private async clearGoalFromCommand(sessionID: string): Promise<string> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined) return "no active goal for this session";
+    if (goal.status !== "active") return `goal ${goal.id} is not active (status: ${goal.status})`;
+    const transcript = await this.transcript(sessionID);
+    const request = this.findClearRequest(transcript);
+    if (request === undefined) {
+      return "no user clear request found in the transcript (fail-closed): the user must state the clear intent";
+    }
+    const problem = validateClearRequest(request, transcript);
+    if (problem !== undefined) return problem;
+    const done = await this.finishGoal(goal, "cleared");
+    if (!done) return this.changedUnderneath(goal);
+    return `goal ${goal.id} cleared`;
+  }
+
+  /** goal_clear tool: an explicit request string, grounded in the transcript. */
+  private async clearGoalFromTool(sessionID: string, request: string): Promise<string> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined) return "no active goal for this session";
+    if (goal.status !== "active") return `goal ${goal.id} is not active (status: ${goal.status})`;
+    const transcript = await this.transcript(sessionID);
+    const problem = validateClearRequest(request, transcript);
+    if (problem !== undefined) return problem;
+    const done = await this.finishGoal(goal, "cleared");
+    if (!done) return this.changedUnderneath(goal);
+    return `goal ${goal.id} cleared: ${request}`;
+  }
+
+  /** Latest user message that looks like a clear intent (candidate filter only). */
+  private findClearRequest(transcript: TranscriptMessage[]): string | undefined {
+    for (let i = transcript.length - 1; i >= 0; i--) {
+      const m = transcript[i];
+      if (m.type !== "user") continue;
+      const text = m.text ?? "";
+      if (text.length >= MIN_CLEAR_REQUEST_LENGTH && CLEAR_KEYWORD_RE.test(text.toLowerCase())) return text;
+    }
+    return undefined;
+  }
+
+  private async pauseGoal(sessionID: string): Promise<string> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined) return "no active goal for this session";
+    if (goal.status === "paused") return `goal ${goal.id} is already paused`;
+    if (goal.status !== "active") return `goal ${goal.id} is not active (status: ${goal.status})`;
+    goal.status = "paused";
+    await this.saveGoal(goal);
+    return `goal ${goal.id} paused`;
+  }
+
+  private async resumeGoal(sessionID: string): Promise<string> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined) return "no active goal for this session";
+    if (goal.status === "active") return `goal ${goal.id} is already active`;
+    if (goal.status !== "paused") return `goal ${goal.id} is not active (status: ${goal.status})`;
+    goal.status = "active";
+    await this.saveGoal(goal);
+    // Task 14 Fix 4: a paused goal was disarmed by the tick's ghost rule
+    // (status !== active → disarmWatchdog) — resume must RE-ARM the watchdog
+    // for the still-waiting shells, or they would be checked by nobody.
+    if ((goal.waitingShells ?? []).length > 0) {
+      this.ensureWatchdog(sessionID);
+    }
+    return `goal ${goal.id} resumed (active)`;
+  }
+
+  private async taskAdd(sessionID: string, title: string): Promise<string> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined || isTerminal(goal.status)) return "no active goal for this session";
+    if (title.trim() === "") return "a non-empty task title is required";
+    try {
+      addTask(goal, title);
+    } catch (err) {
+      if (err instanceof TaskLimitError) return `${err.message}: no more tasks can be added`;
+      throw err;
+    }
+    await this.saveGoal(goal);
+    return `task ${goal.tasks.length} added: ${title}`;
+  }
+
+  private async taskUpdate(sessionID: string, ref: string, status: GoalTaskStatus): Promise<string> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined || isTerminal(goal.status)) return "no active goal for this session";
+    if (goal.tasks.length === 0) return `goal ${goal.id} has no tasks`;
+    const index = resolveTaskRef(goal.tasks, ref);
+    if (index === -1) return `task ref "${ref}" not found (goal has ${goal.tasks.length} tasks)`;
+    const task = goal.tasks[index - 1];
+    task.status = status;
+    task.updatedAt = Date.now();
+    await this.saveGoal(goal);
+    return `task ${index} -> ${status}`;
+  }
+
+  private async historyGoal(sessionID: string): Promise<string> {
+    const prefix = `${goalStorageKey(sessionID)}/archived/`;
+    let entries: Array<{ key: string; value: unknown }>;
+    try {
+      entries = await this.probe.storageScan(prefix);
+    } catch (err) {
+      console.warn(`opencode-goal: failed to scan archived goals for ${sessionID}:`, err);
+      return `no archived goals for this session`;
+    }
+    if (entries.length === 0) return `no archived goals for this session`;
+    const lines = entries.map((e) => {
+      const g = e.value as GoalRecord;
+      return `- ${g.id} (${g.status}) ${g.objective}`;
+    });
+    return `archived goals:\n${lines.join("\n")}`;
+  }
+
+  private async waitGoal(sessionID: string, minutes: number): Promise<string> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined) return "no active goal for this session";
+    if (goal.status !== "active") return `goal ${goal.id} is not active (status: ${goal.status})`;
+    const waitUntil = Date.now() + minutes * 60_000;
+    goal.waitUntil = waitUntil;
+    await this.saveGoal(goal);
+    return `goal ${goal.id} will not be woken for ${minutes} minutes (until ${new Date(waitUntil).toISOString()})`;
+  }
+
+  // ------------------------------------------------------------------
+  // transcript access
+  // ------------------------------------------------------------------
+
+  /** Host transcript -> evidence.ts TranscriptMessage[] (best-effort). */
+  private async transcript(sessionID: string): Promise<TranscriptMessage[]> {
+    let messages: SessionMessage[];
+    try {
+      messages = await this.probe.context(sessionID);
+    } catch {
+      return [];
+    }
+    return messages.map((m) => {
+      const out: TranscriptMessage = { type: typeof m.type === "string" ? m.type : undefined };
+      if (typeof m.text === "string") out.text = m.text;
+      if (Array.isArray(m.content)) {
+        out.content = (m.content as unknown[]).map((c) => {
+          if (typeof c === "object" && c !== null && typeof (c as { text?: unknown }).text === "string") {
+            return { text: (c as { text: string }).text };
+          }
+          return { text: undefined };
+        });
+      }
+      return out;
+    });
+  }
+}

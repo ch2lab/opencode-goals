@@ -1,0 +1,8 @@
+.superpowers/
+node_modules/
+dist/
+.publish-staging/
+*.log
+
+memory.jsonc
+
