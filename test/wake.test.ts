@@ -129,6 +129,59 @@ test("judge section is absent when no instruction is provided", () => {
   expect(msg).not.toContain("裁判提示");
 });
 
+// --- wakeDetail "slim" (2026-10-17 transcript-noise ruling) ---
+// The context-hook system part (objectiveBlock) already carries
+// objective/budget before EVERY model call, so the slim wake drops the
+// budget/objective/progress re-grounding and keeps header + one-line
+// forced-tool-call instruction (+ judge / wakeText channels unchanged).
+
+test("slim detail: header + one-line trigger only — no budget/objective/progress re-grounding", () => {
+  const g = goalWith({
+    tasks: [
+      makeTask("first task", "done", 1),
+      makeTask("second task", "doing", 2),
+    ],
+  });
+  const msg = buildWakeMessage(g, "10 turns", undefined, undefined, "slim");
+  expect(msg).toBe(
+    [
+      "[GOAL g_abc | 第 3/10 轮]",
+      "核对进度（目标与预算见 [GOAL] 系统上下文），必须用工具调用结束本轮：完成 → goal_complete(evidence，具体可核对锚点 ≥24 字符)；受阻 → goal_block(具体原因)；否则 → 推进（先 goal_add_task 规划 / goal_update_task 同步）。",
+    ].join("\n"),
+  );
+  // the dropped re-grounding blocks
+  expect(msg).not.toContain("预算:");
+  expect(msg).not.toContain("目标:");
+  expect(msg).not.toContain("进度:");
+  expect(msg).not.toContain("first task");
+  // the forced-tool-call contract survives
+  expect(msg).toContain("goal_complete");
+  expect(msg).toContain("goal_block");
+  expect(msg).toContain("goal_add_task");
+  expect(msg).toContain("goal_update_task");
+});
+
+test("slim detail: judge + wakeText channels still append in the same order", () => {
+  const msg = buildWakeMessage(goalWith({}), "10 turns", "看 CI 日志", "先跑测试", "slim");
+  expect(msg).toContain("裁判提示: 看 CI 日志");
+  expect(msg.endsWith("补充指示: 先跑测试")).toBe(true);
+  expect(msg.indexOf("裁判提示")).toBeLessThan(msg.indexOf("补充指示"));
+});
+
+test("slim detail: no judge section means the trigger line is the last body line", () => {
+  const msg = buildWakeMessage(goalWith({}), "10 turns", undefined, undefined, "slim");
+  expect(msg).not.toContain("裁判提示");
+  expect(msg).not.toContain("补充指示");
+  expect(msg.split("\n").length).toBe(2);
+});
+
+test("full detail is the explicit opt-out (5th arg, same as the default)", () => {
+  const g = goalWith({});
+  const full = buildWakeMessage(g, "10 turns", undefined, undefined, "full");
+  expect(full).toBe(buildWakeMessage(g, "10 turns"));
+  expect(full).toContain("目标:");
+});
+
 // --- empty tasks ---
 
 test("goal with no tasks: no-todo marker, no task lines, rest of contract holds", () => {

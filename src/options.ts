@@ -12,6 +12,11 @@ export interface Options {
   shellStallMs: number;
   waitCheckInMs: number;
   timeoutWrap: boolean;
+  /** Wake transcript footprint: "full" (budget + objective + task progress
+   *  re-grounded in the wake message) or "slim" (one-line trigger only —
+   *  the context-hook system part already carries objective/budget before
+   *  every model call). Default "slim" (2026-10-17 transcript-noise ruling). */
+  wakeDetail: "full" | "slim";
   wakeText?: string;
   model?: ModelRef;
 }
@@ -25,6 +30,7 @@ const DEFAULT_OPTIONS: Options = {
   shellStallMs: 300000,
   waitCheckInMs: 300000,
   timeoutWrap: false,
+  wakeDetail: "slim",
 };
 
 export function resolveOptions(pluginOptions: Record<string, unknown>): Options {
@@ -45,6 +51,12 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
   const wakeText =
     typeof o.wakeText === "string" && o.wakeText.length > 0 ? o.wakeText : undefined;
   const model = parseModelRef(o.model);
+  // wakeDetail: strict "full"|"slim" strings; anything else falls back to
+  // the default (same fault-tolerance style as the numeric/boolean fields).
+  const wakeDetail =
+    o.wakeDetail === "full" || o.wakeDetail === "slim"
+      ? (o.wakeDetail as "full" | "slim")
+      : DEFAULT_OPTIONS.wakeDetail;
 
   return {
     stallLimit: num("stallLimit", DEFAULT_OPTIONS.stallLimit),
@@ -56,6 +68,7 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
     shellStallMs: num("shellStallMs", DEFAULT_OPTIONS.shellStallMs),
     waitCheckInMs: num("waitCheckInMs", DEFAULT_OPTIONS.waitCheckInMs),
     timeoutWrap: bool("timeoutWrap", DEFAULT_OPTIONS.timeoutWrap),
+    wakeDetail,
     wakeText,
     model,
   };

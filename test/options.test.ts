@@ -11,6 +11,7 @@ const EXPECTED_DEFAULTS: Options = {
   shellStallMs: 300000,
   waitCheckInMs: 300000,
   timeoutWrap: false,
+  wakeDetail: "slim",
   wakeText: undefined,
 };
 
@@ -25,6 +26,7 @@ test("empty input yields every default exactly", () => {
   expect(o.shellStallMs).toBe(300000);
   expect(o.waitCheckInMs).toBe(300000);
   expect(o.timeoutWrap).toBe(false);
+  expect(o.wakeDetail).toBe("slim");
   expect(o.wakeText).toBeUndefined();
   expect(o).toEqual(EXPECTED_DEFAULTS);
 });
@@ -95,6 +97,19 @@ test("wakeText accepts only non-empty strings", () => {
   expect(resolveOptions({ wakeText: null }).wakeText).toBeUndefined();
   expect(resolveOptions({ wakeText: "  " }).wakeText).toBe("  ");
   expect(resolveOptions({ wakeText: "go" }).wakeText).toBe("go");
+});
+
+// --- wakeDetail (2026-10-17: wake transcript footprint; default "slim") ---
+
+test("wakeDetail: default 'slim'; 'full' is the explicit opt-in; anything else falls back to 'slim'", () => {
+  expect(resolveOptions({}).wakeDetail).toBe("slim");
+  expect(resolveOptions({ wakeDetail: "slim" }).wakeDetail).toBe("slim");
+  expect(resolveOptions({ wakeDetail: "full" }).wakeDetail).toBe("full");
+  // invalid / wrong-type values fall back to the default
+  expect(resolveOptions({ wakeDetail: "FULL" }).wakeDetail).toBe("slim");
+  expect(resolveOptions({ wakeDetail: "minimal" }).wakeDetail).toBe("slim");
+  expect(resolveOptions({ wakeDetail: 1 }).wakeDetail).toBe("slim");
+  expect(resolveOptions({ wakeDetail: null }).wakeDetail).toBe("slim");
 });
 
 // --- model (2026-10-16: side-channel model for judge / compaction) ---

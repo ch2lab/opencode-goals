@@ -46,6 +46,51 @@ import { buildCompactionPrompt, composeCompactionSummary, goalSystemPart } from 
 import { decidePermission, GOAL_CONTROL_ACTION } from "./permission";
 import type { HostEvent, PermissionDecision, PermissionHookInput, SessionMessage, WakeProbe } from "./types";
 
+// ---------------------------------------------------------------------------
+// Single-instance guard (2026-10-16 field incident, aiserver5/129): the host's
+// plugin hot-reload re-runs setup() WITHOUT disposing the previous instance
+// (host log: 3x "loading plugin" within one second on the config swap, zero
+// unload lines) → N live controllers on the same event stream + shared
+// storage → every terminal boundary arbitrated N times → N duplicate boundary
+// wakes (identical turn stamp), which piled up in the session inbox queue
+// during long busy scripts and flooded the model at once.
+//
+// The registry lives on globalThis, NOT module state: a host hot-reload can
+// re-import the plugin module, which would reset module-level variables.
+// Key = plugin id + location directory (the host may legitimately run
+// separate instances per location; same location → one live controller).
+// ---------------------------------------------------------------------------
+
+const LIVE_REGISTRY = Symbol.for("opencode-goal:live-controllers");
+
+type LiveSlot = { stop: () => Promise<void> };
+
+function liveRegistry(): Map<string, LiveSlot> {
+  const g = globalThis as unknown as Record<symbol, unknown>;
+  let reg = g[LIVE_REGISTRY] as Map<string, LiveSlot> | undefined;
+  if (reg === undefined) {
+    reg = new Map();
+    g[LIVE_REGISTRY] = reg;
+  }
+  return reg;
+}
+
+/** Bounded wait: the takeover must never hang on a stuck previous instance. */
+function stopWithTimeout(stop: () => Promise<void>, ms: number, label: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  return Promise.race([
+    stop().catch((err) => {
+      console.warn(`opencode-goal: ${label}:`, err);
+    }),
+    timeout,
+  ]).finally(() => {
+    clearTimeout(timer);
+  });
+}
+
 export interface ShellProbe {
   list(): Promise<Array<{ id: string; state: "running" | "exited"; exitCode?: number; outputTail?: string }>>;
 }
@@ -388,6 +433,22 @@ export class GoalController {
    * returns the cleanup function (awaited by the plugin entry on dispose).
    */
   async start(): Promise<() => Promise<void>> {
+    // Single-instance guard: a host hot-reload may set this plugin up again
+    // while the previous instance is still alive — stop the displaced owner
+    // of this location key BEFORE arming (field incident 2026-10-16: triple
+    // wakes per boundary from three concurrent controllers). Ownership is
+    // taken up front so a stalled old stop (bounded below) cannot block the
+    // takeover.
+    const key = `opencode-goal:${
+      typeof this.probe.locationDirectory === "string" ? this.probe.locationDirectory : "global"
+    }`;
+    const reg = liveRegistry();
+    const prev = reg.get(key);
+    if (prev !== undefined) {
+      reg.delete(key);
+      await stopWithTimeout(prev.stop, 10_000, `stopping displaced controller (${key}) timed out`);
+    }
+
     this.probe.registerCommand("goal", (text, sessionID) => this.handleCommand(sessionID, text));
 
     this.probe.registerTool(
@@ -563,7 +624,7 @@ export class GoalController {
     this.stopped = false;
     this.loopIter = this.probe.eventSubscribe()[Symbol.asyncIterator]();
     this.loopPromise = this.runLoop(this.loopIter);
-    return async () => {
+    const cleanup = async (): Promise<void> => {
       this.stopped = true;
       // Task 10: cleanup stops EVERYTHING — all per-goal watchdog timers,
       // watch state and pending tick work (test/watchdog.test.ts #10).
@@ -587,7 +648,15 @@ export class GoalController {
       } catch {
         // runLoop swallows per-event failures (fault-tolerance discipline)
       }
+      // Single-instance guard: deregister only while this instance still
+      // OWNS the key — a displaced instance's late cleanup must not delete
+      // the successor's entry.
+      const r = liveRegistry();
+      if (r.get(key) === slot) r.delete(key);
     };
+    const slot: LiveSlot = { stop: cleanup };
+    reg.set(key, slot);
+    return cleanup;
   }
 
   // ------------------------------------------------------------------
@@ -1033,7 +1102,15 @@ export class GoalController {
         // (boundary wake / judge-demoted wake). The watchdog check-in wakes
         // below are an INDEPENDENT text family (shellCheckInText/…) and do
         // NOT carry wakeText (ruling: wakeText does not apply to check-ins).
-        text: buildWakeMessage(goal, this.capText(goal), judgeInstruction, this.options.wakeText),
+        // options.wakeDetail selects the transcript footprint (2026-10-17:
+        // default "slim" — objective/budget ride the per-turn system part).
+        text: buildWakeMessage(
+          goal,
+          this.capText(goal),
+          judgeInstruction,
+          this.options.wakeText,
+          this.options.wakeDetail,
+        ),
         delivery: "queue",
         metadata: { goalWake: true, goalID: goal.id, goalTurn: goal.used.turns },
       });

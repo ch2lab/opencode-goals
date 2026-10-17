@@ -137,6 +137,43 @@ test("1: boundary wake — succeeded with sessionID + event id injects a queue w
   await stop();
 });
 
+test("1b: wake transcript footprint — default is 'slim' (one-line trigger); wakeDetail 'full' restores the re-grounding blocks", async () => {
+  // Default (options.wakeDetail "slim", 2026-10-17 ruling): header +
+  // one-line forced-tool-call trigger. Objective/budget ride the per-turn
+  // context-hook system part; task progress rides transcript history +
+  // compaction — the wake does not repeat them.
+  {
+    const { h, stop } = await boot();
+    const g = await setGoalDirect(h);
+    await h.emit(succeeded("e1"));
+    const t = h.prompts[0].input.text;
+    expect(t).toContain(`[GOAL ${g.id} | 第 1/(unbounded) 轮]`);
+    expect(t).toContain("goal_complete");
+    expect(t).toContain("goal_block");
+    expect(t).toContain("goal_add_task");
+    expect(t).toContain("goal_update_task");
+    expect(t).not.toContain("预算:");
+    expect(t).not.toContain("目标:");
+    expect(t).not.toContain("进度:");
+    await stop();
+  }
+  // Explicit "full": the pre-2026-10-17 shape (budget + objective + progress
+  // re-grounded inside the wake message itself).
+  {
+    const h = await createHarness();
+    const ctrl = new GoalController(h.probe, resolveOptions({ wakeDetail: "full" }), {});
+    const stop = await ctrl.start();
+    const g = await setGoalDirect(h);
+    await h.emit(succeeded("e1"));
+    const t = h.prompts[0].input.text;
+    expect(t).toContain("预算: unbounded turns / unbounded tokens");
+    expect(t).toContain(`目标: ${g.objective}`);
+    expect(t).toContain("进度:");
+    expect(t).toContain("请核对以上进度");
+    await stop();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // 2. dedup (same eventID / continuationPending window / started re-arms)
 // ---------------------------------------------------------------------------
