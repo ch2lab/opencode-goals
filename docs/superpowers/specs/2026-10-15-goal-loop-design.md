@@ -410,3 +410,21 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 - **修复（`src/controller.ts`）**：窗口改**时间限界**（默认 10s，`deps.contWindowMs` 可注入）——同一回合终态的兄弟事件（`execution.succeeded` → `session.idle`）毫秒级到达；超出窗口才到的边界必是唤醒回合自己的终态 → 关窗、正常仲裁。单条事件丢失不再能把 goal 推出循环。skip 路径同时补**决策日志行**（`decision:"skip"`, `reason:"continuationPending window (sibling boundary)"`）——跳过从此可见。
 - **测试**：`test/single-instance.test.ts` test 4（RED：旧逻辑下 `wakeCount` 停在 1 = 现场签名"goal 死循环"；GREEN：窗口过期后边界被正常仲裁，`wakeCount` 2）。
 - 129 重播种（新构建）待用户 GO，机制同 §18 部署（缓存目录播种 + options nudge）。
+
+## 20. 2026-10-17 修订（provider 失败暂停：模型跑不起来时别再空转唤醒）
+
+129 现场事故（截图 + 决策日志实证）：provider 断供（`Upstream request failed: Insufficient account funds`）时，**每个失败回合都产生终态边界 → 插件判 in-flight 0 → 照常发 wake → 下个回合又失败 → 再 wake**（turn 51/52/53 连发）。stall 阶梯没兜住：用户期间发的"加油。"使 `lastInbox=user` → 按设计"有人在场不算 stall"→ `stalls` 反复归零 → 无限循环。同时 `used.turns` 被失败回合消耗（"turn 51"里大部分是失败请求）。根因：插件把"模型停止没进展"（该 wake——循环的本义）和"模型根本没跑起来（provider 挂了）"（wake 纯属空转，余额/路由问题不会因再 prompt 一次自己好）当成同一种零进展处理。
+
+**用户裁定（2026-10-17）**：`goal_block` 不可行——这是模型问题，不是对话流程业务限制 → **静默暂停 + 退避自动重试**（恢复后无人值守继续跑）。
+
+**契约钉（129 实机消息流取证，2026-10-17）**：失败回合的 assistant 消息带 `error = { type: "provider.quota", message: "Upstream request failed: Insufficient account funds" }`（宿主 schema `Session.Message.Assistant.error` = `Session.StructuredError { type, message, status? }`）。provider 级错误类型形如 `provider.quota` / `provider.error` / `provider.auth` / `provider.no-route` / `provider.content-filter`；`ToolError` / `Interrupted` / `ExecutionInterrupted` / `unknown` 属正常运行，**永不**触发暂停。
+
+- **修复（`src/state.ts` / `src/options.ts` / `src/wake.ts` / `src/controller.ts`）**：
+  - `GoalRecord.providerPause?: { until, noticeSent }`；新选项 `providerFailLimit`（默认 2——单次瞬断仍给一次唤醒机会）、`providerPauseMs`（默认 30min）。
+  - 边界仲裁新增前置分支：`lastAssistantProviderError`（最后一个 assistant 消息的 `error.type` 含 `provider`；context 查询失败 = fail-open 按正常处理，永不假暂停）。errored 边界 → 连击计数；**连击 ≥ 上限（或暂停已过期）→ 进入/续期暂停**：不发 wake、不计 stall、不计 `used.turns`、**一条** synthetic 通知（每次事故一次，`noticeSent` 持久化在 goal 记录上——续期不重复通知）、写决策行 `skip: provider failure streak N — paused 30m`、看门狗 re-arm 作为重试心跳。
+  - **干净边界（模型又跑起来了）→ 清连击 + 清暂停 → 正常仲裁恢复循环**（用户换模型/充值后自动续跑）。
+  - 连击 1（未达上限）→ 照常 wake 但**不计 `used.turns`**（`injectWake(goal, countTurn=false)`）——失败回合不烧预算、不污染 "turn N" 计数。
+  - 暂停期间：in-flight 门按 quiet 处理（不武装 check-in）、tick 不投递 check-in（失败投递 = 又一个 doomed 回合）。
+  - **到期**：watchdog tick 发**一条** retry wake（goalControl，watchdog 文案族，`providerPauseRetryText`）；该 retry 的边界解决暂停——errored → 续期（不重复通知）、clean → 清除。disarm 条件放宽：未过期的暂停存在时 tick 保持运行（否则 30min 后无人点火重试）。
+- **测试**：`test/arbiter.test.ts` test 15-19（RED → GREEN）：15 首次 errored 边界唤醒一次且不计数、二连触发暂停（一通知、不计 stall）；16 三犯续期不重复通知、干净边界清除并恢复计数；17 到期看门狗恰好发一条 retry、失败重试续期不重发通知、下个期限再发；18 非 provider 错误（ToolError）不暂停；19 暂停期间 in-flight 边界静默（check-in 不武装不投递）。`test/options.test.ts` 默认值断言同步补两新字段。
+- 129 重播种（含本修复的新构建）待用户 GO，机制同 §18/§19 部署。

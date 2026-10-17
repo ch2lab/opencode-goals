@@ -41,7 +41,7 @@ import {
   type TranscriptMessage,
 } from "./evidence";
 import type { Judge, JudgeVerdict } from "./judge";
-import { backgroundCheckInText, buildWakeMessage } from "./wake";
+import { backgroundCheckInText, buildWakeMessage, providerPauseNoticeText, providerPauseRetryText } from "./wake";
 import { buildCompactionPrompt, composeCompactionSummary } from "./compact";
 import { decidePermission, GOAL_CONTROL_ACTION } from "./permission";
 import { appendDecision } from "./decisionlog";
@@ -343,6 +343,14 @@ export class GoalController {
    * boundary closes it (controller ruling I1).
    */
   private pendingSkipped = new Map<string, string>();
+  /**
+   * Consecutive provider-errored boundaries per session (2026-10-17 ruling,
+   * 129 quota incident). Reaching `providerFailLimit` arms the provider pause
+   * (goal.providerPause); any CLEAN boundary (model ran) resets to zero.
+   * In-memory only: a hot reload restarts the streak at 0 — a re-detected
+   * failure simply re-arms the pause.
+   */
+  private providerFailStreak = new Map<string, number>();
   /** "Last enqueued inbox item" per session (spec §6-⑤) — attribution source. */
   private lastInbox = new Map<string, LastInboxEntry>();
   /** Latest wake inbox per session: reclassifies the host's enqueued echo of OUR prompt. */
@@ -1045,6 +1053,62 @@ export class GoalController {
       this.rememberHandled(eventID);
       return;
     }
+    // Provider failure pause (2026-10-17 ruling, 129 "Insufficient account
+    // funds" incident): a boundary whose LAST assistant message carries a
+    // provider.* error is NOT a model stop — the turn failed before the model
+    // ran, and re-waking only burns another doomed request (user cheers kept
+    // resetting the stall ladder, so the ladder never self-limited it).
+    // Streak >= providerFailLimit → pause: no wake, no stall accounting, no
+    // turn counting, ONE synthetic notice, watchdog retries after
+    // providerPauseMs. A CLEAN boundary (model ran again) clears the streak
+    // and pause and resumes normal arbitration.
+    const errored = await this.lastAssistantProviderError(sessionID);
+    if (errored) {
+      const streak = (this.providerFailStreak.get(sessionID) ?? 0) + 1;
+      this.providerFailStreak.set(sessionID, streak);
+      const pause = goal.providerPause;
+      if (streak >= this.options.providerFailLimit || (pause !== undefined && Date.now() >= pause.until)) {
+        const noticeSent = pause?.noticeSent ?? false;
+        const minutes = Math.round(this.options.providerPauseMs / 60000);
+        goal.providerPause = { until: Date.now() + this.options.providerPauseMs, noticeSent };
+        await appendDecision({
+          ts: new Date().toISOString(),
+          sessionID,
+          goalID: goal.id,
+          own: 0,
+          other: 0,
+          ownKnown: true,
+          decision: "skip",
+          reason: `provider failure streak ${streak} — paused ${minutes}m`,
+        });
+        if (!noticeSent) {
+          try {
+            await this.probe.synthetic({
+              sessionID,
+              text: providerPauseNoticeText(goal.id, minutes),
+              metadata: { goalControl: true },
+            });
+            goal.providerPause!.noticeSent = true; // one per INCIDENT (a re-arm must not re-notify)
+          } catch (err) {
+            console.warn(`opencode-goal: failed to deliver provider-pause notice for goal ${goal.id}:`, err);
+          }
+        }
+        this.ensureWatchdog(sessionID); // the tick is the retry deadline's heartbeat
+        this.markTurnInactive(sessionID);
+        await this.recordHandled(sessionID, eventID, goal);
+        await this.saveGoal(goal);
+        return;
+      }
+      // Streak below the limit (no active pause): one more wake attempt
+      // (transient-hiccup tolerance) — but the doomed turn does not consume
+      // the turn budget (countTurn=false at the wake injection below).
+    } else {
+      this.providerFailStreak.delete(sessionID);
+      if (goal.providerPause !== undefined) {
+        goal.providerPause = undefined; // the model ran again — resume the loop
+        await this.saveGoal(goal);
+      }
+    }
     // Background in-flight gate (2026-10-17 ruling): a terminal boundary with
     // ANY background work in flight — the goal's own running shells (host
     // shell store, shell.list) OR other in-flight sessions of this project
@@ -1077,7 +1141,10 @@ export class GoalController {
       return;
     }
     if (inFlight > 0) {
-      const quiet = goal.waitUntil !== undefined && Date.now() < goal.waitUntil;
+      // An ACTIVE provider pause silences the progress check like goal_wait's
+      // waitUntil window (a check-in wake during either is a doomed turn).
+      const pauseActive = goal.providerPause !== undefined && Date.now() < goal.providerPause.until;
+      const quiet = (goal.waitUntil !== undefined && Date.now() < goal.waitUntil) || pauseActive;
       const last = this.lastInbox.get(sessionID);
       const lastWatchdog = last !== undefined && last.kind === "wake" && last.watchdog === true;
       if (quiet || !lastWatchdog) {
@@ -1176,7 +1243,8 @@ export class GoalController {
         decision: "wake",
         reason: `boundary (in-flight ${inFlight})`,
       });
-      await this.injectWake(goal);
+      // A provider-errored boundary wakes without counting the doomed turn.
+      await this.injectWake(goal, !errored);
     }
     this.markTurnInactive(sessionID);
     // Regression fix (Task 9 brief, Task 8 M4 extract lost this): the tail
@@ -1198,10 +1266,12 @@ export class GoalController {
    * continuationPending = true, lastInbox = this wake (InboxRef.id).
    * Judge instruction channel (Task 9): a pending instruction (if any) rides
    * into THIS wake as the buildWakeMessage judge paragraph, then is dropped.
+   * `countTurn = false` (provider-errored boundary): the wake is attempted but
+   * the doomed turn does not consume the turn budget.
    */
-  private async injectWake(goal: GoalRecord): Promise<void> {
+  private async injectWake(goal: GoalRecord, countTurn = true): Promise<void> {
     const sessionID = goal.sessionID;
-    goal.used.turns += 1;
+    if (countTurn) goal.used.turns += 1;
     goal.continuations += 1;
     let judgeInstruction: string | undefined;
     const pending = this.judgeInstruction.get(sessionID);
@@ -1276,6 +1346,35 @@ export class GoalController {
       }
     }
     return texts.slice(-3);
+  }
+
+  /**
+   * Provider-failure signal (2026-10-17, pinned on LIVE 129): the LAST
+   * assistant message carries an error whose type contains "provider"
+   * (129: { type: "provider.quota", message: "Upstream request failed:
+   * Insufficient account funds" } — host schema Session.StructuredError
+   * { type, message, status? }). Non-provider errors (ToolError / Interrupted
+   * / ExecutionInterrupted / unknown) are normal operation and NEVER count.
+   * A context query failure is NOT evidence of provider failure — fail open
+   * (false): the loop degrades to the status-quo wake behavior, never to a
+   * false pause.
+   */
+  private async lastAssistantProviderError(sessionID: string): Promise<boolean> {
+    let messages: SessionMessage[];
+    try {
+      messages = await this.probe.context(sessionID);
+    } catch {
+      return false;
+    }
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.type !== "assistant") continue;
+      const err = m.error;
+      if (err === undefined || err === null) return false;
+      const type = typeof err === "object" ? String((err as { type?: unknown }).type ?? "") : "";
+      return type.toLowerCase().includes("provider");
+    }
+    return false;
   }
 
   // ------------------------------------------------------------------
@@ -1607,7 +1706,10 @@ export class GoalController {
    * 2. checkinDue deadline reached + session idle + not quiet → ONE progress
    *    reminder (consumed on fire; a missed deadline — active session or
    *    quiet window — stays pending and fires on the next qualifying tick);
-   * 3. nothing pending (no waiting shells, no deadline) → disarm.
+   * 3. an EXPIRED provider pause → ONE retry wake (the retry's boundary
+   *    resolves the pause: errored re-arms it, clean clears it);
+   * 4. nothing pending (no waiting shells, no deadline, no unexpired pause)
+   *    → disarm.
    */
   private async runWatchdogTick(sessionID: string): Promise<void> {
     if (this.stopped) return;
@@ -1620,7 +1722,10 @@ export class GoalController {
     }
     const now = Date.now();
     const idle = this.turns.get(sessionID)?.active !== true; // Task 8 per-session active flag
-    const quiet = goal.waitUntil !== undefined && now < goal.waitUntil;
+    // An ACTIVE provider pause silences the progress check like the waitUntil
+    // window (a check-in wake while the provider is down is a doomed turn).
+    const pauseActive = goal.providerPause !== undefined && now < goal.providerPause.until;
+    const quiet = (goal.waitUntil !== undefined && now < goal.waitUntil) || pauseActive;
     const due = this.checkinDue.get(sessionID);
     if (due !== undefined && now >= due.due && idle && !quiet) {
       this.checkinDue.delete(sessionID); // one-shot: consumed on fire
@@ -1629,7 +1734,19 @@ export class GoalController {
         backgroundCheckInText(due.inFlight, this.options.checkInDelaySec),
       );
     }
-    if ((goal.waitingShells?.length ?? 0) === 0 && this.checkinDue.get(sessionID) === undefined) {
+    // Provider pause deadline reached → fire ONE retry wake. The pause record
+    // is NOT cleared here: the retry's boundary is what resolves it (errored
+    // → re-arm, clean → clear), which is also what re-arms this watchdog.
+    if (goal.providerPause !== undefined && now >= goal.providerPause.until) {
+      await this.deliverWatchdogWake(goal, providerPauseRetryText(goal.id));
+    }
+    // Disarm only when nothing is pending: no shells, no deadline, and no
+    // UNEXPIRED provider pause (while armed, this tick IS the retry heartbeat).
+    if (
+      (goal.waitingShells?.length ?? 0) === 0 &&
+      this.checkinDue.get(sessionID) === undefined &&
+      (goal.providerPause === undefined || now >= goal.providerPause.until)
+    ) {
       this.disarmWatchdog(sessionID);
     }
   }

@@ -15,6 +15,15 @@ export interface Options {
    * (default 300 = 5 minutes). Any session activity cancels it. */
   checkInDelaySec: number;
   timeoutWrap: boolean;
+  /** 2026-10-17 ruling (129 "Insufficient account funds" incident): consecutive
+   *  boundaries whose last assistant message carries a provider.* error that
+   *  arm the provider pause (default 2 — a single transient failure still gets
+   *  one wake attempt). */
+  providerFailLimit: number;
+  /** Provider-pause duration in MILLISECONDS before the watchdog retry wake
+   *  (default 30 min — long enough for funds/model to be fixed, short enough
+   *  that a self-healing provider re-joins the loop without human action). */
+  providerPauseMs: number;
   /** Wake transcript footprint: "full" (budget + objective + per-task
    *  progress re-grounded in the wake message) or "slim" (2026-10-17 minimal
    *  ruling: header + ONE forced-tool-call line only — the goal tools are
@@ -40,6 +49,8 @@ const DEFAULT_OPTIONS: Options = {
   watchdogTickMs: 30000,
   checkInDelaySec: 300,
   timeoutWrap: false,
+  providerFailLimit: 2,
+  providerPauseMs: 30 * 60 * 1000,
   wakeDetail: "slim",
 };
 
@@ -77,6 +88,8 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
     watchdogTickMs: num("watchdogTickMs", DEFAULT_OPTIONS.watchdogTickMs),
     checkInDelaySec: num("checkInDelaySec", DEFAULT_OPTIONS.checkInDelaySec),
     timeoutWrap: bool("timeoutWrap", DEFAULT_OPTIONS.timeoutWrap),
+    providerFailLimit: num("providerFailLimit", DEFAULT_OPTIONS.providerFailLimit),
+    providerPauseMs: num("providerPauseMs", DEFAULT_OPTIONS.providerPauseMs),
     wakeDetail,
     wakeText,
     model,

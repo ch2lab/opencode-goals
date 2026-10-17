@@ -18,6 +18,25 @@ export function backgroundCheckInText(inFlight: number, waitSec: number): string
   return `Background check-in: ${inFlight} background item(s) in flight, no session activity for ${waitSec}s. Check progress: what finished, what is next — advance the goal.`;
 }
 
+/**
+ * Provider-pause entry notice — ONE per incident (goalControl synthetic,
+ * 2026-10-17 ruling): the model is failing with a provider-level error
+ * (quota/funds), automatic wakes are suspended, and a watchdog retry fires
+ * after `minutes`.
+ */
+export function providerPauseNoticeText(goalID: string, minutes: number): string {
+  return `opencode-goal: goal ${goalID} auto-paused — model requests keep failing with a provider error (quota/funds). Automatic wakes suspended; retrying in ${minutes}m. Fix the provider or switch models — the loop resumes on the first successful turn.`;
+}
+
+/**
+ * Watchdog retry wake fired at the pause deadline (watchdog text family —
+ * no options.wakeText, like the check-in). If the provider is still down the
+ * boundary re-arms the pause (no duplicate notice); a clean turn resumes.
+ */
+export function providerPauseRetryText(goalID: string): string {
+  return `Provider pause retry: model requests were failing with a provider error (quota/funds) — retrying goal ${goalID}. If the provider is still failing, say so and end this turn with a goal tool call.`;
+}
+
 /** Turns usage text: `used/cap`, or `used/(unbounded)` when cap is open. */
 function turnsUsage(goal: GoalRecord): string {
   const { used, cap } = goal;

@@ -29,7 +29,7 @@ import { expect, test } from "bun:test";
 import { resolveOptions } from "../src/options.ts";
 import { archivedGoalKey, createGoal, goalStorageKey, type GoalRecord } from "../src/state.ts";
 import { GoalController } from "../src/controller.ts";
-import type { HostEvent } from "../src/types.ts";
+import type { HostEvent, SessionMessage } from "../src/types.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 const S = "s1";
@@ -461,5 +461,146 @@ test("14: options.wakeText appends an Extra instruction line to the boundary wak
   expect(p.text).toContain(`[GOAL ${g.id}`); // the normal wake body is intact
   expect(p.text).toContain("Extra instruction: 务必先看 CI 日志"); // options.wakeText landed (user content stays verbatim)
   expect(p.text.endsWith("Extra instruction: 务必先看 CI 日志")).toBe(true); // final line
+  await stop();
+});
+
+// ---------------------------------------------------------------------------
+// 15-19: provider failure pause (2026-10-17 ruling, 129 incident: "Insufficient
+// account funds" — every turn fails BEFORE the model runs; each failure
+// boundary re-arms the wake loop and user cheers kept resetting the stall
+// ladder → infinite zero-progress loop). Pinned on LIVE 129 (2026-10-17): the
+// errored assistant message is { error: { type: "provider.quota", message:
+// "Upstream request failed: Insufficient account funds" } } (host schema
+// Session.Message.Assistant.error = Session.StructuredError { type, message }).
+// ---------------------------------------------------------------------------
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Errored assistant message in the provider.* shape (the 129 contract). */
+function providerErr(type = "provider.quota"): SessionMessage {
+  return {
+    id: "err",
+    type: "assistant",
+    error: { type, message: `Upstream request failed: ${type}` },
+  };
+}
+
+async function armProviderPause(h: Harness): Promise<GoalRecord> {
+  const g = await setGoalDirect(h);
+  h.setMessages(S, [{ id: "u1", type: "user" }, providerErr()]);
+  await h.emit(succeeded("pA")); // first errored boundary → one wake attempt
+  await h.emit(started("pS")); // the (doomed) turn starts — clears the pending window
+  await h.emit(succeeded("pB")); // second consecutive errored boundary → paused
+  return g;
+}
+
+test("15: provider failure — first errored boundary wakes once (doomed turn NOT counted); the second consecutive errored boundary pauses the loop (no wake, one notice, pause armed, no stall accounting)", async () => {
+  const h = await createHarness();
+  const ctrl = new GoalController(h.probe, resolveOptions({}), {});
+  const stop = await ctrl.start();
+  await setGoalDirect(h);
+  h.setMessages(S, [{ id: "u1", type: "user" }, providerErr()]);
+  await h.emit(succeeded("e15a"));
+  expect(h.prompts.length).toBe(1); // one wake attempt (transient-hiccup tolerance)
+  expect(goalOf(h)!.used.turns).toBe(0); // the doomed turn does not consume the budget
+  expect(goalOf(h)!.providerPause).toBeUndefined();
+  const stallsAfter1 = goalOf(h)!.stalls;
+  await h.emit(started("e15s")); // the doomed turn starts
+  await h.emit(succeeded("e15b"));
+  expect(h.prompts.length).toBe(1); // loop paused — no second wake
+  const g = goalOf(h)!;
+  expect(g.providerPause).toBeDefined();
+  expect(g.providerPause!.until).toBeGreaterThan(Date.now());
+  expect(g.providerPause!.noticeSent).toBe(true);
+  expect(h.synthetics.length).toBe(1); // exactly one notice
+  expect(h.synthetics[0].input.metadata?.goalControl).toBe(true);
+  expect(h.synthetics[0].input.text).toContain(g.id);
+  expect(g.stalls).toBe(stallsAfter1); // the pause does no stall accounting
+  expect(g.used.turns).toBe(0);
+  expect(g.status).toBe("active"); // paused ≠ terminal — recoverable
+  await stop();
+});
+
+test("16: provider pause — a further errored boundary re-arms (extends the deadline, no duplicate notice); a clean boundary clears the pause and resumes the loop", async () => {
+  const h = await createHarness();
+  const ctrl = new GoalController(h.probe, resolveOptions({}), {});
+  const stop = await ctrl.start();
+  await armProviderPause(h);
+  const until = goalOf(h)!.providerPause!.until;
+  await sleep(10); // re-armed deadline must be STRICTLY later (same-ms arms compare equal)
+  await h.emit(succeeded("e16c")); // the user's cheer turn failed again
+  const g2 = goalOf(h)!;
+  expect(g2.providerPause!.until).toBeGreaterThan(until); // re-armed from now
+  expect(h.synthetics.length).toBe(1); // no duplicate notice
+  expect(h.prompts.length).toBe(1); // still no wake
+  // The model recovers (user switched models / funds restored): clean last assistant
+  h.setMessages(S, [
+    { id: "u1", type: "user" },
+    providerErr(),
+    { id: "u2", type: "user" },
+    { id: "a2", type: "assistant" },
+  ]);
+  await h.emit(succeeded("e16d"));
+  expect(h.prompts.length).toBe(2); // the loop resumed
+  const g3 = goalOf(h)!;
+  expect(g3.providerPause).toBeUndefined();
+  expect(g3.used.turns).toBe(1); // the recovered turn counts
+  await stop();
+});
+
+test("17: provider pause expiry — the watchdog fires ONE retry wake at the deadline; a failed retry re-arms without re-noticing; the next deadline fires the next retry", async () => {
+  const h = await createHarness();
+  const ctrl = new GoalController(h.probe, resolveOptions({ providerPauseMs: 40, watchdogTickMs: 5 }), {});
+  const stop = await ctrl.start();
+  await armProviderPause(h);
+  expect(goalOf(h)!.providerPause).toBeDefined();
+  await sleep(120); // past the 40ms deadline; the 5ms tick must fire the retry
+  expect(h.prompts.length).toBe(2); // first wake + exactly one retry
+  expect(h.prompts[1].input.metadata?.goalControl).toBe(true);
+  expect(h.prompts[1].input.text).toMatch(/retry/i);
+  expect(goalOf(h)!.providerPause).toBeDefined(); // still armed — the retry's boundary resolves it
+  expect(goalOf(h)!.providerPause!.noticeSent).toBe(true);
+  // The retry turn fails too (still an errored message) → re-arm, no re-notice
+  await h.emit(started("e17s")); // the retried turn starts — clears the pending window
+  await h.emit(succeeded("e17c"));
+  expect(h.synthetics.length).toBe(1); // exactly one notice across the whole incident
+  expect(goalOf(h)!.providerPause!.until).toBeGreaterThan(Date.now());
+  await sleep(120); // next deadline → next retry
+  expect(h.prompts.length).toBe(3);
+  await stop();
+});
+
+test("18: non-provider errors do not pause — ToolError on the last assistant = normal wake loop (turns counted, no pause)", async () => {
+  const h = await createHarness();
+  const ctrl = new GoalController(h.probe, resolveOptions({}), {});
+  const stop = await ctrl.start();
+  await setGoalDirect(h);
+  h.setMessages(S, [
+    {
+      id: "a1",
+      type: "assistant",
+      error: { type: "ToolError", message: "Command failed" },
+    },
+  ]);
+  await h.emit(succeeded("e18a"));
+  await h.emit(started("e18s"));
+  await h.emit(succeeded("e18b"));
+  expect(h.prompts.length).toBe(2);
+  const g = goalOf(h)!;
+  expect(g.providerPause).toBeUndefined();
+  expect(g.used.turns).toBe(2); // the model ran (a tool ran) — normal counting
+  await stop();
+});
+
+test("19: in-flight boundary during an active provider pause — quiet: the progress check is neither armed nor delivered", async () => {
+  const h = await createHarness();
+  const ctrl = new GoalController(h.probe, resolveOptions({ checkInDelaySec: 1, watchdogTickMs: 50 }), {});
+  const stop = await ctrl.start();
+  await armProviderPause(h); // default providerPauseMs (30 min) keeps the pause active
+  expect(goalOf(h)!.providerPause).toBeDefined();
+  await h.emit(ev("session.shell.started", "e19c", { sessionID: S, shell: { id: "sh1", status: "running" } }));
+  await h.emit(succeeded("e19d")); // in-flight boundary during the pause
+  await sleep(1300); // past checkInDelaySec — if the check-in had been armed, it would have delivered
+  expect(h.prompts.length).toBe(1); // only the first wake — no check-in delivery during the pause
   await stop();
 });

@@ -10,6 +10,8 @@ const EXPECTED_DEFAULTS: Options = {
   watchdogTickMs: 30000,
   checkInDelaySec: 300,
   timeoutWrap: false,
+  providerFailLimit: 2,
+  providerPauseMs: 30 * 60 * 1000,
   wakeDetail: "slim",
   wakeText: undefined,
 };
@@ -24,6 +26,8 @@ test("empty input yields every default exactly", () => {
   expect(o.watchdogTickMs).toBe(30000);
   expect(o.checkInDelaySec).toBe(300);
   expect(o.timeoutWrap).toBe(false);
+  expect(o.providerFailLimit).toBe(2);
+  expect(o.providerPauseMs).toBe(30 * 60 * 1000);
   expect(o.wakeDetail).toBe("slim");
   expect(o.wakeText).toBeUndefined();
   expect(o).toEqual(EXPECTED_DEFAULTS);

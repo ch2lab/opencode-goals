@@ -34,6 +34,13 @@ export interface GoalRecord {
   tasks: GoalTask[];
   waitingShells?: Array<{ id: string; timeoutMs?: number; since: number }>;
   waitUntil?: number;
+  /** Provider failure pause (2026-10-17 ruling, 129 quota incident): set when
+   *  consecutive boundaries whose last assistant message carries a provider.*
+   *  error reach `providerFailLimit`. Until `until` the loop is silent (no
+   *  wakes, no stall accounting, no check-ins); the watchdog fires ONE retry
+   *  wake at the deadline (its boundary re-arms or clears this).
+   *  `noticeSent` = the one-per-incident synthetic notice was delivered. */
+  providerPause?: { until: number; noticeSent: boolean };
   lastHandledEventID?: string;
   judgeUsed?: boolean;
   evidence?: string;
