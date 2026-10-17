@@ -5,7 +5,9 @@
 //   registration file: <XDG_STATE_HOME | <home>/.local/state>/opencode/service.json
 //                      = { id?, version?, url, pid, password? }
 //   auth:              Authorization: Basic base64("opencode:" + password)
-//   shell store:       GET    /api/shell?location.directory=<abs>
+//   shell store:       GET    /api/shell, location via x-opencode-directory header
+//                      (URL-encoded abs dir; the server's requestRef ignores
+//                       dot-notation query params like location.directory=)
 //   inbox list:        GET    /api/session/:sessionID/inbox
 //   inbox cancel:      DELETE /api/session/:sessionID/inbox/:inboxID
 //
@@ -156,10 +158,11 @@ test("registration pid !== our pid -> unavailable(pid-mismatch), fetch untouched
   expect(f.calls.length).toBe(0);
 });
 
-test("shellList: GET /api/shell?location.directory=… with Basic auth; entries normalized", async () => {
+test("shellList: GET /api/shell + x-opencode-directory header (URL-encoded) + Basic auth; entries normalized", async () => {
   const f = fakeFetch((url, init) => {
-    expect(url).toBe("http://127.0.0.1:45278/api/shell?location.directory=%2Fproj");
+    expect(url).toBe("http://127.0.0.1:45278/api/shell");
     const headers = (init?.headers ?? {}) as Record<string, string>;
+    expect(headers["x-opencode-directory"]).toBe(encodeURIComponent("/proj"));
     expect(headers["Authorization"]).toBe("Basic " + Buffer.from("opencode:pw").toString("base64"));
     return jsonRes(200, {
       location: { directory: "/proj" },
@@ -184,9 +187,10 @@ test("shellList: GET /api/shell?location.directory=… with Basic auth; entries 
   ]);
 });
 
-test("shellList: empty locationDirectory sends no location param", async () => {
-  const f = fakeFetch((url) => {
+test("shellList: empty locationDirectory sends no x-opencode-directory header", async () => {
+  const f = fakeFetch((url, init) => {
     expect(url).toBe("http://127.0.0.1:45278/api/shell");
+    expect(((init?.headers ?? {}) as Record<string, string>)["x-opencode-directory"]).toBeUndefined();
     return jsonRes(200, { location: { directory: "/proj" }, data: [] });
   });
   const api = createHostApi({

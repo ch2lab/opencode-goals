@@ -12,7 +12,11 @@
 //   registration file: <XDG_STATE_HOME | <home>/.local/state>/opencode/service.json
 //                      = { id?, version?, url, pid, password? }
 //   auth:              Authorization: Basic base64("opencode:" + password)
-//   shell store:       GET    /api/shell?location.directory=<abs>
+//   shell store:       GET    /api/shell + header x-opencode-directory: <enc abs dir>
+//                      (the server's requestRef only honors that header or the
+//                       bracket query location[directory]; dot-notation params are
+//                       invisible -> silent fallback to the service's cwd, which
+//                       for `serve --service` is always home)
 //   inbox list:        GET    /api/session/:sessionID/inbox
 //   inbox cancel:      DELETE /api/session/:sessionID/inbox/:inboxID
 //                      (a 404 SessionNotFound body on inbox routes means
@@ -135,19 +139,33 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
 
   type Fetched = Response | { reason: string };
 
-  async function doFetch(path: string, method: "GET" | "DELETE" = "GET"): Promise<Fetched> {
+  async function doFetch(
+    path: string,
+    method: "GET" | "DELETE" = "GET",
+    extraHeaders?: Record<string, string>,
+  ): Promise<Fetched> {
     const p = await prepare();
     if ("state" in p) return { reason: p.reason ?? "unknown" };
     try {
       return await fetchFn(p.base + path, {
         method,
-        headers: p.headers,
+        headers: extraHeaders ? { ...p.headers, ...extraHeaders } : p.headers,
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
       const reason = err instanceof Error && err.name === "TimeoutError" ? "timeout" : "network";
       return { reason };
     }
+  }
+
+  /**
+   * Location routing header (undefined for the default location). The server's
+   * requestRef only honors x-opencode-directory (or the bracket query
+   * location[directory]) — a dot-notation query param is invisible and silently
+   * falls back to the service's cwd, which `serve --service` chdirs to home.
+   */
+  function locationHeader(locationDirectory: string): Record<string, string> | undefined {
+    return locationDirectory !== "" ? { "x-opencode-directory": encodeURIComponent(locationDirectory) } : undefined;
   }
 
   /** 404 with a structured SessionNotFound body (not a plain 404). */
@@ -161,11 +179,7 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
   }
 
   async function shellList(locationDirectory: string): Promise<HostApiResult<ShellEntry[]>> {
-    const path =
-      locationDirectory !== ""
-        ? `/api/shell?location.directory=${encodeURIComponent(locationDirectory)}`
-        : "/api/shell";
-    const r = await doFetch(path);
+    const r = await doFetch("/api/shell", "GET", locationHeader(locationDirectory));
     if ("reason" in r) return { state: "unavailable", reason: r.reason };
     if (!r.ok) return { state: "unavailable", reason: `http-${r.status}` };
     const body = await safeJson(r);

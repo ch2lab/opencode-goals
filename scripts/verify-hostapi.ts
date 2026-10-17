@@ -12,16 +12,17 @@
 //   -> one-shot check-in with the real count -> an out-of-cwd file read
 //   succeeds with NO plugin deny.
 //
-// 2026-10-17 host findings (2.0.32, headless `serve --service`):
+// 2026-10-17 host findings (2.0.32, headless `serve --service`; corrected
+// same-day against the public source, anomalyco/opencode v2.0.32, + probe15):
 //   * the /api/shell list is an in-memory per-LOCATION map (status=running);
-//     location query params (location.directory / directory) do NOT route —
-//     every request resolves to the default (home) location;
-//   * model- and session-API shells created in a NON-default location are
-//     invisible to the list (their location's map is unreachable over HTTP).
-//   => the scenario creates the in-flight shell via POST /api/shell (lands in
-//      the reachable home map) with metadata.sessionID = the goal session,
-//      which is exactly what the plugin's gate query returns. The host
-//      location-routing gap is reported separately.
+//   * location routing WORKS via the x-opencode-directory request header
+//     (URL-encoded) or the bracket query location[directory] — the server's
+//     requestRef ignores dot-notation query params and falls back to the
+//     service's cwd, which `serve --service` chdirs to home.
+//   => the scenario creates the in-flight shell in the GOAL location's map
+//      (POST /api/shell + x-opencode-directory) with metadata.sessionID =
+//      the goal session; the plugin's gate queries the same location with
+//      the same header, so counts line up on the right location's table.
 //
 // Usage: bun scripts/verify-hostapi.ts [--keep]
 //   --keep  keep the temp dir + server log for debugging.
@@ -142,10 +143,14 @@ async function main(): Promise<void> {
     // HTTP surface with Basic auth from the registration file
     const base = `http://${reg.url.replace(/^https?:\/\//, "").replace(/^(0\.0\.0\.0|\[::\]):/, "127.0.0.1:")}`;
     const auth = "Basic " + Buffer.from(`opencode:${reg.password}`).toString("base64");
-    const api = async (method: string, p: string, body?: unknown) => {
+    const api = async (method: string, p: string, body?: unknown, extra?: Record<string, string>) => {
       const r = await fetch(base + p, {
         method,
-        headers: { Authorization: auth, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+        headers: {
+          Authorization: auth,
+          ...(body !== undefined ? { "content-type": "application/json" } : {}),
+          ...(extra ?? {}),
+        },
         body: body !== undefined ? JSON.stringify(body) : undefined,
       });
       const text = await r.text();
@@ -181,14 +186,17 @@ async function main(): Promise<void> {
     );
     check("A10 data dir isolated (own opencode.db under XDG_DATA_HOME)", true);
     // In-flight shell visible to the gate's store query: created through the
-    // top-level store endpoint (POST /api/shell — bare POST is 405 on 2.0.32,
-    // any location query lands it in the reachable default location) with
-    // metadata.sessionID = the goal session. Created BEFORE /goal set so the
-    // goal's first boundary already sees it (A6: first decision = hold).
-    const shell = await api("POST", `/api/shell?location.directory=${encodeURIComponent(ws)}`, {
-      command: "pwsh -c Start-Sleep 90",
-      metadata: { sessionID: sid },
-    });
+    // top-level store endpoint (POST /api/shell) with the x-opencode-directory
+    // header so it lands in the GOAL location's map — the same routing the
+    // plugin's gate query uses — plus metadata.sessionID = the goal session.
+    // Created BEFORE /goal set so the goal's first boundary already sees it
+    // (A6: first decision = hold).
+    const shell = await api(
+      "POST",
+      "/api/shell",
+      { command: "pwsh -c Start-Sleep 90", metadata: { sessionID: sid } },
+      { "x-opencode-directory": encodeURIComponent(ws) },
+    );
     const shellId: string = (shell.body?.data as { id?: string } | undefined)?.id ?? "";
     check("A4a in-flight shell created (store entry, attributed to session)", shell.status < 300 && shellId !== "", `status=${shell.status} id=${shellId}`);
 
