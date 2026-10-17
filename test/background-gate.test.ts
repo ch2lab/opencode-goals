@@ -146,13 +146,13 @@ test("4: another project's active session is not counted (sessionBelongs gate)",
   await stop();
 });
 
-test("5: any session activity cancels the timer (no check-in after the deadline)", async () => {
+test("5: real session activity (a new turn starting) cancels the timer (no check-in after the deadline)", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Cancel");
   await h.emit(started("c1", CHILD));
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight boundary → timer armed (1s)
-  await h.emit(usageUpdated("u1", S)); // activity → cancel
+  await h.emit(started("c2", S)); // the session goes active again → cancel
   await sleep(1500); // past the deadline: a cancelled timer never fires
   expect(h.prompts.length).toBe(0);
   await stop();
@@ -392,6 +392,26 @@ test("19: skipped boundary logs skip (ownKnown false) and warns once per session
     console.warn = origWarn;
     await stop();
   }
+});
+
+// 2026-10-17 incident (verify run 1792232697727): the host reports a turn's
+// token usage (session.usage.updated) AFTER its terminal boundary event. The
+// late straggler is NOT activity — the session is idle. Cancelling on it killed
+// the freshly armed one-shot check-in and left the goal silent for 150s.
+test("21: late usage.updated / tool.called after a terminal boundary do NOT cancel the armed check-in", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Straggler21");
+  await h.emit(started("c1", CHILD));
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // in-flight boundary → arm (1s)
+  // the just-ended turn's bookkeeping events arrive AFTER the boundary
+  // (turns[S].active is false now — the session is idle)
+  await h.emit(usageUpdated("u1", S));
+  await h.emit(toolCalled("t1", S));
+  await sleep(1500); // past the deadline: the uncancelled check-in fires
+  expect(h.prompts.length).toBe(1);
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
+  await stop();
 });
 
 test("20: an ordinary wake boundary logs wake (ownKnown, in-flight 0)", async () => {

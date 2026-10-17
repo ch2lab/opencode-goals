@@ -393,3 +393,12 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 2. `XDG_CONFIG_HOME` 对**主配置不生效**（该处配置文件只被 watcher 订阅、不被读取——模型会静默回退内置默认）；显式配置源 env `OPENCODE_CONFIG_CONTENT` 生效（隔离验证宿主依赖它）；受管服务端口文件 `<XDG_CONFIG_HOME>/opencode/service.json` 有效。
 3. 2.0.32 的 command 端点 body 为 `{ name, text }`（2.0.29 协议为 `{ text }`）。
 4. **模型会自行终止 goal**（model-side completion）：goal 终态后所有边界静默 no-op、check-in 被 ghost 规则 disarm——长跑场景的 goal 文案须显式禁止模型自行 complete（验证脚本 `HOLD-FOREVER` 文案即此用途）。
+
+## 18. 2026-10-17 修订（迟到事件误杀 check-in）
+
+§7.2 的"任何会话活动取消 check-in 计时"在 2.0.32 实机上被一条**迟到事件**打破：宿主在该回合的**终态边界事件之后**才发出该回合的 `session.usage.updated`（token 用量上报）。`onUsageUpdated` 无条件 `checkinDue.delete` 把刚武装的一次性 check-in 取消——goal 静默 150s+（verify 实机两次稳定复现：A7 超时、决策日志仅 hold 一行、仪表显示 `checkinDue cancelled by usage.updated` 后 tick 见 `due=none`）。
+
+- **修复（`src/controller.ts`）**：`usage.updated` / `tool.called` 的取消**仅在该会话回合确实进行中**（`turns[sid].active === true`）时生效——迟到的记账事件不是活动；`execution.started` / `inbox.enqueued` / `shell.started|ended` 保持无条件取消（真实活动）。
+- **测试**：`test/background-gate.test.ts` test 5 改为"真活动（新回合）取消"；新增 test 21"终态边界后的迟到 usage/tool 事件不取消已武装的 check-in"（先 RED 后 GREEN）。
+- **实机复验（2.0.32 隔离宿主）**：13/13 全绿——A7 check-in 携真计数落入 inbox 并被消费。
+- 同一轮顺带修正 `scripts/verify-hostapi.ts` 收尾：临时目录删除包 best-effort（Windows 子进程句柄残留导致 `rmSync` 抛错、污染退出码）。

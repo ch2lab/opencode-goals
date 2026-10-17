@@ -326,7 +326,11 @@ async function main(): Promise<void> {
     }
     fs.closeSync(logFd);
     if (!KEEP) {
-      fs.rmSync(tmp, { recursive: true, force: true });
+      try {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      } catch {
+        /* best effort — a lingering child process may still hold a handle */
+      }
     }
   }
 

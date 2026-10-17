@@ -749,7 +749,7 @@ export class GoalController {
   }
 
   private async onExecutionStarted(sessionID: string): Promise<void> {
-    this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
+    this.checkinDue.delete(sessionID); // a new turn is activity: cancel the progress check
     const goal = await this.loadGoal(sessionID);
     if (goal === undefined || goal.status !== "active") return;
     let t = this.turns.get(sessionID);
@@ -767,7 +767,11 @@ export class GoalController {
   }
 
   private async onToolCalled(sessionID: string): Promise<void> {
-    this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
+    // Only cancel while a turn is actually in flight: the host can emit the
+    // just-ended turn's tool/usage events AFTER its terminal boundary (late
+    // stragglers, 2026-10-17 verify incident — a late session.usage.updated
+    // killed the freshly armed one-shot check-in and left the goal silent).
+    if (this.turns.get(sessionID)?.active === true) this.checkinDue.delete(sessionID);
     const goal = await this.loadGoal(sessionID);
     if (goal === undefined || goal.status !== "active") return;
     const t = this.turns.get(sessionID);
@@ -779,7 +783,10 @@ export class GoalController {
    *  data.tokens = { input, output, reasoning, cache: { read, write } } —
    *  the total sums all five fields (token-usage.d.ts `total` semantics). */
   private async onUsageUpdated(sessionID: string, props: Record<string, unknown>): Promise<void> {
-    this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
+    // Only cancel while a turn is actually in flight (late straggler events —
+    // usage reported after the turn's terminal boundary — are not activity;
+    // see onToolCalled).
+    if (this.turns.get(sessionID)?.active === true) this.checkinDue.delete(sessionID);
     const goal = await this.loadGoal(sessionID);
     if (goal === undefined || isTerminal(goal.status)) return;
     const tokens = props.tokens;
@@ -795,7 +802,7 @@ export class GoalController {
   }
 
   private async onInboxEnqueued(sessionID: string, props: Record<string, unknown>): Promise<void> {
-    this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
+    this.checkinDue.delete(sessionID); // a new inbox item is activity: cancel the progress check
     // .d.ts (session-event.d.ts InboxEnqueued): data = { item: { type,
     // payload, delivery }, inboxID, sessionID }.
     const inboxID = typeof props.inboxID === "string" ? props.inboxID : undefined;
@@ -1627,7 +1634,7 @@ export class GoalController {
    * Pure event-driven: no tick — the exit arrives as a shell.ended event.
    */
   private async onShellStarted(sessionID: string, props: Record<string, unknown>): Promise<void> {
-    this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
+    this.checkinDue.delete(sessionID); // a background shell event is activity: cancel the progress check
     const shell = shellInfoFrom(props);
     if (shell === undefined) return;
     const goal = await this.loadGoal(sessionID);
@@ -1651,7 +1658,7 @@ export class GoalController {
    * processed (the waitingShells membership IS the once-only guard).
    */
   private async onShellEnded(sessionID: string, props: Record<string, unknown>): Promise<void> {
-    this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
+    this.checkinDue.delete(sessionID); // a background shell event is activity: cancel the progress check
     const shell = shellInfoFrom(props);
     if (shell === undefined) return;
     const goal = await this.loadGoal(sessionID);
