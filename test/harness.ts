@@ -48,10 +48,6 @@ export interface Harness {
   commandExecutor(sessionID: string, text: string): Promise<void>; // 驱动已注册命令（R5: 携带 sessionID）
   setGenerate(reply: string | ((input: { sessionID: string; prompt: string }) => string)): void;
   generated: Array<{ sessionID: string; prompt: string; reply: string }>; // 记录旁路调用
-  rpc: {
-    queue: Array<{ method: string; input?: unknown; reply?: unknown }>;
-    calls: Array<{ method: string; input: unknown; output?: unknown }>;
-  };
   inbox: Map<string, InboxItem[]>; // 每会话 inbox（活后端：inboxCancel 会就地移除条目）；cancelledInbox 记录
   cancelledInbox: string[];
   // 调 controller 注册的 permission 回调；返回最后一次成功回调的决定（R9：决定有返回通道）
@@ -62,7 +58,8 @@ export interface Harness {
   setSession(sessionID: string, settings: { location?: { directory?: string }; projectID?: string }): void; // sessionGet 后端
   setMessages(sessionID: string, messages: SessionMessage[]): void; // context() 后端
   setShells(entries: ShellEntry[]): void; // host shell-store 后端（shell.list）；事件同步维护（见 emit）
-  failShellList(on: boolean): void; // 脚本化 shell.list 抛错（安全方向用例）
+  failShellList(on: boolean): void; // 脚本化 shell.list 抛错（信号不可用用例）
+  shellListCalls: number; // shell.list 查询次数（活值 getter）
   commands: Map<string, (text: string, sessionID: string) => Promise<void>>;
   commandDescriptions: Map<string, string>; // 命令菜单里的友好描述（宿主 CommandDefinition.description）
   tools: Map<
@@ -247,7 +244,6 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
   const prompts: PromptCall[] = [];
   const synthetics: SyntheticCall[] = [];
   const generated: Harness["generated"] = [];
-  const rpc: Harness["rpc"] = { queue: [], calls: [] };
   const permissions: Harness["permissions"] = [];
   const permissionDecisions: Harness["permissionDecisions"] = [];
   const commands: Harness["commands"] = new Map();
@@ -263,6 +259,7 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
   // model-originated shells (no events on the real host) enter via setShells.
   let shellStore: ShellEntry[] = [];
   let shellListFail = false;
+  let shellListCalls = 0;
 
   const probe: WakeProbe = {
     projectID: typeof overrides?.projectID === "string" ? overrides.projectID : undefined,
@@ -304,15 +301,6 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
       generated.push({ sessionID, prompt, reply });
       return { text: reply };
     },
-    rpcCall: async (method, input) => {
-      // Scripted FIFO: the next queue entry is consumed by the next call;
-      // the reply is returned only when the method matches (else undefined);
-      // an exhausted queue yields undefined. Every call is recorded.
-      const head = rpc.queue.shift();
-      const output = head !== undefined && head.method === method ? head.reply : undefined;
-      rpc.calls.push({ method, input, output });
-      return output;
-    },
     sessionGet: async (sessionID) => structuredClone(sessions.get(sessionID)),
     inboxList: async (sessionID) => structuredClone(inbox.get(sessionID) ?? []),
     inboxCancel: async (inboxID) => {
@@ -327,6 +315,7 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
     },
     shellList: async () => {
       if (shellListFail) throw new Error("shell store query failed (scripted)");
+      shellListCalls += 1;
       return structuredClone(shellStore);
     },
     registerCommand: (name, description, run) => {
@@ -398,7 +387,6 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
       generateReply = reply;
     },
     generated,
-    rpc,
     inbox,
     cancelledInbox,
     permissionHook: async (input) => {
@@ -429,6 +417,9 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
     },
     failShellList: (on) => {
       shellListFail = on;
+    },
+    get shellListCalls() {
+      return shellListCalls;
     },
     setMessages: (sessionID, msgs) => {
       messages.set(sessionID, structuredClone(msgs));

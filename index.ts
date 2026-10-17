@@ -11,9 +11,10 @@
 import { Plugin } from "@opencode/plugin";
 import type { Registration } from "@opencode/plugin/promise/registration";
 import { GoalController } from "./src/controller";
+import { createHostApi } from "./src/hostapi";
 import { resolveOptions, selectJudgeModel } from "./src/options";
 import { SessionGenerateJudge } from "./src/judge";
-import type { HostEvent, InboxItem, InboxRef, SessionMessage, WakeProbe } from "./src/types";
+import type { HostEvent, InboxRef, SessionMessage, WakeProbe } from "./src/types";
 
 type PendingRegistration = Promise<Registration | undefined>;
 
@@ -42,24 +43,13 @@ export default Plugin.define({
       registrations.push(p);
     };
 
-    // The plugin Context exposes RPC only as typed, per-definition clients:
-    // ctx.rpc(definition) -> RpcClient (plugin/dist/promise/rpc.d.ts —
-    // RpcDomain extends the RpcApi generic call signature + register; there
-    // is no dynamic rpc.call member). The narrow WakeProbe surface (Task 6)
-    // addresses host methods by name, so everything routes through one
-    // generic definition with the method name carried in the input.
-    // TODO(task13): verify in live smoke that this routing matches the host's
-    // method addressing (shell queries in Task 8, session inbox below).
-    const rpcGeneric = ctx.rpc({
-      id: "opencode-goal",
-      methods: {
-        call: { input: { type: "object" }, output: { type: "object" } },
-      },
-      events: {},
-    });
-    const callRpc = async (method: string, input: unknown): Promise<unknown> => {
-      return (await rpcGeneric.call({ method, input: input as unknown })) as unknown;
-    };
+    // HTTP data plane (2026-10-17): the host's own services (shell store,
+    // session inbox) are NOT in the in-process ctx.rpc registry (that channel
+    // is host -> plugin-registered domains only); they live on the HTTP API
+    // surface. hostapi discovers the local service.json registration file
+    // (re-read per query), authenticates with Basic, self-identifies by pid.
+    // A query failure throws here; the controller maps it to its signal.
+    const hostApi = createHostApi();
 
     const probe: WakeProbe = {
       // Per-session values come from sessionGet (Task 6 ruling), not from the
@@ -207,13 +197,6 @@ export default Plugin.define({
         return { text };
       },
 
-      // Generic host-method call (narrow surface). Routed through the typed
-      // per-definition RPC client (see callRpc above).
-      // TODO(task13): verify in live smoke (see callRpc TODO).
-      rpcCall: async (method, input) => {
-        return callRpc(method, input);
-      },
-
       // ctx.session.get({ sessionID }) -> SessionInfo { location:
       // LocationPublicRef { directory }, projectID, ... } (generated/types.d.ts).
       sessionGet: async (sessionID) => {
@@ -224,69 +207,42 @@ export default Plugin.define({
         };
       },
 
-      // session.inbox.list({ sessionID }) -> SessionInboxInfo[] (input shape
-      // SessionInboxListInput, generated/types.d.ts). NOTE: the plugin's
-      // SessionDomain does not expose inbox.* — the client's session inbox
-      // methods are reached over the RPC channel (Task 7 brief ruling).
-      // TODO(task13): verify in live smoke that "session.inbox.list" is the
-      // RPC method name the host answers.
+      // Host inbox (hostapi): GET /api/session/:sessionID/inbox. A session
+      // gone (404 SessionNotFound) is an empty list, not a failure.
       inboxList: async (sessionID) => {
-        const raw = (await callRpc("session.inbox.list", { sessionID }) ??
-          []) as Array<{
-            id: string;
-            sessionID: string;
-            type: InboxItem["type"];
-            payload?: unknown;
-            delivery?: unknown;
-          }>;
-        return raw.map((item) => ({
-          id: item.id,
-          sessionID: item.sessionID,
-          type: item.type,
-          payload: item.payload as Record<string, unknown> | undefined,
-          delivery: item.delivery as InboxItem["delivery"] | undefined,
-        }));
+        const r = await hostApi.inboxList(sessionID);
+        if (r.state !== "ok") {
+          throw new Error(`inbox query failed (${r.reason})`);
+        }
+        return r.value ?? [];
       },
 
-      // Ruling R6: host cancel is session.inbox.cancel({ sessionID, inboxID })
-      // (SessionInboxCancelInput, generated/types.d.ts) over the RPC channel.
-      // The sessionID comes from the inboxSessions mapping; unknown inbox ->
-      // warn + skip (best-effort, never throw).
+      // Ruling R6: cancel needs the sessionID, carried by the inboxSessions
+      // mapping (prompt results + session.inbox.enqueued events). Host cancel
+      // is hostapi: DELETE /api/session/:sessionID/inbox/:inboxID. Unknown
+      // inbox -> warn + skip; host failures are best-effort (never throw).
       inboxCancel: async (inboxID) => {
         const sessionID = inboxSessions.get(inboxID);
         if (sessionID === undefined) {
           console.warn(`opencode-goal: inboxCancel skipped — no session known for inbox ${inboxID}`);
           return;
         }
-        await callRpc("session.inbox.cancel", { sessionID, inboxID });
+        const r = await hostApi.inboxCancel(sessionID, inboxID);
+        if (r.state !== "ok") {
+          console.warn(`opencode-goal: inboxCancel failed for ${inboxID} (${r.reason})`);
+        }
       },
 
-      // shell.list — the host shell store (contract pinned 2026-10-17 by
-      // 2.0.32 binary forensics): same jn-registered API family as
-      // session.inbox.list (the live-verified in-process channel precedent),
-      // direct input convention { location: { directory } }. Location-scoped,
-      // running-only ("Exited commands are not included"); entries carry
-      // metadata.sessionID for attribution. Non-array reply = contract
-      // violation → throw (the caller fails safe: treat as in-flight).
+      // Host shell store (hostapi): GET /api/shell?location.directory=… —
+      // location-scoped, running-only ("Exited commands are not included");
+      // entries carry metadata.sessionID for attribution. A query failure
+      // throws here (the controller maps it to its failure signal).
       shellList: async (locationDirectory) => {
-        const raw = await callRpc("shell.list", { location: { directory: locationDirectory } });
-        if (!Array.isArray(raw)) {
-          throw new Error(`shell.list returned non-array (${JSON.stringify(raw)?.slice(0, 120)})`);
+        const r = await hostApi.shellList(locationDirectory);
+        if (r.state !== "ok") {
+          throw new Error(`shell store query failed (${r.reason})`);
         }
-        const out: Array<{ id: string; status: string; sessionID?: string }> = [];
-        for (const e of raw as Array<Record<string, unknown>>) {
-          if (typeof e !== "object" || e === null || typeof e.id !== "string") continue;
-          const metadata =
-            typeof e.metadata === "object" && e.metadata !== null
-              ? (e.metadata as Record<string, unknown>)
-              : undefined;
-          out.push({
-            id: e.id,
-            status: typeof e.status === "string" ? e.status : "running",
-            sessionID: typeof metadata?.sessionID === "string" ? metadata.sessionID : undefined,
-          });
-        }
-        return out;
+        return r.value ?? [];
       },
 
       // ctx.command.transform(e => e.add(CommandDefinition { name,

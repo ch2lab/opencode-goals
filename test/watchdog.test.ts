@@ -222,11 +222,11 @@ test("4: cleanup — after stop() the tick is gone (no timer, no further activit
   await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }));
   await h.emit(succeeded("b1")); // arm → the tick is the deadline's heartbeat
   await waitFor(() => (ctrl as unknown as { wdTimers: Map<string, unknown> }).wdTimers.has(S), 2000, "tick armed");
-  const rpcAtStop = h.rpc.calls.length;
+  const shellCallsAtStop = h.shellListCalls;
   await stop();
   await sleep(150); // advance real time
   expect((ctrl as unknown as { wdTimers: Map<string, unknown> }).wdTimers.has(S)).toBe(false);
-  expect(h.rpc.calls.length).toBe(rpcAtStop);
+  expect(h.shellListCalls).toBe(shellCallsAtStop);
 });
 
 // ---------------------------------------------------------------------------

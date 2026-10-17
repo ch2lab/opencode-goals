@@ -177,23 +177,6 @@ test("contract 5: probe.generate is verbatim-assignable to JudgeGenerator (Task 
   });
 });
 
-// --- Contract 6: rpc ---------------------------------------------------------
-
-test("contract 6: rpcCall is a FIFO script; exhausted queue returns undefined and still records", async () => {
-  const h = await createHarness();
-  h.rpc.queue.push({ method: "shell.list", input: { cwd: "/w" }, reply: [{ id: "sh_1" }] });
-  h.rpc.queue.push({ method: "other" });
-  expect(await h.probe.rpcCall("shell.list", { cwd: "/w" })).toEqual([{ id: "sh_1" }]);
-  expect(await h.probe.rpcCall("other", undefined)).toBeUndefined();
-  expect(await h.probe.rpcCall("shell.list", {})).toBeUndefined(); // queue exhausted
-  expect(h.rpc.queue).toEqual([]);
-  expect(h.rpc.calls).toEqual([
-    { method: "shell.list", input: { cwd: "/w" }, output: [{ id: "sh_1" }] },
-    { method: "other", input: undefined, output: undefined },
-    { method: "shell.list", input: {}, output: undefined },
-  ]);
-});
-
 // --- Contract 7: inbox ---------------------------------------------------------
 
 test("contract 7: inboxList returns deep copies; inboxCancel records (and removes) the item", async () => {

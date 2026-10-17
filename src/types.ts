@@ -188,11 +188,10 @@ export interface WakeProbe {
   storageRemove(key: string): Promise<void>;
   storageScan(prefix: string): Promise<Array<{ key: string; value: unknown }>>;
   generate(input: { sessionID: string; prompt: string }): Promise<{ text: string }>;
-  rpcCall(method: string, input: unknown): Promise<unknown>; // shell 查询走这里
   sessionGet(sessionID: string): Promise<{ location?: { directory?: string }; projectID?: string } | undefined>;
-  inboxList(sessionID: string): Promise<InboxItem[]>;
-  inboxCancel(inboxID: string): Promise<void>;
-  shellList(locationDirectory: string): Promise<ShellEntry[]>; // shell.list（宿主 shell store）
+  inboxList(sessionID: string): Promise<InboxItem[]>; // hostapi GET /api/session/:id/inbox
+  inboxCancel(inboxID: string): Promise<void>; // hostapi DELETE /api/session/:id/inbox/:inboxID
+  shellList(locationDirectory: string): Promise<ShellEntry[]>; // hostapi GET /api/shell（宿主 shell store）
   projectID?: string;
   locationDirectory?: string;
   // —— 注册面（adapter 转真实 ctx；harness 记录供断言；hook 载荷字段以 2.0.29 .d.ts 为准）——
