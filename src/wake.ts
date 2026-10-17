@@ -47,10 +47,13 @@ function taskLines(goal: GoalRecord): string {
  * REMOVED (ruling: the plugin writes NO system part at all — any write, even a
  * byte-stable one, shifts the request prefix at appearance/disappearance and
  * breaks the LLM prefix cache), so the wake message is the per-turn grounding
- * channel (tail-appended — appends never break the prefix). "slim" = header +
- * budget + objective + discipline + one-line forced tool call (no task list);
- * "full" adds the per-task progress block. Default "full" (this builder's
- * pre-existing contract; the OPTION default is "slim" — see options.ts).
+ * channel (tail-appended — appends never break the prefix). "slim" (2026-10-17
+ * minimal ruling) = header + ONE forced terminal tool call line ONLY — no
+ * budget/objective/discipline/task lines: the goal tools are already exposed
+ * in the model's system prompt (no per-turn re-teaching), and the objective
+ * rides the conversation context. "full" adds the per-task progress block.
+ * Default "full" (this builder's pre-existing contract; the OPTION default
+ * is "slim" — see options.ts).
  */
 export function buildWakeMessage(
   goal: GoalRecord,
@@ -63,11 +66,7 @@ export function buildWakeMessage(
     detail === "slim"
       ? [
           `[GOAL ${goal.id} | turn ${turnsUsage(goal)}]`,
-          `Budget: ${caps}`,
-          `Objective: ${goal.objective}`,
-          "Discipline: advance the goal autonomously; prefer concrete actions over narration.",
-          "Keep tasks current: plan first with goal_add_task(title); sync with goal_update_task(ref, status) (todo/doing/done) as you go.",
-          "Verify progress and end this turn with a tool call: done → goal_complete(evidence, a concrete verifiable anchor ≥24 chars); blocked → goal_block(concrete reason); otherwise → advance.",
+          "End this turn with a tool call: goal_complete(evidence, a concrete verifiable anchor ≥24 chars) / goal_block(concrete reason) / advance the goal.",
         ]
       : [
           `[GOAL ${goal.id} | turn ${turnsUsage(goal)}]`,

@@ -139,12 +139,11 @@ test("1: boundary wake — succeeded with sessionID + event id injects a queue w
   await stop();
 });
 
-test("1b: wake transcript footprint — default is 'slim' (grounding + trigger, no task list); wakeDetail 'full' adds the per-task progress block", async () => {
-  // Default (options.wakeDetail "slim", 2026-10-17, amended same day): the
-  // context-hook system part was REMOVED (zero system-part writes — prefix
-  // cache), so the slim wake IS the per-turn grounding: header + budget +
-  // objective + discipline + one-line forced-tool-call trigger (no task list
-  // — task progress rides transcript history + compaction).
+test("1b: wake transcript footprint — default is 'slim' (header + trigger only, minimal ruling); wakeDetail 'full' re-states budget/objective/progress", async () => {
+  // Default (options.wakeDetail "slim", 2026-10-17, then minimized): the
+  // goal tools are exposed in the model's system prompt and the objective
+  // rides the conversation context, so the slim wake is the header + ONE
+  // forced-tool-call line only — no re-teaching, no re-grounding text.
   {
     const { h, stop } = await boot();
     const g = await setGoalDirect(h);
@@ -153,12 +152,12 @@ test("1b: wake transcript footprint — default is 'slim' (grounding + trigger, 
     expect(t).toContain(`[GOAL ${g.id} | turn 1/(unbounded)]`);
     expect(t).toContain("goal_complete");
     expect(t).toContain("goal_block");
-    expect(t).toContain("goal_add_task");
-    expect(t).toContain("goal_update_task");
-    // the grounding moved from the (removed) system part into the wake
-    expect(t).toContain("Budget:");
-    expect(t).toContain(`Objective: ${g.objective}`);
-    expect(t).not.toContain("Progress:"); // no task list in slim
+    // minimal ruling: the wake no longer re-states goal content or tools
+    expect(t).not.toContain("Budget:");
+    expect(t).not.toContain(`Objective: ${g.objective}`);
+    expect(t).not.toContain("goal_add_task");
+    expect(t).not.toContain("goal_update_task");
+    expect(t).not.toContain("Progress:");
     await stop();
   }
   // Explicit "full": adds the per-task progress block (budget + objective +

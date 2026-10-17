@@ -143,13 +143,13 @@ test("judge section is absent when no instruction is provided", () => {
   expect(msg).not.toContain("Judge note");
 });
 
-// --- wakeDetail "slim" (2026-10-17, amended same day) ---
-// The context-hook system part was REMOVED (ruling: zero system-part writes —
-// prefix cache), so the slim wake IS the per-turn grounding: header + budget
-// + objective + discipline + one-line forced-tool-call trigger (no task list;
-// judge / wakeText channels unchanged).
+// --- wakeDetail "slim" (2026-10-17, then minimized) ---
+// Minimal ruling: the goal tools are already exposed in the model's system
+// prompt (no per-turn re-teaching) and the objective rides the conversation
+// context — so the slim wake is the header + ONE forced-tool-call line only.
+// judge / wakeText channels unchanged.
 
-test("slim detail: header + budget + objective + discipline + trigger — no task list", () => {
+test("slim detail: header + one forced-trigger line ONLY (minimal ruling)", () => {
   const g = goalWith({
     tasks: [
       makeTask("first task", "done", 1),
@@ -160,14 +160,11 @@ test("slim detail: header + budget + objective + discipline + trigger — no tas
   expect(msg).toBe(
     [
       "[GOAL g_abc | turn 3/10]",
-      "Budget: 10 turns",
-      "Objective: ship the wake builders",
-      "Discipline: advance the goal autonomously; prefer concrete actions over narration.",
-      "Keep tasks current: plan first with goal_add_task(title); sync with goal_update_task(ref, status) (todo/doing/done) as you go.",
-      "Verify progress and end this turn with a tool call: done → goal_complete(evidence, a concrete verifiable anchor ≥24 chars); blocked → goal_block(concrete reason); otherwise → advance.",
+      "End this turn with a tool call: goal_complete(evidence, a concrete verifiable anchor ≥24 chars) / goal_block(concrete reason) / advance the goal.",
     ].join("\n"),
   );
-  // no task detail in slim
+  // no budget / objective / task detail in slim — context carries the goal
+  expect(msg).not.toContain("Budget:");
   expect(msg).not.toContain("Progress:");
   expect(msg).not.toContain("first task");
   // the forced-tool-call contract survives
@@ -186,7 +183,7 @@ test("slim detail: no judge section means the trigger line is the last body line
   const msg = buildWakeMessage(goalWith({}), "10 turns", undefined, undefined, "slim");
   expect(msg).not.toContain("Judge note");
   expect(msg).not.toContain("Extra instruction");
-  expect(msg.split("\n").length).toBe(6);
+  expect(msg.split("\n").length).toBe(2);
 });
 
 test("full detail is the explicit opt-out (5th arg, same as the default)", () => {
@@ -227,28 +224,28 @@ test("goal with no tasks: no-todo marker, no task lines, rest of contract holds"
   expect(msg).toContain("goal_block");
 });
 
-// --- P0-2 (2026-10-16 A/B): imperative task-maintenance instruction ---
-// Evidence: live A/B — the reference plugin's model actively used
-// goal_add_task/goal_update_task across every scenario; ours never did
-// (tasks[] empty in all four runs). The objective grounding carries an
-// explicit imperative instruction; since the system-part removal (2026-10-17)
-// it lives in the wake message (the per-turn tail channel).
+// --- P0-2 (2026-10-16 A/B) superseded for "slim" (2026-10-17 minimal ruling) ---
+// Original evidence: live A/B — the reference plugin's model actively used
+// goal_add_task/goal_update_task; ours never did. The tools are exposed in
+// the model's system prompt, so the slim wake no longer re-teaches them; the
+// "full" detail keeps the imperative instruction (opt-in re-grounding).
 
-test("slim wake carries the imperative task-maintenance instruction (goal_add_task + goal_update_task)", () => {
+test("slim wake does NOT re-teach the goal tools (they are exposed in the system prompt)", () => {
   const msg = buildWakeMessage(goalWith({}), "10 turns", undefined, undefined, "slim");
-  expect(msg).toContain("goal_add_task");
-  expect(msg).toContain("goal_update_task");
+  expect(msg).not.toContain("goal_add_task");
+  expect(msg).not.toContain("goal_update_task");
 });
 
-test("wake message carries the imperative task-maintenance instruction (goal_add_task + goal_update_task)", () => {
+test("full wake message carries the imperative task-maintenance instruction (goal_add_task + goal_update_task)", () => {
   const msg = buildWakeMessage(goalWith({}), "10 turns");
   expect(msg).toContain("goal_add_task");
   expect(msg).toContain("goal_update_task");
 });
 
-// --- slim wake: grounding lives here (the system part is gone) ---
+// --- slim wake: minimal (2026-10-17) — the conversation context carries the
+// goal; the wake re-states nothing but the turn header + terminal trigger ---
 
-test("slim wake carries budget + objective verbatim (the per-turn grounding) — and no task detail", () => {
+test("slim wake carries no objective/budget/task detail — header + trigger only", () => {
   const g = goalWith({
     objective: "slim objective",
     tasks: [
@@ -258,8 +255,8 @@ test("slim wake carries budget + objective verbatim (the per-turn grounding) —
   });
   const msg = buildWakeMessage(g, "10 turns", undefined, undefined, "slim");
   expect(msg).toContain("[GOAL g_abc");
-  expect(msg).toContain("Objective: slim objective");
-  expect(msg).toContain("Budget: 10 turns");
+  expect(msg).not.toContain("slim objective");
+  expect(msg).not.toContain("Budget:");
   expect(msg).not.toContain("1. [");
   expect(msg).not.toContain("2. [doing] 写测试");
 });

@@ -16,11 +16,11 @@ export interface Options {
   checkInDelaySec: number;
   timeoutWrap: boolean;
   /** Wake transcript footprint: "full" (budget + objective + per-task
-   *  progress re-grounded in the wake message) or "slim" (budget + objective
-   *  + discipline lines + one-line trigger, no task list). 2026-10-17: the
-   *  context-hook system part was REMOVED (ruling: the plugin writes NO
-   *  system part — prefix cache), so the wake is the per-turn grounding
-   *  channel. Default "slim" (2026-10-17 transcript-noise ruling). */
+   *  progress re-grounded in the wake message) or "slim" (2026-10-17 minimal
+   *  ruling: header + ONE forced-tool-call line only — the goal tools are
+   *  exposed in the model's system prompt and the objective rides the
+   *  conversation context, so the wake re-teaches and re-states nothing).
+   *  Default "slim". */
   wakeDetail: "full" | "slim";
   wakeText?: string;
   model?: ModelRef;
