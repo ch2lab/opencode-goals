@@ -44,6 +44,7 @@ import type { Judge, JudgeVerdict } from "./judge";
 import { backgroundCheckInText, buildWakeMessage } from "./wake";
 import { buildCompactionPrompt, composeCompactionSummary } from "./compact";
 import { decidePermission, GOAL_CONTROL_ACTION } from "./permission";
+import { appendDecision } from "./decisionlog";
 import type { HostEvent, PermissionDecision, PermissionHookInput, SessionMessage, WakeProbe } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -896,9 +897,9 @@ export class GoalController {
    *    the verdict is disposed inline (continue re-wakes with the optional
    *    instruction; complete / needs_human / give_up end the goal).
    */
-  /** In-flight background work for the gate (2026-10-17 shell-store ruling):
-   * the goal session's OWN running shells, queried live from the host shell
-   * store (shell.list — location-scoped, running-only), plus every OTHER
+  /** In-flight signal for the gate (2026-10-17 shell-store ruling, HTTP data
+   * plane): the goal session's OWN running shells, queried live from the
+   * host shell store (location-scoped, running-only), plus every OTHER
    * in-flight session of this project (subtask sessions: names and parent
    * links are neither known nor needed — count only).
    * Why the store and not the session.shell.* events: the host does not emit
@@ -906,10 +907,12 @@ export class GoalController {
    * the event-driven waitingShells count is blind to exactly the case that
    * motivated the gate. The store is the host's own truth: stateless
    * (self-heals across plugin reloads) and self-pruning (exited shells vanish).
-   * Query failure → treat as in-flight (safe direction: degrades to the
-   * progress-check cadence, never a false wake); warn-once per session. */
-  private async inFlightCount(sessionID: string): Promise<number> {
+   * Query failure = the host context is dead (2026-10-17 ruling): ownKnown
+   * false, NO fake count — the caller logs and skips; reviving a dead
+   * session is not the plugin's job. warn-once per session. */
+  private async inFlightSignal(sessionID: string): Promise<{ own: number; other: number; ownKnown: boolean }> {
     let own = 0;
+    let ownKnown = true;
     try {
       const info = await this.probe.sessionGet(sessionID);
       const directory = info?.location?.directory;
@@ -920,17 +923,22 @@ export class GoalController {
       }
       this.shellQueryWarned.delete(sessionID); // a success re-arms the warn
     } catch (err) {
+      ownKnown = false;
       if (!this.shellQueryWarned.has(sessionID)) {
         this.shellQueryWarned.add(sessionID);
-        console.warn(`opencode-goal: shell store query failed for ${sessionID}; treating as in-flight:`, err);
+        console.warn(
+          `opencode-goal: shell store query failed for ${sessionID}; the host context is dead — skipping this boundary:`,
+          err,
+        );
       }
-      return 1;
     }
-    let n = own;
-    for (const sid of this.activeSessions.keys()) {
-      if (sid !== sessionID) n += 1;
+    let other = 0;
+    if (ownKnown) {
+      for (const sid of this.activeSessions.keys()) {
+        if (sid !== sessionID) other += 1;
+      }
     }
-    return n;
+    return { own, other, ownKnown };
   }
 
   private async arbitrateBoundary(sessionID: string, event: HostEvent): Promise<void> {
@@ -1007,7 +1015,26 @@ export class GoalController {
     // spec §7.1: a check-in replied with pure text counts per the stall
     // ladder; (b) goal_wait's waitUntil window silences EVERYTHING
     // (record only: no wake, no arm, no stall accounting — "不消耗 stall 预算").
-    const inFlight = await this.inFlightCount(sessionID);
+    const { own, other, ownKnown } = await this.inFlightSignal(sessionID);
+    const inFlight = own + other;
+    if (!ownKnown) {
+      // Query failure = the host context is dead (2026-10-17 ruling): log +
+      // skip — no wake, no check-in arm, no stall accounting. Reviving a dead
+      // session is not the plugin's job; the human reads the log.
+      await appendDecision({
+        ts: new Date().toISOString(),
+        sessionID,
+        goalID: goal.id,
+        own: 0,
+        other: 0,
+        ownKnown: false,
+        decision: "skip",
+        reason: "shell signal unavailable (host context dead)",
+      });
+      this.markTurnInactive(sessionID);
+      await this.recordHandled(sessionID, eventID, goal);
+      return;
+    }
     if (inFlight > 0) {
       const quiet = goal.waitUntil !== undefined && Date.now() < goal.waitUntil;
       const last = this.lastInbox.get(sessionID);
@@ -1023,6 +1050,16 @@ export class GoalController {
           });
           this.ensureWatchdog(sessionID); // the tick is the deadline's heartbeat
         }
+        await appendDecision({
+          ts: new Date().toISOString(),
+          sessionID,
+          goalID: goal.id,
+          own,
+          other,
+          ownKnown: true,
+          decision: "hold",
+          reason: quiet ? "in-flight, quiet window" : "in-flight (check-in armed)",
+        });
         this.markTurnInactive(sessionID);
         await this.recordHandled(sessionID, eventID, goal);
         return;
@@ -1087,7 +1124,19 @@ export class GoalController {
       );
       return;
     }
-    if (wake) await this.injectWake(goal);
+    if (wake) {
+      await appendDecision({
+        ts: new Date().toISOString(),
+        sessionID,
+        goalID: goal.id,
+        own,
+        other,
+        ownKnown: true,
+        decision: "wake",
+        reason: `boundary (in-flight ${inFlight})`,
+      });
+      await this.injectWake(goal);
+    }
     this.markTurnInactive(sessionID);
     // Regression fix (Task 9 brief, Task 8 M4 extract lost this): the tail
     // ALWAYS persists this boundary's increments (used.turns / continuations

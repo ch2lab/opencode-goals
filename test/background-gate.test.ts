@@ -15,6 +15,8 @@
 // small option values (checkInDelaySec 1s = the 1-second minimum) + STATE
 // polling, never exact wall-clock moments.
 import { expect, test } from "bun:test";
+import * as fs from "node:fs";
+import { decisionLogPath } from "../src/decisionlog.ts";
 import { resolveOptions } from "../src/options.ts";
 import { goalStorageKey, type GoalRecord } from "../src/state.ts";
 import { backgroundCheckInText } from "../src/wake.ts";
@@ -315,15 +317,92 @@ test("16: another session's shell in the same location is not counted → immedi
   await stop();
 });
 
-test("17: query failure → treat as in-flight (safe direction: no wake, no throw, check-in still fires)", async () => {
+// 2026-10-17 ruling: a failed shell query means the host context is dead —
+// log it and SKIP (no wake, no check-in arm); reviving a dead session is not
+// the plugin's job. "The query must succeed when the API is healthy" is
+// guaranteed by the one-shot host verification, not by failure fallbacks.
+
+test("17: query failure = host context dead → skip (no wake, no check-in arm, no throw)", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Fail17");
   h.setSession(S, { location: { directory: "/w" } });
   h.failShellList(true);
   await modelWorked(h, "c");
-  await h.emit(succeeded("b1", S)); // query throws → in-flight → hold + arm
+  await h.emit(succeeded("b1", S)); // query throws → skip: nothing armed, no wake
   expect(h.prompts.length).toBe(0);
-  await sleep(1500); // the armed one-shot still fires (no permanent silence)
+  await sleep(1500); // nothing armed → still silent
+  expect(h.prompts.length).toBe(0);
+  await stop();
+});
+
+// Decision log assertions: the gate writes one JSON line per decision to
+// <tempdir>/opencode-goal/decisions-<pid>.jsonl (this process' file).
+
+function lastDecision(sessionID: string): Record<string, unknown> | undefined {
+  try {
+    const raw = fs.readFileSync(decisionLogPath(process.pid), "utf8");
+    const lines = raw
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+    const mine = lines.filter((l) => l.sessionID === sessionID);
+    return mine[mine.length - 1];
+  } catch {
+    return undefined;
+  }
+}
+
+test("18: in-flight boundary logs a hold decision (real counts, ownKnown)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Log18");
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "shX", status: "running", sessionID: S }]); // store truth, no events
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // own running shell → hold
+  expect(h.prompts.length).toBe(0);
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("hold");
+  expect(line?.own).toBe(1);
+  expect(line?.other).toBe(0);
+  expect(line?.ownKnown).toBe(true);
+  await stop();
+});
+
+test("19: skipped boundary logs skip (ownKnown false) and warns once per session", async () => {
+  const { h, stop } = await boot();
+  const warns: unknown[][] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warns.push(args);
+  };
+  try {
+    await h.commandExecutor(S, "/goal set Log19");
+    h.setSession(S, { location: { directory: "/w" } });
+    h.failShellList(true);
+    await modelWorked(h, "c");
+    await h.emit(succeeded("b1", S)); // skip
+    await h.emit(succeeded("b2", S)); // skip again — the warn stays at one
+    const line = lastDecision(S);
+    expect(line?.decision).toBe("skip");
+    expect(line?.ownKnown).toBe(false);
+    const shellWarns = warns.filter((w) => String(w[0] ?? "").includes("shell store query failed"));
+    expect(shellWarns).toHaveLength(1);
+  } finally {
+    console.warn = origWarn;
+    await stop();
+  }
+});
+
+test("20: an ordinary wake boundary logs wake (ownKnown, in-flight 0)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Log20");
+  h.setSession(S, { location: { directory: "/w" } });
+  await modelWorked(h, "d");
+  await h.emit(succeeded("b1", S)); // nothing in flight → wake
   expect(h.prompts.length).toBe(1);
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("wake");
+  expect(line?.ownKnown).toBe(true);
   await stop();
 });
