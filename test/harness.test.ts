@@ -243,7 +243,7 @@ test("contract 9: registration surface lands in the harness; executors drive it 
   const sessionCalls: Array<[string, Record<string, unknown>]> = [];
   const permissionActions: string[] = [];
 
-  h.probe.registerCommand("goal", async (text, sessionID) => {
+  h.probe.registerCommand("goal", "test command", async (text, sessionID) => {
     commandTexts.push(text);
     commandSessions.push(sessionID);
   });

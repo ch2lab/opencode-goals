@@ -213,6 +213,14 @@ const USAGE =
   "/goal resume | /goal complete <evidence> | /goal block <reason> | /goal clear | " +
   "/goal task add <title> | /goal task <n> <todo|doing|done> | /goal history";
 
+/**
+ * Command-menu description (host CommandDefinition.description — the friendly
+ * hint other plugins show in the / command list; 2026-10-17 user request).
+ * One line: what it is + all subcommands at a glance.
+ */
+const GOAL_COMMAND_DESCRIPTION =
+  "Goal loop: 设定目标后模型自主推进，证据门控完成或预算用尽收口。Usage: /goal set|view|pause|resume|complete|block|clear|task|history";
+
 /** All 8 goal_* tools are gated by the goal.control permission (Task 3). */
 const GOAL_PERMISSION = GOAL_CONTROL_ACTION;
 
@@ -470,7 +478,9 @@ export class GoalController {
     }
     if (this.stopped) return slot.stop; // displaced during the takeover — do not arm
 
-    this.probe.registerCommand("goal", (text, sessionID) => this.handleCommand(sessionID, text));
+    this.probe.registerCommand("goal", GOAL_COMMAND_DESCRIPTION, (text, sessionID) =>
+      this.handleCommand(sessionID, text),
+    );
 
     this.probe.registerTool(
       "goal_set",

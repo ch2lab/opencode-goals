@@ -187,7 +187,7 @@ export interface WakeProbe {
   // —— 注册面（adapter 转真实 ctx；harness 记录供断言；hook 载荷字段以 2.0.29 .d.ts 为准）——
   // Ruling R5: command invocations (CommandInvocation) and tool contexts
   // (Tool.Context) both carry sessionID in 2.0.29 — multi-session attribution.
-  registerCommand(name: string, run: (text: string, sessionID: string) => Promise<void>): void;
+  registerCommand(name: string, description: string, run: (text: string, sessionID: string) => Promise<void>): void;
   registerTool(name: string, spec: { description: string; input: unknown; permission?: string }, run: (input: unknown, sessionID: string) => Promise<string>): void;
   onSessionHook(kind: "context" | "compaction", fn: (sessionID: string, payload: Record<string, unknown>) => void): void;
   onShellCreateBefore(fn: (input: { command: string; cwd: string; timeout: number }) => void): void;

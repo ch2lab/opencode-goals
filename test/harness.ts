@@ -61,6 +61,7 @@ export interface Harness {
   setSession(sessionID: string, settings: { location?: { directory?: string }; projectID?: string }): void; // sessionGet 后端
   setMessages(sessionID: string, messages: SessionMessage[]): void; // context() 后端
   commands: Map<string, (text: string, sessionID: string) => Promise<void>>;
+  commandDescriptions: Map<string, string>; // 命令菜单里的友好描述（宿主 CommandDefinition.description）
   tools: Map<
     string,
     { spec: { description: string; input: unknown; permission?: string }; run: (input: unknown, sessionID: string) => Promise<string> }
@@ -247,6 +248,7 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
   const permissions: Harness["permissions"] = [];
   const permissionDecisions: Harness["permissionDecisions"] = [];
   const commands: Harness["commands"] = new Map();
+  const commandDescriptions: Harness["commandDescriptions"] = new Map();
   const tools: Harness["tools"] = new Map();
   const sessionHooks: Harness["sessionHooks"] = { context: [], compaction: [] };
   const shellCreateBefore: Harness["shellCreateBefore"] = [];
@@ -315,8 +317,9 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
         }
       }
     },
-    registerCommand: (name, run) => {
+    registerCommand: (name, description, run) => {
       commands.set(name, run);
+      commandDescriptions.set(name, description);
     },
     registerTool: (name, spec, run) => {
       tools.set(name, { spec: { ...spec }, run });
@@ -382,6 +385,7 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
       messages.set(sessionID, structuredClone(msgs));
     },
     commands,
+    commandDescriptions,
     tools,
     sessionHooks,
     shellCreateBefore,

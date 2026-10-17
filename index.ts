@@ -264,11 +264,14 @@ export default Plugin.define({
       // ctx.command.transform(e => e.add(CommandDefinition { name,
       // description?, execute(input: CommandInvocation { sessionID,
       // prompt: { text }, delivery }) })) (plugin/dist/promise/command.d.ts).
-      registerCommand: (name, run) => {
+      registerCommand: (name, description, run) => {
         remember(
           ctx.command.transform((e) => {
             e.add({
               name,
+              // CommandDefinition.description (schema-verified 2.0.29) — the
+              // friendly hint shown in the host's / command list.
+              description,
               execute: async (inv) => {
                 await run(inv.prompt.text, inv.sessionID);
               },

@@ -447,3 +447,16 @@ test("13: goal_set description constrains spontaneous use (explicit-ask gate)", 
   expect(spec!.spec.description).toMatch(/explicitly asks you to set a goal/i);
   await stop();
 });
+
+test("15: the /goal command carries a friendly command-menu description (host CommandDefinition.description)", async () => {
+  // 2026-10-17 user request: other plugins show a one-line hint in the host's
+  // / command list — /goal must too (name + purpose + subcommands at a glance).
+  const { h, stop } = await boot();
+  const desc = h.commandDescriptions.get("goal");
+  expect(desc).toBeDefined();
+  expect(desc!.length).toBeGreaterThan(20);
+  for (const sub of ["set", "view", "pause", "resume", "complete", "block", "clear", "task", "history"]) {
+    expect(desc).toContain(sub);
+  }
+  await stop();
+});
