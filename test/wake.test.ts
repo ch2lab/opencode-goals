@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createGoal, type GoalRecord, type GoalTask } from "../src/state.ts";
-import { buildWakeMessage } from "../src/wake.ts";
+import { backgroundCheckInText, buildWakeMessage } from "../src/wake.ts";
 
 const NOW = 1_700_000_000_000;
 
@@ -194,6 +194,24 @@ test("full detail is the explicit opt-out (5th arg, same as the default)", () =>
   const full = buildWakeMessage(g, "10 turns", undefined, undefined, "full");
   expect(full).toBe(buildWakeMessage(g, "10 turns"));
   expect(full).toContain("Objective:");
+});
+
+// --- backgroundCheckInText (2026-10-17 ruling: one-shot progress check after
+// checkInDelaySec of silence while background work is in flight — a pure
+// reminder; the plugin does no liveness checking of the background work) ---
+
+test("backgroundCheckInText: byte-pinned reminder (in-flight count + wait, English)", () => {
+  const t1 = backgroundCheckInText(1, 300);
+  expect(t1).toBe(
+    "Background check-in: 1 background item(s) in flight, no session activity for 300s. Check progress: what finished, what is next — advance the goal.",
+  );
+  const t3 = backgroundCheckInText(3, 90);
+  expect(t3).toBe(
+    "Background check-in: 3 background item(s) in flight, no session activity for 90s. Check progress: what finished, what is next — advance the goal.",
+  );
+  // i18n ruling: plugin-generated text is CJK-free
+  expect(/[一-鿿]/.test(t1)).toBe(false);
+  expect(/[一-鿿]/.test(t3)).toBe(false);
 });
 
 // --- empty tasks ---

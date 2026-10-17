@@ -11,6 +11,11 @@ export interface Options {
   watchdogTickMs: number;
   shellStallMs: number;
   waitCheckInMs: number;
+  /** 2026-10-17 ruling: background in-flight gate — a boundary with background
+   * work (shells / subtask sessions) in flight does NOT wake immediately; it
+   * arms a one-shot progress check after this many SECONDS of silence
+   * (default 300 = 5 minutes). Any session activity cancels it. */
+  checkInDelaySec: number;
   timeoutWrap: boolean;
   /** Wake transcript footprint: "full" (budget + objective + per-task
    *  progress re-grounded in the wake message) or "slim" (budget + objective
@@ -37,6 +42,7 @@ const DEFAULT_OPTIONS: Options = {
   watchdogTickMs: 30000,
   shellStallMs: 300000,
   waitCheckInMs: 300000,
+  checkInDelaySec: 300,
   timeoutWrap: false,
   wakeDetail: "slim",
 };
@@ -75,6 +81,7 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
     watchdogTickMs: num("watchdogTickMs", DEFAULT_OPTIONS.watchdogTickMs),
     shellStallMs: num("shellStallMs", DEFAULT_OPTIONS.shellStallMs),
     waitCheckInMs: num("waitCheckInMs", DEFAULT_OPTIONS.waitCheckInMs),
+    checkInDelaySec: num("checkInDelaySec", DEFAULT_OPTIONS.checkInDelaySec),
     timeoutWrap: bool("timeoutWrap", DEFAULT_OPTIONS.timeoutWrap),
     wakeDetail,
     wakeText,

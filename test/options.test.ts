@@ -10,6 +10,7 @@ const EXPECTED_DEFAULTS: Options = {
   watchdogTickMs: 30000,
   shellStallMs: 300000,
   waitCheckInMs: 300000,
+  checkInDelaySec: 300,
   timeoutWrap: false,
   wakeDetail: "slim",
   wakeText: undefined,
@@ -25,6 +26,7 @@ test("empty input yields every default exactly", () => {
   expect(o.watchdogTickMs).toBe(30000);
   expect(o.shellStallMs).toBe(300000);
   expect(o.waitCheckInMs).toBe(300000);
+  expect(o.checkInDelaySec).toBe(300);
   expect(o.timeoutWrap).toBe(false);
   expect(o.wakeDetail).toBe("slim");
   expect(o.wakeText).toBeUndefined();
@@ -79,6 +81,20 @@ test("stallLimit accepts integers >= 1 only", () => {
   expect(resolveOptions({ stallLimit: 1 }).stallLimit).toBe(1);
   expect(resolveOptions({ stallLimit: 0 }).stallLimit).toBe(3);
   expect(resolveOptions({ stallLimit: 2.5 }).stallLimit).toBe(3);
+});
+
+// --- checkInDelaySec (2026-10-17 ruling: background in-flight gate — the
+// session stays quiet checkInDelaySec seconds, then gets a one-shot progress
+// check. Unit = SECONDS (ruling), default 300 = 5 minutes) ---
+
+test("checkInDelaySec: integer seconds >= 1 only, default 300", () => {
+  expect(resolveOptions({}).checkInDelaySec).toBe(300);
+  expect(resolveOptions({ checkInDelaySec: 1 }).checkInDelaySec).toBe(1);
+  expect(resolveOptions({ checkInDelaySec: 60 }).checkInDelaySec).toBe(60);
+  expect(resolveOptions({ checkInDelaySec: 0 }).checkInDelaySec).toBe(300);
+  expect(resolveOptions({ checkInDelaySec: -5 }).checkInDelaySec).toBe(300);
+  expect(resolveOptions({ checkInDelaySec: 0.5 }).checkInDelaySec).toBe(300);
+  expect(resolveOptions({ checkInDelaySec: "300" }).checkInDelaySec).toBe(300);
 });
 
 test("booleans accept only boolean literals", () => {

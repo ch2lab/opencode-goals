@@ -7,6 +7,17 @@
 // in whatever language the user wrote it.
 import type { GoalRecord } from "./state";
 
+/**
+ * One-shot progress-check reminder (2026-10-17 ruling): fired by the watchdog
+ * tick when a session has been silent for `waitSec` seconds with background
+ * work (`inFlight` items — shells / subtask sessions) still in flight. Pure
+ * reminder: the plugin does NO liveness checking of the background work
+ * itself — the session (model) goes and checks.
+ */
+export function backgroundCheckInText(inFlight: number, waitSec: number): string {
+  return `Background check-in: ${inFlight} background item(s) in flight, no session activity for ${waitSec}s. Check progress: what finished, what is next — advance the goal.`;
+}
+
 /** Turns usage text: `used/cap`, or `used/(unbounded)` when cap is open. */
 function turnsUsage(goal: GoalRecord): string {
   const { used, cap } = goal;
