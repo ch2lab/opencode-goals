@@ -431,6 +431,20 @@ export class GoalController {
    * next attribution, overwritten by the next started).
    */
   private turns = new Map<string, { active: boolean; toolCalled: boolean }>();
+  /**
+   * In-flight session registry (2026-10-17 ruling): EVERY session of this
+   * project currently mid-turn — goal-independent (the in-flight gate counts
+   * sessions, not goals). `session.execution.started` → add; terminal
+   * boundary → delete. Feeds inFlightCount(); a lost terminal event leaves a
+   * stale entry (degrades to a slower gate, never a false wake).
+   */
+  private activeSessions = new Map<string, number>();
+  /**
+   * One-shot progress-check deadline per session (2026-10-17 ruling): armed at
+   * in-flight boundaries, cancelled by any session activity, fired by the
+   * watchdog tick.
+   */
+  private checkinDue = new Map<string, { due: number; inFlight: number }>();
   /** continuationPending window: set at wake injection, cleared by execution.started. */
   private contPending = new Map<string, boolean>();
   /**
@@ -797,6 +811,17 @@ export class GoalController {
     const sessionID = event.properties?.sessionID;
     if (typeof sessionID !== "string" || sessionID === "") return; // 无归属：无 sessionID
     if (!(await this.sessionBelongs(sessionID))) return; // 无归属：非本实例 project
+    // 2026-10-17 in-flight gate: per-session mid-turn tracking (every project
+    // session, goal-independent — the gate counts in-flight sessions).
+    if (event.type === "session.execution.started") {
+      this.activeSessions.set(sessionID, Date.now());
+    } else if (
+      event.type === "session.execution.succeeded" ||
+      event.type === "session.execution.failed" ||
+      event.type === "session.idle"
+    ) {
+      this.activeSessions.delete(sessionID);
+    }
     switch (event.type) {
       case "session.execution.started":
         await this.onExecutionStarted(sessionID);
@@ -862,6 +887,7 @@ export class GoalController {
   }
 
   private async onExecutionStarted(sessionID: string): Promise<void> {
+    this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
     const goal = await this.loadGoal(sessionID);
     if (goal === undefined || goal.status !== "active") return;
     let t = this.turns.get(sessionID);
@@ -881,6 +907,7 @@ export class GoalController {
   }
 
   private async onToolCalled(sessionID: string): Promise<void> {
+    this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
     const goal = await this.loadGoal(sessionID);
     if (goal === undefined || goal.status !== "active") return;
     const t = this.turns.get(sessionID);
@@ -910,6 +937,7 @@ export class GoalController {
    *  data.tokens = { input, output, reasoning, cache: { read, write } } —
    *  the total sums all five fields (token-usage.d.ts `total` semantics). */
   private async onUsageUpdated(sessionID: string, props: Record<string, unknown>): Promise<void> {
+    this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
     const goal = await this.loadGoal(sessionID);
     if (goal === undefined || isTerminal(goal.status)) return;
     const tokens = props.tokens;
@@ -925,6 +953,7 @@ export class GoalController {
   }
 
   private async onInboxEnqueued(sessionID: string, props: Record<string, unknown>): Promise<void> {
+    this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
     // .d.ts (session-event.d.ts InboxEnqueued): data = { item: { type,
     // payload, delivery }, inboxID, sessionID }.
     const inboxID = typeof props.inboxID === "string" ? props.inboxID : undefined;
@@ -1026,6 +1055,18 @@ export class GoalController {
    *    the verdict is disposed inline (continue re-wakes with the optional
    *    instruction; complete / needs_human / give_up end the goal).
    */
+  /** In-flight background work for the gate (2026-10-17 ruling): this goal's
+   * waiting shells + every OTHER in-flight session of this project. Subtask
+   * sessions: names and parent links are neither known nor needed — the count
+   * alone is the signal ("拿不到子任务或 shell 名称不重要，只需数量 > 0"). */
+  private inFlightCount(goal: GoalRecord, sessionID: string): number {
+    let n = goal.waitingShells?.length ?? 0;
+    for (const sid of this.activeSessions.keys()) {
+      if (sid !== sessionID) n += 1;
+    }
+    return n;
+  }
+
   private async arbitrateBoundary(sessionID: string, event: HostEvent): Promise<void> {
     const eventID = typeof event.id === "string" ? event.id : undefined;
     // ① dedup: already handled (memory, bounded) or persisted as handled.
@@ -1089,20 +1130,33 @@ export class GoalController {
       this.rememberHandled(eventID);
       return;
     }
-    // Task 10 fast path (spec §6-② / §7.1): a boundary while the goal is
-    // waiting on shells does NOT inject the ordinary wake — (re)arming the
-    // watchdog IS this boundary's entire action. Two exceptions keep normal
-    // arbitration: (a) the last inbox item is one of OUR watchdog wakes —
-    // spec §7.1: a check-in replied with pure text counts per the stall
-    // ladder; (b) goal_wait's waitUntil window silences EVERYTHING (record
-    // only: no wake, no stall accounting — "不消耗 stall 预算").
-    const waitingCount = goal.waitingShells?.length ?? 0;
-    if (waitingCount > 0) {
+    // Background in-flight gate (2026-10-17 ruling): a terminal boundary with
+    // ANY background work in flight — the goal's waiting shells OR other
+    // in-flight sessions of this project (subtask sessions) — does NOT inject
+    // the ordinary wake; the session is already "waiting". The boundary's
+    // entire action: arm the one-shot progress check (checkInDelaySec of
+    // silence, fired by the watchdog tick) + keep the shell watchdog (re)armed.
+    // Two exceptions keep normal arbitration: (a) the last inbox item is one of
+    // OUR watchdog wakes — spec §7.1: a check-in replied with pure text counts
+    // per the stall ladder; (b) goal_wait's waitUntil window silences EVERYTHING
+    // (record only: no wake, no arm, no stall accounting — "不消耗 stall 预算").
+    const inFlight = this.inFlightCount(goal, sessionID);
+    if (inFlight > 0) {
       const quiet = goal.waitUntil !== undefined && Date.now() < goal.waitUntil;
       const last = this.lastInbox.get(sessionID);
       const lastWatchdog = last !== undefined && last.kind === "wake" && last.watchdog === true;
       if (quiet || !lastWatchdog) {
-        this.rearmWatchdog(sessionID, goal);
+        if (!quiet) {
+          // Not quiet: arm the one-shot progress check. The clock only runs
+          // while the session is quiet — any activity cancels it, and the next
+          // in-flight boundary re-arms (fresh countdown).
+          this.checkinDue.set(sessionID, {
+            due: Date.now() + this.options.checkInDelaySec * 1000,
+            inFlight,
+          });
+          this.ensureWatchdog(sessionID); // the tick is the deadline's heartbeat
+        }
+        if ((goal.waitingShells?.length ?? 0) > 0) this.rearmWatchdog(sessionID, goal);
         this.markTurnInactive(sessionID);
         await this.recordHandled(sessionID, eventID, goal);
         return;
@@ -1110,7 +1164,7 @@ export class GoalController {
       // Proceeding (a reply to OUR watchdog wake) is still a boundary while
       // waiting on shells → re-arm the watchdog (spec §6-②: a boundary with
       // running shells arms; execution.started having disarmed it).
-      this.rearmWatchdog(sessionID, goal);
+      if ((goal.waitingShells?.length ?? 0) > 0) this.rearmWatchdog(sessionID, goal);
     }
     // ⑤ attribution (lastInbox) → stall ladder.
     const toolCalled = this.turns.get(sessionID)?.toolCalled === true;
@@ -1748,6 +1802,7 @@ export class GoalController {
    * ghost rule).
    */
   private async onShellStarted(sessionID: string, props: Record<string, unknown>): Promise<void> {
+    this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
     const shell = shellInfoFrom(props);
     if (shell === undefined) return;
     const goal = await this.loadGoal(sessionID);
@@ -1773,6 +1828,7 @@ export class GoalController {
    * processed.
    */
   private async onShellEnded(sessionID: string, props: Record<string, unknown>): Promise<void> {
+    this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
     const shell = shellInfoFrom(props);
     if (shell === undefined) return;
     const goal = await this.loadGoal(sessionID);
