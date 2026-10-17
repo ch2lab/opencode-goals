@@ -48,7 +48,9 @@ interface Boot {
 async function boot(existing?: Harness): Promise<Boot> {
   const h = existing ?? (await createHarness());
   const judgeCalls: Boot["judgeCalls"] = [];
-  const ctrl = new GoalController(h.probe, resolveOptions({}), {
+  // This file exercises the judge's arbitration behavior → enable it
+  // explicitly (the option default flipped to false on 2026-10-17).
+  const ctrl = new GoalController(h.probe, resolveOptions({ judgeEnabled: true }), {
     judge: {
       judge: async (goal, texts) => {
         judgeCalls.push({ goalID: goal.id, texts: [...texts] });
@@ -137,28 +139,30 @@ test("1: boundary wake — succeeded with sessionID + event id injects a queue w
   await stop();
 });
 
-test("1b: wake transcript footprint — default is 'slim' (one-line trigger); wakeDetail 'full' restores the re-grounding blocks", async () => {
-  // Default (options.wakeDetail "slim", 2026-10-17 ruling): header +
-  // one-line forced-tool-call trigger. Objective/budget ride the per-turn
-  // context-hook system part; task progress rides transcript history +
-  // compaction — the wake does not repeat them.
+test("1b: wake transcript footprint — default is 'slim' (grounding + trigger, no task list); wakeDetail 'full' adds the per-task progress block", async () => {
+  // Default (options.wakeDetail "slim", 2026-10-17, amended same day): the
+  // context-hook system part was REMOVED (zero system-part writes — prefix
+  // cache), so the slim wake IS the per-turn grounding: header + budget +
+  // objective + discipline + one-line forced-tool-call trigger (no task list
+  // — task progress rides transcript history + compaction).
   {
     const { h, stop } = await boot();
     const g = await setGoalDirect(h);
     await h.emit(succeeded("e1"));
     const t = h.prompts[0].input.text;
-    expect(t).toContain(`[GOAL ${g.id} | 第 1/(unbounded) 轮]`);
+    expect(t).toContain(`[GOAL ${g.id} | turn 1/(unbounded)]`);
     expect(t).toContain("goal_complete");
     expect(t).toContain("goal_block");
     expect(t).toContain("goal_add_task");
     expect(t).toContain("goal_update_task");
-    expect(t).not.toContain("预算:");
-    expect(t).not.toContain("目标:");
-    expect(t).not.toContain("进度:");
+    // the grounding moved from the (removed) system part into the wake
+    expect(t).toContain("Budget:");
+    expect(t).toContain(`Objective: ${g.objective}`);
+    expect(t).not.toContain("Progress:"); // no task list in slim
     await stop();
   }
-  // Explicit "full": the pre-2026-10-17 shape (budget + objective + progress
-  // re-grounded inside the wake message itself).
+  // Explicit "full": adds the per-task progress block (budget + objective +
+  // progress re-grounded inside the wake message itself).
   {
     const h = await createHarness();
     const ctrl = new GoalController(h.probe, resolveOptions({ wakeDetail: "full" }), {});
@@ -166,10 +170,10 @@ test("1b: wake transcript footprint — default is 'slim' (one-line trigger); wa
     const g = await setGoalDirect(h);
     await h.emit(succeeded("e1"));
     const t = h.prompts[0].input.text;
-    expect(t).toContain("预算: unbounded turns / unbounded tokens");
-    expect(t).toContain(`目标: ${g.objective}`);
-    expect(t).toContain("进度:");
-    expect(t).toContain("请核对以上进度");
+    expect(t).toContain("Budget: unbounded turns / unbounded tokens");
+    expect(t).toContain(`Objective: ${g.objective}`);
+    expect(t).toContain("Progress:");
+    expect(t).toContain("Review the progress above");
     await stop();
   }
 });
@@ -312,7 +316,7 @@ test("5: three consecutive no-action boundaries hit the stall ladder → judge c
   expect(judgeCalls[0].texts[0]).toBe("no action two"); // max 3: oldest trimmed
   // judge result disposed inline (Task 9): this verdict carries no
   // instruction → the wake carries no judge paragraph.
-  expect(h.prompts[3].input.text).not.toContain("裁判提示");
+  expect(h.prompts[3].input.text).not.toContain("Judge note");
   await stop();
 });
 
@@ -445,7 +449,7 @@ test("9: restart replay — a new controller on the same storage does not re-wak
 // including the byte-identical default.
 // ---------------------------------------------------------------------------
 
-test("14: options.wakeText appends 补充指示 to the boundary wake prompt", async () => {
+test("14: options.wakeText appends an Extra instruction line to the boundary wake prompt", async () => {
   const h = await createHarness();
   const ctrl = new GoalController(h.probe, resolveOptions({ wakeText: "务必先看 CI 日志" }), {});
   const stop = await ctrl.start();
@@ -456,7 +460,7 @@ test("14: options.wakeText appends 补充指示 to the boundary wake prompt", as
   expect(p.metadata?.goalWake).toBe(true);
   expect(p.metadata?.goalID).toBe(g.id);
   expect(p.text).toContain(`[GOAL ${g.id}`); // the normal wake body is intact
-  expect(p.text).toContain("补充指示: 务必先看 CI 日志"); // options.wakeText landed
-  expect(p.text.endsWith("补充指示: 务必先看 CI 日志")).toBe(true); // final line
+  expect(p.text).toContain("Extra instruction: 务必先看 CI 日志"); // options.wakeText landed (user content stays verbatim)
+  expect(p.text.endsWith("Extra instruction: 务必先看 CI 日志")).toBe(true); // final line
   await stop();
 });

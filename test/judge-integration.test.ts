@@ -85,7 +85,9 @@ interface Boot {
 async function boot(options: Record<string, unknown> = {}): Promise<Boot> {
   const h = await createHarness();
   const fake = fakeJudge();
-  const ctrl = new GoalController(h.probe, resolveOptions(options), { judge: fake.judge });
+  // These tests exercise the judge itself → enable it explicitly (the default
+  // flipped to false on 2026-10-17; test 7 opts back out with an explicit false).
+  const ctrl = new GoalController(h.probe, resolveOptions({ judgeEnabled: true, ...options }), { judge: fake.judge });
   const stop = await ctrl.start();
   return { h, stop, fake };
 }
@@ -160,7 +162,7 @@ test("1: continue — stalls zeroed, judgeUsed persisted, instruction rides the 
   expect(fake.lastTexts).toEqual(["tail-two", "tail-three", "tail-four"]); // bound + ≤3
   const wake = h.prompts[h.prompts.length - 1].input;
   expect(wake.text).toContain("next step"); // judge instruction paragraph
-  expect(wake.text).toContain("裁判提示");
+  expect(wake.text).toContain("Judge note");
   await stop();
 });
 
@@ -210,7 +212,7 @@ test("3: complete with ungrounded evidence — demoted to continue (no complete,
   expect(g.judgeUsed).toBe(true);
   expect(g.evidence).toBeUndefined();
   const wake = h.prompts[h.prompts.length - 1].input;
-  expect(wake.text).not.toContain("裁判提示"); // no instruction → no judge paragraph
+  expect(wake.text).not.toContain("Judge note"); // no instruction → no judge paragraph
   expect(fake.calls).toBe(1);
   await stop();
 });
@@ -301,7 +303,7 @@ test("6: one judge per goal — after continue, three more no-action boundaries 
   const g = goalOf(h)!;
   expect(g.id).toBe(g0.id);
   expect(g.status).toBe("stalled");
-  expect(g.stallReport).toContain("裁判已用过"); // fixed wording: judge already used
+  expect(g.stallReport).toContain("Judge already used"); // fixed wording: judge already used
   expect(h.storage.get(archivedGoalKey(S, g.id))).toBeDefined();
   await stop();
 });
@@ -324,7 +326,7 @@ test("7: judgeEnabled=false — the fake is never called, directly stalled at th
   expect(g.status).toBe("stalled");
   expect(g.stallReport).toContain("NoJudge"); // objective verbatim in the report
   expect(g.stallReport).toContain("stalling hard"); // no-action tails
-  expect(g.stallReport).toContain("裁判未启用"); // fixed wording: judge disabled
+  expect(g.stallReport).toContain("Judge not enabled"); // fixed wording: judge disabled
   expect(h.synthetics[h.synthetics.length - 1].input.metadata?.goalControl).toBe(true);
   await stop();
 });
@@ -348,7 +350,7 @@ test("14: judge complete verdict on a stale record — silent drop, no terminal 
       return pending; // LONG judge await — spans the /goal pause below
     },
   };
-  const ctrl = new GoalController(h.probe, resolveOptions({}), { judge });
+  const ctrl = new GoalController(h.probe, resolveOptions({ judgeEnabled: true }), { judge });
   const stop = await ctrl.start();
   const evidence = "bun test passed: all 12 tests green in goal-loop.test.ts";
   await h.commandExecutor(S, "/goal set JudgeStale");
@@ -411,7 +413,7 @@ test("8: judge rejects — fail-closed stalled, the event loop survives and keep
   ]);
   await runStalls(h, 3, "x");
   expect(goalOf(h)!.status).toBe("stalled"); // ruling: reject = give_up semantics
-  expect(goalOf(h)!.stallReport).toContain("裁判调用失败"); // fixed wording
+  expect(goalOf(h)!.stallReport).toContain("Judge call failed"); // fixed wording
   const promptsBefore = h.prompts.length;
   // A subsequent boundary must still be handled normally (record-only, no wake).
   await h.emit(succeeded("e_after"));

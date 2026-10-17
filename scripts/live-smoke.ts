@@ -239,7 +239,7 @@ async function runSmoke(host: IsolatedHost): Promise<void> {
       // plugin wake in the host inbox (SSE trace): the shell-exit watchdog
       // wake (text "你等待的脚本…") or any goalWake stall-ladder item
       const ev = await readFile(eventFile, "utf8").catch(() => "");
-      if (/"goalWake":true|你等待的脚本/.test(ev)) {
+      if (/"goalWake":true|The shell you were waiting for/.test(ev)) {
         level = "inbox";
         break;
       }

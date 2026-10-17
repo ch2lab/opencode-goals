@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createGoal, type GoalRecord, type GoalTask } from "../src/state.ts";
-import { buildWakeMessage, objectiveBlock } from "../src/wake.ts";
+import { buildWakeMessage } from "../src/wake.ts";
 
 const NOW = 1_700_000_000_000;
 
@@ -45,11 +45,10 @@ test("wake message carries [GOAL <id>], the verbatim objective, and turns usage"
   expect(msg).toContain("3/10");
 });
 
-test("caps string is embedded verbatim in both wake message and objective block", () => {
+test("caps string is embedded verbatim in the wake message", () => {
   const g = goalWith({});
   const caps = "10 turns / 100k tokens";
   expect(buildWakeMessage(g, caps)).toContain(caps);
-  expect(objectiveBlock(g, caps)).toContain(caps);
 });
 
 test("undefined cap.turns renders the usage as (unbounded)", () => {
@@ -82,43 +81,58 @@ test("wake message steers to goal_complete and goal_block", () => {
   expect(msg).toContain("goal_block");
 });
 
+// --- i18n ruling (2026-10-17): all plugin-generated text is English ---
+// (user-provided content — objective/task titles/wakeText — may be any language;
+// the plugin's OWN template wording must be CJK-free)
+
+test("wake template wording is CJK-free (i18n ruling), both details", () => {
+  const g = goalWith({
+    objective: "an english objective",
+    tasks: [makeTask("an english task", "doing", 1)],
+  });
+  const full = buildWakeMessage(g, "10 turns", "judge wording", "extra wording", "full");
+  const slim = buildWakeMessage(g, "10 turns", "judge wording", "extra wording", "slim");
+  expect(/[一-鿿]/.test(full)).toBe(false);
+  expect(/[一-鿿]/.test(slim)).toBe(false);
+});
+
 // --- judge instruction: both directions ---
 
 test("judge instruction appears as its own section when provided", () => {
-  const instruction = "证据必须是可复跑的命令输出";
+  const instruction = "evidence must be a re-runnable command output";
   const msg = buildWakeMessage(goalWith({}), "10 turns", instruction);
-  expect(msg).toContain(`裁判提示: ${instruction}`);
+  expect(msg).toContain(`Judge note: ${instruction}`);
 });
 
-// --- wakeText (Task 14 Fix 3a): appended as the final 补充指示 line ---
+// --- wakeText (Task 14 Fix 3a): appended as the final Extra instruction line ---
 
-test("wakeText appends a 补充指示 line at the end (after the judge section)", () => {
-  const instruction = "证据必须是可复跑的命令输出";
-  const msg = buildWakeMessage(goalWith({}), "10 turns", instruction, "务必先看 CI 日志");
-  expect(msg).toContain("裁判提示: 证据必须是可复跑的命令输出");
-  expect(msg.endsWith("补充指示: 务必先看 CI 日志")).toBe(true);
-  expect(msg.indexOf("裁判提示")).toBeLessThan(msg.indexOf("补充指示"));
+test("wakeText appends an Extra instruction line at the end (after the judge section)", () => {
+  const instruction = "evidence must be a re-runnable command output";
+  const msg = buildWakeMessage(goalWith({}), "10 turns", instruction, "check the CI logs first");
+  expect(msg).toContain(`Judge note: ${instruction}`);
+  expect(msg.endsWith("Extra instruction: check the CI logs first")).toBe(true);
+  expect(msg.indexOf("Judge note")).toBeLessThan(msg.indexOf("Extra instruction"));
 });
 
 test("wakeText without a judge section lands directly after the main body", () => {
-  const msg = buildWakeMessage(goalWith({}), "10 turns", undefined, "务必先看 CI 日志");
-  expect(msg.endsWith("补充指示: 务必先看 CI 日志")).toBe(true);
-  expect(msg).not.toContain("裁判提示");
+  const msg = buildWakeMessage(goalWith({}), "10 turns", undefined, "check the CI logs first");
+  expect(msg.endsWith("Extra instruction: check the CI logs first")).toBe(true);
+  expect(msg).not.toContain("Judge note");
 });
 
-test("default (no wakeText) message is byte-identical to the pre-Fix-3a template", () => {
+test("default (no wakeText) message is byte-identical to the pinned template", () => {
   // Pinned byte-for-byte: the 4th parameter must be a pure no-op when unset.
   const g = goalWith({});
   const expected = [
-    "[GOAL g_abc | 第 3/10 轮]",
-    "预算: 10 turns",
-    "目标: ship the wake builders",
-    "进度:",
-    "  （无待办）",
-    "请核对以上进度，然后必须用工具调用结束本轮：",
-    "- 完成条件已满足 → goal_complete(evidence)（evidence 须是具体可核对的锚点：文件/测试/输出，≥24 字符）；",
-    "- 确实无法推进 → goal_block(reason)，给出具体原因；",
-    "- 否则 → 用下一个具体工具推进：无待办先 goal_add_task(title) 规划，推进中用 goal_update_task(ref, status) 同步更新。",
+    "[GOAL g_abc | turn 3/10]",
+    "Budget: 10 turns",
+    "Objective: ship the wake builders",
+    "Progress:",
+    "  (no tasks)",
+    "Review the progress above, then end this turn with a tool call:",
+    "- completion criteria met → goal_complete(evidence) (evidence must be a concrete verifiable anchor: file/test/output, ≥24 chars);",
+    "- genuinely cannot advance → goal_block(reason), with a concrete reason;",
+    "- otherwise → advance with the next concrete tool: if there are no tasks yet, plan first with goal_add_task(title); sync with goal_update_task(ref, status) as you go.",
   ].join("\n");
   expect(buildWakeMessage(g, "10 turns")).toBe(expected);
   expect(buildWakeMessage(g, "10 turns", undefined, undefined)).toBe(expected);
@@ -126,16 +140,16 @@ test("default (no wakeText) message is byte-identical to the pre-Fix-3a template
 
 test("judge section is absent when no instruction is provided", () => {
   const msg = buildWakeMessage(goalWith({}), "10 turns");
-  expect(msg).not.toContain("裁判提示");
+  expect(msg).not.toContain("Judge note");
 });
 
-// --- wakeDetail "slim" (2026-10-17 transcript-noise ruling) ---
-// The context-hook system part (objectiveBlock) already carries
-// objective/budget before EVERY model call, so the slim wake drops the
-// budget/objective/progress re-grounding and keeps header + one-line
-// forced-tool-call instruction (+ judge / wakeText channels unchanged).
+// --- wakeDetail "slim" (2026-10-17, amended same day) ---
+// The context-hook system part was REMOVED (ruling: zero system-part writes —
+// prefix cache), so the slim wake IS the per-turn grounding: header + budget
+// + objective + discipline + one-line forced-tool-call trigger (no task list;
+// judge / wakeText channels unchanged).
 
-test("slim detail: header + one-line trigger only — no budget/objective/progress re-grounding", () => {
+test("slim detail: header + budget + objective + discipline + trigger — no task list", () => {
   const g = goalWith({
     tasks: [
       makeTask("first task", "done", 1),
@@ -145,41 +159,41 @@ test("slim detail: header + one-line trigger only — no budget/objective/progre
   const msg = buildWakeMessage(g, "10 turns", undefined, undefined, "slim");
   expect(msg).toBe(
     [
-      "[GOAL g_abc | 第 3/10 轮]",
-      "核对进度（目标与预算见 [GOAL] 系统上下文），必须用工具调用结束本轮：完成 → goal_complete(evidence，具体可核对锚点 ≥24 字符)；受阻 → goal_block(具体原因)；否则 → 推进（先 goal_add_task 规划 / goal_update_task 同步）。",
+      "[GOAL g_abc | turn 3/10]",
+      "Budget: 10 turns",
+      "Objective: ship the wake builders",
+      "Discipline: advance the goal autonomously; prefer concrete actions over narration.",
+      "Keep tasks current: plan first with goal_add_task(title); sync with goal_update_task(ref, status) (todo/doing/done) as you go.",
+      "Verify progress and end this turn with a tool call: done → goal_complete(evidence, a concrete verifiable anchor ≥24 chars); blocked → goal_block(concrete reason); otherwise → advance.",
     ].join("\n"),
   );
-  // the dropped re-grounding blocks
-  expect(msg).not.toContain("预算:");
-  expect(msg).not.toContain("目标:");
-  expect(msg).not.toContain("进度:");
+  // no task detail in slim
+  expect(msg).not.toContain("Progress:");
   expect(msg).not.toContain("first task");
   // the forced-tool-call contract survives
   expect(msg).toContain("goal_complete");
   expect(msg).toContain("goal_block");
-  expect(msg).toContain("goal_add_task");
-  expect(msg).toContain("goal_update_task");
 });
 
 test("slim detail: judge + wakeText channels still append in the same order", () => {
-  const msg = buildWakeMessage(goalWith({}), "10 turns", "看 CI 日志", "先跑测试", "slim");
-  expect(msg).toContain("裁判提示: 看 CI 日志");
-  expect(msg.endsWith("补充指示: 先跑测试")).toBe(true);
-  expect(msg.indexOf("裁判提示")).toBeLessThan(msg.indexOf("补充指示"));
+  const msg = buildWakeMessage(goalWith({}), "10 turns", "check CI", "run tests first", "slim");
+  expect(msg).toContain("Judge note: check CI");
+  expect(msg.endsWith("Extra instruction: run tests first")).toBe(true);
+  expect(msg.indexOf("Judge note")).toBeLessThan(msg.indexOf("Extra instruction"));
 });
 
 test("slim detail: no judge section means the trigger line is the last body line", () => {
   const msg = buildWakeMessage(goalWith({}), "10 turns", undefined, undefined, "slim");
-  expect(msg).not.toContain("裁判提示");
-  expect(msg).not.toContain("补充指示");
-  expect(msg.split("\n").length).toBe(2);
+  expect(msg).not.toContain("Judge note");
+  expect(msg).not.toContain("Extra instruction");
+  expect(msg.split("\n").length).toBe(6);
 });
 
 test("full detail is the explicit opt-out (5th arg, same as the default)", () => {
   const g = goalWith({});
   const full = buildWakeMessage(g, "10 turns", undefined, undefined, "full");
   expect(full).toBe(buildWakeMessage(g, "10 turns"));
-  expect(full).toContain("目标:");
+  expect(full).toContain("Objective:");
 });
 
 // --- empty tasks ---
@@ -187,7 +201,7 @@ test("full detail is the explicit opt-out (5th arg, same as the default)", () =>
 test("goal with no tasks: no-todo marker, no task lines, rest of contract holds", () => {
   const g = goalWith({ objective: "no tasks goal" });
   const msg = buildWakeMessage(g, "unbounded");
-  expect(msg).toContain("（无待办）");
+  expect(msg).toContain("(no tasks)");
   expect(msg).not.toContain("1. [");
   expect(msg).toContain("[GOAL g_abc");
   expect(msg).toContain("no tasks goal");
@@ -198,13 +212,14 @@ test("goal with no tasks: no-todo marker, no task lines, rest of contract holds"
 // --- P0-2 (2026-10-16 A/B): imperative task-maintenance instruction ---
 // Evidence: live A/B — the reference plugin's model actively used
 // goal_add_task/goal_update_task across every scenario; ours never did
-// (tasks[] empty in all four runs). Its objective block carries an explicit
-// imperative instruction; ours only had a passive "同步更新待办状态" aside.
+// (tasks[] empty in all four runs). The objective grounding carries an
+// explicit imperative instruction; since the system-part removal (2026-10-17)
+// it lives in the wake message (the per-turn tail channel).
 
-test("objectiveBlock carries the imperative task-maintenance instruction (goal_add_task + goal_update_task)", () => {
-  const block = objectiveBlock(goalWith({}), "10 turns");
-  expect(block).toContain("goal_add_task");
-  expect(block).toContain("goal_update_task");
+test("slim wake carries the imperative task-maintenance instruction (goal_add_task + goal_update_task)", () => {
+  const msg = buildWakeMessage(goalWith({}), "10 turns", undefined, undefined, "slim");
+  expect(msg).toContain("goal_add_task");
+  expect(msg).toContain("goal_update_task");
 });
 
 test("wake message carries the imperative task-maintenance instruction (goal_add_task + goal_update_task)", () => {
@@ -213,20 +228,20 @@ test("wake message carries the imperative task-maintenance instruction (goal_add
   expect(msg).toContain("goal_update_task");
 });
 
-// --- objectiveBlock: isomorphic but no task detail ---
+// --- slim wake: grounding lives here (the system part is gone) ---
 
-test("objective block has header, objective, turns usage — and no task detail", () => {
+test("slim wake carries budget + objective verbatim (the per-turn grounding) — and no task detail", () => {
   const g = goalWith({
-    objective: "block objective",
+    objective: "slim objective",
     tasks: [
       makeTask("搭骨架", "done", 1),
       makeTask("写测试", "doing", 2),
     ],
   });
-  const block = objectiveBlock(g, "10 turns");
-  expect(block).toContain("[GOAL g_abc");
-  expect(block).toContain("block objective");
-  expect(block).toContain("3/10");
-  expect(block).not.toContain("1. [");
-  expect(block).not.toContain("2. [doing] 写测试");
+  const msg = buildWakeMessage(g, "10 turns", undefined, undefined, "slim");
+  expect(msg).toContain("[GOAL g_abc");
+  expect(msg).toContain("Objective: slim objective");
+  expect(msg).toContain("Budget: 10 turns");
+  expect(msg).not.toContain("1. [");
+  expect(msg).not.toContain("2. [doing] 写测试");
 });

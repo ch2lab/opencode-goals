@@ -223,9 +223,9 @@ test("2: fast path — boundary with waitingShells does not wake; shell.exited w
   await h.emit(shellEnded("x1", "sh1", "timeout"));
   expect(h.prompts.length).toBe(1);
   const t = h.prompts[0].input.text;
-  expect(t).toContain("超时");
+  expect(t).toContain("timed out");
   expect(t).toContain("timeout");
-  expect(t).not.toContain("被杀");
+  expect(t).not.toContain("killed");
   expect(t).toContain("last output line"); // output tail carried
   expect(h.prompts[0].input.metadata?.goalControl).toBe(true);
   expect(h.prompts[0].input.delivery).toBe("queue");
@@ -239,9 +239,9 @@ test("2: fast path — boundary with waitingShells does not wake; shell.exited w
   await h.emit(shellEnded("x2", "sh2", "killed"));
   expect(h.prompts.length).toBe(2);
   const k = h.prompts[1].input.text;
-  expect(k).toContain("被杀");
   expect(k).toContain("killed");
-  expect(k).not.toContain("超时");
+  expect(k).toContain("killed");
+  expect(k).not.toContain("timeout");
   expect(k).not.toContain("timeout");
   await stop();
 });
@@ -276,7 +276,7 @@ test("3: event-lost self-heal — probe shows exited without an exited event →
 // 4. check-in dual signal (stall / long-wait / within-window / active / once per segment)
 // ---------------------------------------------------------------------------
 
-test("4a: check-in dual signal — zero growth → 疑似卡死; at most once per segment; tool action restarts the countdown", async () => {
+test("4a: check-in dual signal — zero growth → likely stalled; at most once per segment; tool action restarts the countdown", async () => {
   const { h, fake, stop } = await boot();
   await h.commandExecutor(S, "/goal set Stall4");
   fake.set([{ id: "sh1", state: "running", outputTail: "fixed" }]); // zero growth
@@ -285,7 +285,7 @@ test("4a: check-in dual signal — zero growth → 疑似卡死; at most once pe
   await sleep(30); // < 50ms zero-growth threshold
   expect(h.prompts.length).toBe(0);
   await waitFor(() => h.prompts.length === 1, 2000, "zero-growth check-in");
-  expect(checkIns(h)[0]).toContain("疑似卡死");
+  expect(checkIns(h)[0]).toContain("likely stalled");
   expect(checkIns(h)[0]).toContain("fixed"); // output tail carried
   expect(h.prompts[0].input.metadata?.goalControl).toBe(true);
   // at most ONE check-in per stall segment: wait far past the threshold, no second
@@ -298,11 +298,11 @@ test("4a: check-in dual signal — zero growth → 疑似卡死; at most once pe
   await waitFor(() => h.prompts.length === 2, 2000, "boundary wake after tool action");
   await waitFor(() => h.prompts.length === 3, 3000, "fresh-segment check-in");
   expect(checkIns(h).length).toBe(2);
-  expect(checkIns(h)[1]).toContain("疑似卡死");
+  expect(checkIns(h)[1]).toContain("likely stalled");
   await stop();
 });
 
-test("4b: check-in dual signal — growth but long wait → 等待已久需确认推进; growth within waitCheckInMs → no inject", async () => {
+test("4b: check-in dual signal — growth but long wait → a long wait needs progress confirmation; growth within waitCheckInMs → no inject", async () => {
   const { h, fake, stop } = await boot();
   await h.commandExecutor(S, "/goal set Grow4");
   let n = 0;
@@ -320,8 +320,8 @@ test("4b: check-in dual signal — growth but long wait → 等待已久需确�
     await sleep(60); // has growth but < waitCheckInMs → still no inject
     expect(h.prompts.length).toBe(0);
     await waitFor(() => h.prompts.length === 1, 3000, "long-wait check-in");
-    expect(checkIns(h)[0]).toContain("等待已久需确认推进");
-    expect(checkIns(h)[0]).not.toContain("疑似卡死");
+    expect(checkIns(h)[0]).toContain("a long wait needs progress confirmation");
+    expect(checkIns(h)[0]).not.toContain("likely stalled");
     expect(checkIns(h)[0]).toMatch(/line \d+/); // output tail carried (snapshot at inject)
   } finally {
     clearInterval(mutator); // never leak the interval on a failing run
@@ -339,7 +339,7 @@ test("4c: check-in — active session: conditions met but no inject; back to idl
   expect(h.prompts.length).toBe(0);
   await h.emit(succeeded("b1")); // back to idle → re-arm → overdue → inject
   await waitFor(() => h.prompts.length === 1, 2000, "post-idle check-in");
-  expect(checkIns(h)[0]).toContain("疑似卡死");
+  expect(checkIns(h)[0]).toContain("likely stalled");
   await stop();
 });
 
@@ -629,7 +629,7 @@ test("12: tick — probe failure window then recovery: timer survives, no state 
   expect((goalOf(h)!.waitingShells ?? []).length).toBe(1); // no state change
   gate.open = true; // recovery
   await waitFor(() => h.prompts.length === 1, 3000, "check-in after probe recovery");
-  expect(h.prompts[0].input.text).toContain("疑似卡死"); // constant tail → zero-growth after baseline
+  expect(h.prompts[0].input.text).toContain("likely stalled"); // constant tail → zero-growth after baseline
   expect(h.prompts[0].input.text).toContain("fixed"); // tail carried once facts returned
   await h.emit(succeeded("b2")); // the event loop still consumes after the failure window
   expect(goalOf(h)!.lastHandledEventID).toBe("b2");

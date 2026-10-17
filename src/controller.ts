@@ -42,7 +42,7 @@ import {
 } from "./evidence";
 import type { Judge, JudgeVerdict } from "./judge";
 import { buildWakeMessage } from "./wake";
-import { buildCompactionPrompt, composeCompactionSummary, goalSystemPart } from "./compact";
+import { buildCompactionPrompt, composeCompactionSummary } from "./compact";
 import { decidePermission, GOAL_CONTROL_ACTION } from "./permission";
 import type { HostEvent, PermissionDecision, PermissionHookInput, SessionMessage, WakeProbe } from "./types";
 
@@ -208,18 +208,62 @@ function parseShellFacts(raw: unknown): ShellFact[] {
 
 const TASK_STATUSES: readonly GoalTaskStatus[] = ["todo", "doing", "done"];
 
-const USAGE =
-  "usage: /goal set <objective> [--turns N] [--tokens N] [--unbounded] | /goal view | /goal pause | " +
-  "/goal resume | /goal complete <evidence> | /goal block <reason> | /goal clear | " +
-  "/goal task add <title> | /goal task <n> <todo|doing|done> | /goal history";
+/**
+ * Multi-line usage block — returned by a BARE `/goal` (or an unknown
+ * subcommand) as a session message (goalControl synthetic), so it renders as
+ * a proper multi-line help listing. The /-menu hint (below) is a separate
+ * SHORT one-liner — the host TUI renders the command list one row per
+ * command, so newlines there do not display; the full usage lives HERE.
+ */
+const USAGE = [
+  "Goal loop: the model advances the goal autonomously; completion is evidence-gated, budget exhaustion ends the run.",
+  "",
+  "Usage:",
+  "  /goal set <objective> [--turns N] [--tokens N] [--unbounded]   start a goal",
+  "  /goal view                                                     show the current goal",
+  "  /goal pause | /goal resume                                     pause / resume",
+  "  /goal complete <evidence>                                     complete with verifiable evidence",
+  "  /goal block <reason>                                          block with a concrete reason",
+  "  /goal clear                                                   discard the goal",
+  "  /goal task add <title>                                        add a task",
+  "  /goal task <n> <todo|doing|done>                              update a task",
+  "  /goal history                                                 list past goals",
+].join("\n");
 
 /**
- * Command-menu description (host CommandDefinition.description — the friendly
- * hint other plugins show in the / command list; 2026-10-17 user request).
- * One line: what it is + all subcommands at a glance.
+ * Command-menu description (host CommandDefinition.description — the hint
+ * shown next to /goal in the / command list). The host clamps each menu
+ * description to a single row (web UI ellipsis — verified live on 2.0.32
+ * desktop, 2026-10-17), so per-subcommand argument help lives on the
+ * fine-grained commands below (one row each); the /goal row just points at
+ * the bare-`/goal` usage table (USAGE).
  */
-const GOAL_COMMAND_DESCRIPTION =
-  "Goal loop: 设定目标后模型自主推进，证据门控完成或预算用尽收口。Usage: /goal set|view|pause|resume|complete|block|clear|task|history";
+const GOAL_COMMAND_DESCRIPTION = "goal loop — full usage: run bare /goal";
+
+/**
+ * Fine-grained command registrations (2026-10-17 user ruling): instead of one
+ * `/goal` row with prose, each subcommand gets its OWN command (goal-set,
+ * goal-view, ...) so the / menu shows one line per subcommand carrying its
+ * argument syntax. Each routes into the same handleCommand as /goal (text
+ * prefixed "goal <sub>" — dispatchCommand strips the leading "goal").
+ *
+ * Surface principle — a menu row is earned by "a human actually types this":
+ * set/view/pause/resume/complete/block/clear are human control operations
+ * (view/pause/resume are HUMAN-ONLY — no LLM tools exist for them, because
+ * pause is a human decision and state arrives via wakes). task/history are
+ * MODEL-centric (goal_add_task/goal_update_task/goal_history tools exist) —
+ * they stay available as /goal subcommands but earn no menu row. wait is
+ * model-only (goal_wait tool, no command — an execution mechanism).
+ */
+const GOAL_SUBCOMMANDS: Array<{ name: string; sub: string; description: string }> = [
+  { name: "goal-set", sub: "set", description: "<objective> [--turns|--tokens N] [--unbounded] — start a goal" },
+  { name: "goal-view", sub: "view", description: "show the current goal" },
+  { name: "goal-pause", sub: "pause", description: "pause the active goal" },
+  { name: "goal-resume", sub: "resume", description: "resume the paused goal" },
+  { name: "goal-complete", sub: "complete", description: "<evidence> — finish with verifiable evidence" },
+  { name: "goal-block", sub: "block", description: "<reason> — stop with a concrete reason" },
+  { name: "goal-clear", sub: "clear", description: "discard the goal" },
+];
 
 /** All 8 goal_* tools are gated by the goal.control permission (Task 3). */
 const GOAL_PERMISSION = GOAL_CONTROL_ACTION;
@@ -262,20 +306,20 @@ function isPlainObject(input: unknown): input is Record<string, unknown> {
 function buildStallReport(goal: GoalRecord, noActionTexts: string[], judgeReason: string): string {
   const tasks =
     goal.tasks.length === 0
-      ? "  （无待办）"
+      ? "  (no tasks)"
       : goal.tasks.map((t, i) => `  ${i + 1}. [${t.status}] ${t.title}`).join("\n");
   const tails =
     noActionTexts.length === 0
-      ? "  （无）"
+      ? "  (none)"
       : noActionTexts.map((t) => `  - ${t}`).join("\n");
   return [
     `[STALL REPORT goal ${goal.id}]`,
-    `目标: ${goal.objective}`,
-    "待办快照:",
+    `Objective: ${goal.objective}`,
+    "Task snapshot:",
     tasks,
-    "最后无动作文本:",
+    "Last no-action texts:",
     tails,
-    `裁判: ${judgeReason}`,
+    `Judge: ${judgeReason}`,
   ].join("\n");
 }
 
@@ -331,14 +375,14 @@ function shellInfoFrom(props: Record<string, unknown>): {
 function shellExitText(shellID: string, status: "exited" | "timeout" | "killed", exitCode?: number, tail?: string): string {
   const head =
     status === "timeout"
-      ? `你等待的脚本 ${shellID} 已超时 (timeout, 被宿主超时终止)`
+      ? `The shell you were waiting for, ${shellID}, timed out (timeout, terminated by the host)`
       : status === "killed"
-        ? `你等待的脚本 ${shellID} 已被杀 (killed, 被外部终止)`
-        : `你等待的脚本 ${shellID} 已退出 (exit${exitCode !== undefined ? `, 退出码 ${exitCode}` : ""})`;
-  return `${head}——最新输出尾部:\n${tail ?? "(无)"}\n决定下一步,用工具调用结束本轮。`;
+        ? `The shell you were waiting for, ${shellID}, was killed (killed, terminated externally)`
+        : `The shell you were waiting for, ${shellID}, exited (exit${exitCode !== undefined ? `, code ${exitCode}` : ""})`;
+  return `${head} — latest output tail:\n${tail ?? "(none)"}\nDecide the next step; end this turn with a tool call.`;
 }
 
-/** Check-in ("状态核查") wake: reason wording 疑似卡死 / 等待已久需确认推进 + tail. */
+/** Check-in ("status review") wake: reason wording (likely stalled / long wait needs progress confirmation) + tail. */
 function shellCheckInText(
   goal: GoalRecord,
   shellID: string,
@@ -348,19 +392,19 @@ function shellCheckInText(
 ): string {
   const why =
     reason === "stall"
-      ? `你等待的脚本 ${shellID} 已 ${ms}ms 零增长,疑似卡死`
-      : `你等待的脚本 ${shellID} 有增长但已等待 ${ms}ms,等待已久需确认推进`;
+      ? `The shell you were waiting for, ${shellID}, shows zero output growth for ${ms}ms — likely stalled`
+      : `The shell you were waiting for, ${shellID}, has output but has been waiting ${ms}ms — a long wait needs progress confirmation`;
   return (
-    `[SHELL CHECK-IN goal ${goal.id}] ${why}——最新输出尾部:\n${tail ?? "(无)"}\n` +
-    "判断它是否在实质推进:是 → goal_wait(N) 显式声明继续等 / 用工具核对并给出依据;否 → 杀掉换路或 goal_block。"
+    `[SHELL CHECK-IN goal ${goal.id}] ${why} — latest output tail:\n${tail ?? "(none)"}\n` +
+    "Judge whether it is making substantive progress: yes → goal_wait(N) to declare the wait explicitly / verify with tools and cite evidence; no → kill it, switch route, or goal_block."
   );
 }
 
 /** Restart-reconcile lost-script wake (spec §7.1 step 3). */
 function shellLostText(ids: string[]): string {
   return (
-    `宿主已重启,你等待的脚本 ${ids.join(", ")} 已随重启丢失/取消 (lost/cancelled, 见会话中的取消通知)——` +
-    "决定下一步(重跑/改路/放弃),用工具调用结束本轮。"
+    `The host restarted; the shells you were waiting for, ${ids.join(", ")}, were lost/cancelled with the restart (lost/cancelled — see the cancellation notices in the session) — ` +
+    "decide the next step (rerun / switch route / give up); end this turn with a tool call."
   );
 }
 
@@ -481,6 +525,20 @@ export class GoalController {
     this.probe.registerCommand("goal", GOAL_COMMAND_DESCRIPTION, (text, sessionID) =>
       this.handleCommand(sessionID, text),
     );
+
+    // Fine-grained commands: one per subcommand so the host's / menu shows a
+    // dedicated one-line argument-help row for each (2026-10-17 user ruling —
+    // the menu clamps every description to a single row). Each routes into
+    // the same handleCommand as /goal; dispatchCommand strips the leading
+    // "goal", so "goal set <objective>" reaches the identical set path.
+    for (const s of GOAL_SUBCOMMANDS) {
+      this.probe.registerCommand(s.name, s.description, (text, sessionID) =>
+        this.handleCommand(
+          sessionID,
+          `goal ${s.sub}${text.trim() ? " " + text.trim() : ""}`,
+        ),
+      );
+    }
 
     this.probe.registerTool(
       "goal_set",
@@ -628,16 +686,21 @@ export class GoalController {
       this.rememberShellTimeout(input.command, input.cwd, input.timeout);
     });
 
-    // Task 11: compaction-proof goal state (spec §10 defense lines 2 + 3).
-    // context hook — before EVERY model call, re-ground the active goal as a
-    // system part (objectiveBlock contract). compaction hook — take over the
-    // compaction summary: SessionCompaction.result is a WHOLE REPLACEMENT that
-    // skips the host model request (session.d.ts), so the summary carries the
-    // conversation history (probe.generate) + a mandatory trailing
-    // [GOAL STATE] block. Both callbacks return their async work (narrow
-    // `=> void` registration signature is assignable; tests await it) and
-    // neither ever throws (fault-tolerance discipline).
-    this.probe.onSessionHook("context", (sessionID, payload) => this.contextHook(sessionID, payload));
+    // Task 11: compaction-proof goal state (spec §10).
+    // 2026-10-17 ruling: the plugin writes NO system part at all — the
+    // "context" session hook (per-turn [GOAL] objective block) was REMOVED:
+    // any write to the system part, even a byte-stable one, shifts the
+    // request prefix at appearance/disappearance and breaks the LLM prefix
+    // cache. Goal grounding rides the tail channels only (wake message +
+    // goal-creation message + the compaction block below).
+    //
+    // compaction hook — take over the compaction summary:
+    // SessionCompaction.result is a WHOLE REPLACEMENT that skips the host
+    // model request (session.d.ts), so the summary carries the conversation
+    // history (probe.generate) + a mandatory trailing [GOAL STATE] block.
+    // The callback returns its async work (narrow `=> void` registration
+    // signature is assignable; tests await it) and never throws
+    // (fault-tolerance discipline).
     this.probe.onSessionHook("compaction", (sessionID, payload) => this.compactionHook(sessionID, payload));
 
     // Task 12: permission sandbox — the goal.control self-grant + path
@@ -1087,7 +1150,7 @@ export class GoalController {
           // Controller ruling: a REJECTING judge = give_up semantics
           // (stalled), fail-closed; the loop must never break.
           console.warn(`opencode-goal: judge failed for goal ${goal.id}:`, err);
-          await this.stallGoal(sessionID, goal, texts, "裁判调用失败（fail-closed 按 give_up 处置）");
+          await this.stallGoal(sessionID, goal, texts, "Judge call failed (fail-closed: treated as give_up)");
           return;
         }
         await this.disposeVerdict(sessionID, goal, texts, verdict);
@@ -1100,10 +1163,10 @@ export class GoalController {
         goal,
         texts,
         !this.options.judgeEnabled
-          ? "裁判未启用（judgeEnabled=false）"
+          ? "Judge not enabled (judgeEnabled=false)"
           : goal.judgeUsed === true
-            ? "裁判已用过（每目标至多一次，不再复核）"
-            : "裁判未接入",
+            ? "Judge already used (at most once per goal, no re-review)"
+            : "Judge not wired",
       );
       return;
     }
@@ -1208,35 +1271,10 @@ export class GoalController {
   }
 
   // ------------------------------------------------------------------
-  // Task 11: compaction-proof goal state — session hooks (context + compaction)
+  // Task 11: compaction-proof goal state — compaction session hook ONLY
+  // (the "context" hook was removed 2026-10-17: zero system-part writes —
+  // see the registration comment in start())
   // ------------------------------------------------------------------
-
-  /**
-   * Context hook (before every model call, spec §10 defense line 2): an
-   * ACTIVE goal appends its objective block as ONE system part; no goal or a
-   * non-active goal (incl. paused) → no-op. The part shape follows
-   * @opencode/ai SystemPart (schema/messages.d.ts: `{ type: "text", text:
-   * string, cache?, metadata? }` — the host type is unambiguous in 2.0.29,
-   * no TODO(task13) needed). Never throws (fault-tolerance discipline).
-   */
-  private async contextHook(sessionID: string, payload: Record<string, unknown>): Promise<void> {
-    try {
-      const goal = await this.loadGoal(sessionID);
-      if (goal === undefined || goal.status !== "active") return;
-      const system = payload.system;
-      if (!Array.isArray(system)) return; // host payload is malformed — leave it untouched
-      // Dedup guard: a host retry re-firing the hook on the SAME payload
-      // object would otherwise double-append. A system part whose text
-      // already grounds this goal means the block is in.
-      const alreadyGrounded = system.some(
-        (p) => typeof (p as { text?: unknown })?.text === "string" && (p as { text: string }).text.includes(`[GOAL ${goal.id}`),
-      );
-      if (alreadyGrounded) return;
-      system.push({ type: "text", text: goalSystemPart(goal, this.capText(goal)) });
-    } catch (err) {
-      console.warn(`opencode-goal: context hook failed for ${sessionID} (goal block not appended):`, err);
-    }
-  }
 
   /**
    * Compaction hook (spec §10 defense line 3): SessionCompaction.result is a

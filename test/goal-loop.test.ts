@@ -97,7 +97,7 @@ test("1c: unknown subcommand and bare /goal produce usage text, never a throw", 
   await h.commandExecutor(S, "/goal frobnicate");
   expect(lastSynthetic(h).text).toContain("unknown goal subcommand");
   await h.commandExecutor(S, "/goal");
-  expect(lastSynthetic(h).text).toContain("usage");
+  expect(lastSynthetic(h).text).toContain("Usage:");
   await stop();
 });
 
@@ -448,15 +448,49 @@ test("13: goal_set description constrains spontaneous use (explicit-ask gate)", 
   await stop();
 });
 
-test("15: the /goal command carries a friendly command-menu description (host CommandDefinition.description)", async () => {
-  // 2026-10-17 user request: other plugins show a one-line hint in the host's
-  // / command list — /goal must too (name + purpose + subcommands at a glance).
+test("15: command-menu descriptions — /goal points to the usage table; every subcommand has its own one-line argument-help command", async () => {
+  // 2026-10-17 user ruling: the host clamps every /-menu description to a
+  // single row (2.0.32 web UI ellipsis, verified live), so per-subcommand
+  // argument help lives on fine-grained commands (goal-set, goal-view, ...) —
+  // one menu row each; /goal points at the bare-`/goal` usage table.
   const { h, stop } = await boot();
   const desc = h.commandDescriptions.get("goal");
   expect(desc).toBeDefined();
-  expect(desc!.length).toBeGreaterThan(20);
-  for (const sub of ["set", "view", "pause", "resume", "complete", "block", "clear", "task", "history"]) {
-    expect(desc).toContain(sub);
+  expect(desc).not.toContain("\n");
+  expect(desc).toContain("bare /goal");
+  for (const [name, token] of [
+    ["goal-set", "<objective>"],
+    ["goal-set", "[--turns|--tokens N]"],
+    ["goal-set", "[--unbounded]"],
+    ["goal-view", "show the current goal"],
+    ["goal-pause", "pause the active goal"],
+    ["goal-resume", "resume the paused goal"],
+    ["goal-complete", "<evidence>"],
+    ["goal-block", "<reason>"],
+    ["goal-clear", "discard the goal"],
+  ] as const) {
+    const d = h.commandDescriptions.get(name);
+    expect(d, `${name} description`).toBeDefined();
+    expect(d!).not.toContain("\n");
+    expect(d!).toContain(token);
   }
+
+  // routing: /goal-set reaches the same set path as /goal set (host strips
+  // the command name and passes the remainder)
+  await h.commandExecutor(S, "/goal-set Fine grained --turns 2");
+  const g = goalOf(h);
+  expect(g!.objective).toBe("Fine grained");
+  expect(g!.cap).toEqual({ turns: 2 });
+  await h.commandExecutor(S, "/goal view");
+  expect(lastSynthetic(h).text).toContain("Fine grained");
+
+  // the full usage (all subcommands) is still served by the bare /goal help
+  // output, delivered as a goalControl synthetic (multi-line session message)
+  await h.commandExecutor(S, "/goal");
+  const helpText = lastSynthetic(h).text;
+  for (const sub of ["set", "view", "pause", "resume", "complete", "block", "clear", "task", "history"]) {
+    expect(helpText).toContain(sub);
+  }
+  expect(helpText).toContain("\n"); // multi-line help block
   await stop();
 });

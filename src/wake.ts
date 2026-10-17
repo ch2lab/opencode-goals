@@ -1,5 +1,10 @@
-// Wake message / objective block builders (spec §7). Pure string builders,
-// zero runtime imports — consumes GoalRecord type only.
+// Wake message builder (spec §7). Pure string builders, zero runtime imports
+// — consumes the GoalRecord type only.
+//
+// I18N ruling (2026-10-17): every string the plugin generates (prompts, tool
+// descriptions, injected messages) is English. User-provided content
+// (objective, task titles, wakeText, quoted transcript text) stays verbatim
+// in whatever language the user wrote it.
 import type { GoalRecord } from "./state";
 
 /** Turns usage text: `used/cap`, or `used/(unbounded)` when cap is open. */
@@ -12,7 +17,7 @@ function turnsUsage(goal: GoalRecord): string {
 
 /** One indented line per task: `N. [status] title`; marker when no tasks. */
 function taskLines(goal: GoalRecord): string {
-  if (goal.tasks.length === 0) return "  （无待办）";
+  if (goal.tasks.length === 0) return "  (no tasks)";
   return goal.tasks
     .map((t, i) => `  ${i + 1}. [${t.status}] ${t.title}`)
     .join("\n");
@@ -22,18 +27,19 @@ function taskLines(goal: GoalRecord): string {
  * Builds the stall-wake message: re-grounds the goal and forces a terminal
  * tool call (goal_complete / goal_block / advance). `caps` is the
  * caller-provided budget description (e.g. "10 turns / 100k tokens",
- * "unbounded"), embedded verbatim in the "full" detail. `wakeText` (Task 14
- * Fix 3a): when non-empty, appends ONE final line `补充指示: <wakeText>` —
+ * "unbounded"), embedded verbatim. `wakeText` (Task 14 Fix 3a): when
+ * non-empty, appends ONE final line `Extra instruction: <wakeText>` —
  * after the judge section when one is present, directly after the main body
- * otherwise. Absent/empty = byte-identical to the pre-Fix-3a template.
+ * otherwise. Absent/empty = byte-identical to the template without it.
  *
- * `detail` (2026-10-17 transcript-noise ruling): "full" re-grounds budget +
- * objective + per-task progress in the wake itself; "slim" keeps only the
- * header + one-line forced-tool-call instruction — the context-hook system
- * part already carries objective/budget before EVERY model call (and the
- * compaction summary carries full state), so the wake need not repeat them.
- * Default "full" (this builder's pre-existing contract; the OPTION default
- * is "slim" — see options.ts).
+ * `detail` (2026-10-17, amended same day): the context-hook system part was
+ * REMOVED (ruling: the plugin writes NO system part at all — any write, even a
+ * byte-stable one, shifts the request prefix at appearance/disappearance and
+ * breaks the LLM prefix cache), so the wake message is the per-turn grounding
+ * channel (tail-appended — appends never break the prefix). "slim" = header +
+ * budget + objective + discipline + one-line forced tool call (no task list);
+ * "full" adds the per-task progress block. Default "full" (this builder's
+ * pre-existing contract; the OPTION default is "slim" — see options.ts).
  */
 export function buildWakeMessage(
   goal: GoalRecord,
@@ -45,41 +51,29 @@ export function buildWakeMessage(
   const lines =
     detail === "slim"
       ? [
-          `[GOAL ${goal.id} | 第 ${turnsUsage(goal)} 轮]`,
-          "核对进度（目标与预算见 [GOAL] 系统上下文），必须用工具调用结束本轮：完成 → goal_complete(evidence，具体可核对锚点 ≥24 字符)；受阻 → goal_block(具体原因)；否则 → 推进（先 goal_add_task 规划 / goal_update_task 同步）。",
+          `[GOAL ${goal.id} | turn ${turnsUsage(goal)}]`,
+          `Budget: ${caps}`,
+          `Objective: ${goal.objective}`,
+          "Discipline: advance the goal autonomously; prefer concrete actions over narration.",
+          "Keep tasks current: plan first with goal_add_task(title); sync with goal_update_task(ref, status) (todo/doing/done) as you go.",
+          "Verify progress and end this turn with a tool call: done → goal_complete(evidence, a concrete verifiable anchor ≥24 chars); blocked → goal_block(concrete reason); otherwise → advance.",
         ]
       : [
-          `[GOAL ${goal.id} | 第 ${turnsUsage(goal)} 轮]`,
-          `预算: ${caps}`,
-          `目标: ${goal.objective}`,
-          "进度:",
+          `[GOAL ${goal.id} | turn ${turnsUsage(goal)}]`,
+          `Budget: ${caps}`,
+          `Objective: ${goal.objective}`,
+          "Progress:",
           taskLines(goal),
-          "请核对以上进度，然后必须用工具调用结束本轮：",
-          "- 完成条件已满足 → goal_complete(evidence)（evidence 须是具体可核对的锚点：文件/测试/输出，≥24 字符）；",
-          "- 确实无法推进 → goal_block(reason)，给出具体原因；",
-          "- 否则 → 用下一个具体工具推进：无待办先 goal_add_task(title) 规划，推进中用 goal_update_task(ref, status) 同步更新。",
+          "Review the progress above, then end this turn with a tool call:",
+          "- completion criteria met → goal_complete(evidence) (evidence must be a concrete verifiable anchor: file/test/output, ≥24 chars);",
+          "- genuinely cannot advance → goal_block(reason), with a concrete reason;",
+          "- otherwise → advance with the next concrete tool: if there are no tasks yet, plan first with goal_add_task(title); sync with goal_update_task(ref, status) as you go.",
         ];
   if (judgeInstruction !== undefined) {
-    lines.push("", `裁判提示: ${judgeInstruction}`);
+    lines.push("", `Judge note: ${judgeInstruction}`);
   }
   if (wakeText !== undefined && wakeText.length > 0) {
-    lines.push(`补充指示: ${wakeText}`);
+    lines.push(`Extra instruction: ${wakeText}`);
   }
   return lines.join("\n");
-}
-
-/**
- * Builds the compact objective block (compression guard / reminder use):
- * same header as the wake message but without task detail lines. Carries the
- * two imperative instruction lines (A/B 2026-10-16): autonomy + task
- * maintenance via goal_add_task / goal_update_task.
- */
-export function objectiveBlock(goal: GoalRecord, caps: string): string {
-  return [
-    `[GOAL ${goal.id} | 第 ${turnsUsage(goal)} 轮]`,
-    `预算: ${caps}`,
-    `目标: ${goal.objective}`,
-    "推进纪律: 自主推进目标，优先具体动作而非叙述。",
-    "保持待办最新: 开工先用 goal_add_task(title) 规划，推进中用 goal_update_task(ref, status)（todo/doing/done）同步更新。",
-  ].join("\n");
 }

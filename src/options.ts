@@ -12,10 +12,12 @@ export interface Options {
   shellStallMs: number;
   waitCheckInMs: number;
   timeoutWrap: boolean;
-  /** Wake transcript footprint: "full" (budget + objective + task progress
-   *  re-grounded in the wake message) or "slim" (one-line trigger only —
-   *  the context-hook system part already carries objective/budget before
-   *  every model call). Default "slim" (2026-10-17 transcript-noise ruling). */
+  /** Wake transcript footprint: "full" (budget + objective + per-task
+   *  progress re-grounded in the wake message) or "slim" (budget + objective
+   *  + discipline lines + one-line trigger, no task list). 2026-10-17: the
+   *  context-hook system part was REMOVED (ruling: the plugin writes NO
+   *  system part — prefix cache), so the wake is the per-turn grounding
+   *  channel. Default "slim" (2026-10-17 transcript-noise ruling). */
   wakeDetail: "full" | "slim";
   wakeText?: string;
   model?: ModelRef;
@@ -24,7 +26,13 @@ export interface Options {
 const DEFAULT_OPTIONS: Options = {
   stallLimit: 3,
   defaultCapTurns: 10,
-  judgeEnabled: true,
+  // 2026-10-17 ruling: default OFF. The side-channel judge's only exclusive
+  // value is rescuing a stalled goal (continue + instruction); its failure
+  // mode degrades to exactly the no-judge behavior (fail-closed → stalled),
+  // and field data (129) never exercised it (stalls=0). A stalled goal
+  // surfacing to the human is the intended control point. Opt back in with
+  // judgeEnabled: true.
+  judgeEnabled: false,
   judgeMaxPerGoal: 1,
   watchdogTickMs: 30000,
   shellStallMs: 300000,

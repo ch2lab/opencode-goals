@@ -1,10 +1,11 @@
-// Task 11: compaction-proof goal state — the two session hooks
-// (spec §10 defense lines 2 + 3), driven through the REAL
+// Task 11: compaction-proof goal state (spec §10) — driven through the REAL
 // GoalController.start() against the deterministic harness (test/harness.ts).
 //
-// - context hook: before every model call, an ACTIVE goal appends its
-//   objective block as a system part; non-active (incl. paused) or no goal →
-//   no-op.
+// 2026-10-17 ruling: the "context" session hook was REMOVED — the plugin
+// writes NO system part at all (any write, even a byte-stable one, shifts the
+// request prefix at appearance/disappearance and breaks the LLM prefix
+// cache). Test 1 pins that absence.
+//
 // - compaction hook: the host's SessionCompaction.result is a WHOLE
 //   REPLACEMENT (session.d.ts: "Set to use this compaction and skip the
 //   model request") — so the summary must carry the conversation history
@@ -13,8 +14,8 @@
 //   (host default compaction runs; payload.result stays unset; the hook
 //   never throws).
 //
-// The 6 behaviors are the Task 11 brief contract. The hook callbacks are
-// pulled from h.sessionHooks — an unregistered hook fails the test (bug).
+// The hook callbacks are pulled from h.sessionHooks — an unregistered hook
+// fails the test (bug).
 import { expect, test } from "bun:test";
 import { resolveOptions } from "../src/options.ts";
 import { goalStorageKey, type GoalRecord } from "../src/state.ts";
@@ -36,12 +37,6 @@ function goalOf(h: Harness, sessionID = S): GoalRecord | undefined {
 
 type HookFn = (sessionID: string, payload: Record<string, unknown>) => void;
 
-function contextHook(h: Harness): HookFn {
-  const hook = h.sessionHooks.context[0];
-  expect(hook, "context session hook must be registered in start()").toBeDefined();
-  return hook!;
-}
-
 function compactionHook(h: Harness): HookFn {
   const hook = h.sessionHooks.compaction[0];
   expect(hook, "compaction session hook must be registered in start()").toBeDefined();
@@ -49,61 +44,13 @@ function compactionHook(h: Harness): HookFn {
 }
 
 // ---------------------------------------------------------------------------
-// 1. context hook positive: active goal → system part appended
+// 1. zero system-part writes: NO context session hook is registered
 // ---------------------------------------------------------------------------
 
-test("1: context hook appends the objective block for an active goal (SystemPart shape, [GOAL + id, verbatim objective, turns usage)", async () => {
+test("1: the controller registers NO context session hook (zero system-part writes — prefix-cache ruling 2026-10-17); the compaction hook stays", async () => {
   const { h, stop } = await boot();
-  await h.commandExecutor(S, "/goal set Ship compaction-proof state");
-  const g = goalOf(h)!;
-  const hook = contextHook(h);
-  const payload: Record<string, unknown> = { system: [] };
-  await hook(S, payload);
-  const system = payload.system as Array<{ type?: string; text: string }>;
-  expect(system).toHaveLength(1);
-  // SystemPart shape pinned from @opencode/ai (schema/messages.d.ts):
-  // { type: "text", text: string, cache?, metadata? }
-  expect(system[0].type).toBe("text");
-  const text = system[0].text;
-  expect(text).toContain("[GOAL");
-  expect(text).toContain(g.id);
-  expect(text).toContain("Ship compaction-proof state");
-  // objectiveBlock contract: turns usage `used/cap`
-  expect(text).toContain(`${g.used.turns}/${g.cap.turns}`);
-  await stop();
-});
-
-// ---------------------------------------------------------------------------
-// 2. context hook no-op: no goal / paused goal
-// ---------------------------------------------------------------------------
-
-test("2: context hook is a no-op without a goal and while paused (system stays empty)", async () => {
-  const { h, stop } = await boot();
-  const hook = contextHook(h);
-
-  const noGoal: Record<string, unknown> = { system: [] };
-  await hook(S, noGoal);
-  expect(noGoal.system).toHaveLength(0);
-
-  await h.commandExecutor(S, "/goal set Pause me");
-  await h.commandExecutor(S, "/goal pause");
-  expect(goalOf(h)!.status).toBe("paused");
-  const paused: Record<string, unknown> = { system: [] };
-  await hook(S, paused);
-  expect(paused.system).toHaveLength(0);
-  await stop();
-});
-
-test("2b: context hook is idempotent on a reused system array (host retry → no double append)", async () => {
-  const { h, stop } = await boot();
-  await h.commandExecutor(S, "/goal set Retry me");
-  const hook = contextHook(h);
-  const payload: Record<string, unknown> = { system: [] };
-  await hook(S, payload);
-  expect(payload.system).toHaveLength(1);
-  // Host retry: the SAME payload object is re-fired.
-  await hook(S, payload);
-  expect(payload.system).toHaveLength(1);
+  expect(h.sessionHooks.context).toHaveLength(0);
+  expect(h.sessionHooks.compaction).toHaveLength(1);
   await stop();
 });
 
@@ -264,16 +211,3 @@ test("7: paused goal is a compaction no-op — no result, no generate", async ()
   await stop();
 });
 
-// ---------------------------------------------------------------------------
-// 8. malformed context payload (non-array system) → never throws, untouched
-// ---------------------------------------------------------------------------
-
-test("8: context hook with a malformed payload never throws and leaves it untouched", async () => {
-  const { h, stop } = await boot();
-  await h.commandExecutor(S, "/goal set Malformed payload");
-  const hook = contextHook(h);
-  const payload: Record<string, unknown> = { system: "nope" };
-  await expect(hook(S, payload)).resolves.toBeUndefined();
-  expect(payload.system).toBe("nope");
-  await stop();
-});

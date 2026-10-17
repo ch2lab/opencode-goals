@@ -53,6 +53,8 @@ export interface Api {
   command(sessionID: string, name: string, text: string): Promise<number>;
   prompt(sessionID: string, text: string): Promise<any>;
   sessionShell(sessionID: string, command: string): Promise<number>;
+  /** Fire-and-forget session-shell create (see makeApi for why). */
+  sessionShellFire(sessionID: string, command: string): Promise<void>;
   createShell(command: string): Promise<any>;
   shellList(): Promise<any[]>;
   shellGet(id: string): Promise<{ status: number; data?: any }>;
@@ -450,6 +452,32 @@ function makeApi(baseUrl: string, password: string, project: string): Api {
     sessionShell: async (sessionID, command) => {
       const { status } = await post(`/api/session/${sessionID}/shell`, { command });
       return status;
+    },
+    // The session-shell POST is a STREAMING ATTACH: the host holds the
+    // connection for the shell's lifetime (verified on 129: the client curl
+    // gave up at 8s — http=000 — while the shell ran to completion and
+    // emitted started/ended). Awaiting it here would trip the 15s api
+    // timeout on any long command and abort the caller. So: fire the
+    // request (the host spawns the shell server-side on request receipt),
+    // abort after a short grace, swallow the abort; callers verify via
+    // shellList() / plugin state.
+    sessionShellFire: async (sessionID, command) => {
+      const u = `${baseUrl}/api/session/${sessionID}/shell?${loc}`;
+      const c = new AbortController();
+      const t = setTimeout(() => c.abort(), 4_000);
+      try {
+        await fetch(u, {
+          method: "POST",
+          headers: { ...H, "content-type": "application/json" },
+          body: JSON.stringify({ command }),
+          signal: c.signal,
+        });
+      } catch {
+        // expected when the 4s grace aborts mid-attach — the shell is
+        // already running server-side
+      } finally {
+        clearTimeout(t);
+      }
     },
     createShell: async (command) => {
       const { status, text } = await post("/api/shell", { command, location: { directory: project } });

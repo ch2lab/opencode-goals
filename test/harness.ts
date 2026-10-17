@@ -347,9 +347,25 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
       return tool.run(input, sessionID);
     },
     commandExecutor: async (sessionID, text) => {
-      // Drives every registered command in registration order (tests register
-      // one command per harness; the real host routes by command name).
-      for (const run of commands.values()) await run(text, sessionID);
+      // Mirror the real host: route by command name. The test passes either the
+      // full "/goal set x" form (name + args, as a user types it) or the bare
+      // host-routed remainder "set x" (the host strips the command name before
+      // calling us). The bare remainder always routes to the master "goal".
+      const trimmed = text.trim();
+      let name: string;
+      let rest: string;
+      if (trimmed.startsWith("/")) {
+        const sp = trimmed.indexOf(" ");
+        const head = sp === -1 ? trimmed : trimmed.slice(0, sp);
+        name = head.slice(1); // drop the leading "/"
+        rest = sp === -1 ? "" : trimmed.slice(sp + 1).trim();
+      } else {
+        name = "goal";
+        rest = trimmed;
+      }
+      const run = commands.get(name);
+      if (run === undefined) throw new Error(`commandExecutor: unknown command "${name}"`);
+      await run(rest, sessionID);
     },
     setGenerate: (reply) => {
       generateReply = reply;

@@ -230,15 +230,15 @@ test("prompt: contains budgetText verbatim", () => {
 
 test("prompt: requires JSON-only output, names all four verdicts and field rules", () => {
   const p = buildJudgePrompt(judgeGoal(), NO_ACTION_TEXTS, BUDGET_TEXT);
-  expect(p).toContain("只输出 JSON");
+  expect(p).toContain("output ONLY JSON");
   for (const v of ["continue", "complete", "needs_human", "give_up"]) {
     expect(p).toContain(v);
   }
-  expect(p).toContain("reason 必有");
-  expect(p).toContain("evidence 仅当 verdict=complete 时必填");
+  expect(p).toContain("reason is required");
+  expect(p).toContain("evidence is required only when verdict=complete");
   // instruction is OPTIONAL on continue — the prompt must not claim it 必填.
-  expect(p).toContain("instruction：verdict=continue 时可选");
-  expect(p).not.toContain("instruction 仅当 verdict=continue 时必填");
+  expect(p).toContain("instruction: optional when verdict=continue");
+  expect(p).not.toContain("instruction is required");
 });
 
 // --- SessionGenerateJudge: injected generator, fail-closed ---

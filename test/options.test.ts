@@ -5,7 +5,7 @@ const EXPECTED_DEFAULTS: Options = {
   stallLimit: 3,
   defaultCapTurns: 10,
   defaultCapTokens: undefined,
-  judgeEnabled: true,
+  judgeEnabled: false,
   judgeMaxPerGoal: 1,
   watchdogTickMs: 30000,
   shellStallMs: 300000,
@@ -20,7 +20,7 @@ test("empty input yields every default exactly", () => {
   expect(o.stallLimit).toBe(3);
   expect(o.defaultCapTurns).toBe(10);
   expect(o.defaultCapTokens).toBeUndefined();
-  expect(o.judgeEnabled).toBe(true);
+  expect(o.judgeEnabled).toBe(false);
   expect(o.judgeMaxPerGoal).toBe(1);
   expect(o.watchdogTickMs).toBe(30000);
   expect(o.shellStallMs).toBe(300000);
@@ -82,9 +82,9 @@ test("stallLimit accepts integers >= 1 only", () => {
 });
 
 test("booleans accept only boolean literals", () => {
-  expect(resolveOptions({ judgeEnabled: "false" }).judgeEnabled).toBe(true);
-  expect(resolveOptions({ judgeEnabled: "true" }).judgeEnabled).toBe(true);
-  expect(resolveOptions({ judgeEnabled: 0 }).judgeEnabled).toBe(true);
+  expect(resolveOptions({ judgeEnabled: "false" }).judgeEnabled).toBe(false);
+  expect(resolveOptions({ judgeEnabled: "true" }).judgeEnabled).toBe(false);
+  expect(resolveOptions({ judgeEnabled: 0 }).judgeEnabled).toBe(false);
   expect(resolveOptions({ timeoutWrap: 1 }).timeoutWrap).toBe(false);
   expect(resolveOptions({ timeoutWrap: "false" }).timeoutWrap).toBe(false);
   expect(resolveOptions({ judgeEnabled: false }).judgeEnabled).toBe(false);
