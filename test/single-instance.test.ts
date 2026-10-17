@@ -84,6 +84,32 @@ test("3: CONCURRENT starts (raced hot-reload loads) converge to one live consume
   await stopB();
 });
 
+// 2026-10-17 129 incident: the host dropped the wake turn's execution.started
+// from the plugin's event stream. The wake turn then completed a REAL
+// boundary, which the still-open continuationPending window SKIPPED — and
+// with the session dormant, no second boundary ever came, so the goal sat
+// silent (no decision-log line, no wake) until a human woke it manually. The
+// window is now time-bounded: far beyond it, a boundary is the wake turn's
+// own terminal and MUST be arbitrated.
+test("4: a lost execution.started cannot kill the wake loop (time-bounded window)", async () => {
+  const h = await createHarness({ locationDirectory: "/tmp/ocg-guard-4" });
+  const c = new GoalController(h.probe, resolveOptions({}), { contWindowMs: 100 });
+  const stop = await c.start();
+
+  await setGoal(h);
+  await h.emit(boundary("b1")); // → wake #1, window armed
+  expect(wakeCount(h)).toBe(1);
+  // NO execution.started emitted (lost in the host event stream); the window
+  // expires while the wake turn runs.
+  await new Promise((r) => setTimeout(r, 200));
+  await h.emit(boundary("b2")); // the wake turn's real terminal boundary
+  // Pre-fix: b2 is skipped (first boundary in the open window) and never
+  // re-tried → wakeCount stays 1 — the field signature of a dead goal loop.
+  expect(wakeCount(h)).toBe(2);
+
+  await stop();
+});
+
 test("2: stopping a displaced instance does not deregister the live successor", async () => {
   const h = await createHarness({ locationDirectory: "/tmp/ocg-guard-2" });
   const a = new GoalController(h.probe, resolveOptions({}), {});

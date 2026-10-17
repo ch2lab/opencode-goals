@@ -111,6 +111,11 @@ function stopWithTimeout(stop: () => Promise<void>, ms: number, label: string): 
 export interface ControllerDeps {
   judge?: Judge;
   tickMs?: number;
+  /** Length of the continuationPending window (default 10s). Sibling
+   *  terminal events of one turn end arrive within milliseconds; a real
+   *  wake turn takes seconds-to-minutes, so a boundary far beyond the
+   *  window is the wake turn's own terminal, not a sibling. */
+  contWindowMs?: number;
 }
 
 const TASK_STATUSES: readonly GoalTaskStatus[] = ["todo", "doing", "done"];
@@ -328,8 +333,9 @@ export class GoalController {
   private checkinDue = new Map<string, { due: number; inFlight: number }>();
   /** warn-once set: shell-store query failures (safe direction keeps the gate armed). */
   private shellQueryWarned = new Set<string>();
-  /** continuationPending window: set at wake injection, cleared by execution.started. */
-  private contPending = new Map<string, boolean>();
+  /** continuationPending window: value = arm time (ms) at wake injection,
+   *  cleared by execution.started; time-bounded in arbitrateBoundary. */
+  private contPending = new Map<string, number>();
   /**
    * First boundary skipped INSIDE the current pending window, per session
    * ("" when the skipped boundary had no id). Bounded-fallback bookkeeping:
@@ -954,33 +960,61 @@ export class GoalController {
     if (eventID !== undefined && this.handledIDs.has(eventID)) return;
     const goal = await this.loadGoal(sessionID);
     if (goal !== undefined && eventID !== undefined && goal.lastHandledEventID === eventID) return;
-    if (this.contPending.get(sessionID) === true) {
-      // continuationPending window: the wake has not landed (no execution.
-      // started yet). Bounded fallback (controller ruling I1): a window
-      // that survives TWO DISTINCT boundaries means the host lost the
-      // started signal — skip at most ONE boundary, then close the window
-      // and arbitrate normally. Bounded skip is preferred over permanent
-      // silence; the residual double-wake risk is acceptable because wakes
-      // are ordinary state-carrying messages by design.
-      const skipped = this.pendingSkipped.get(sessionID);
-      if (skipped === undefined) {
-        // First boundary inside the window → skip it (record only) and
-        // remember it so a second DISTINCT boundary can close the window.
-        if (eventID !== undefined) this.pendingSkipped.set(sessionID, eventID);
-        else this.pendingSkipped.set(sessionID, "");
-        this.markTurnInactive(sessionID);
-        await this.recordHandled(sessionID, eventID, goal);
-        return;
+    const armedAt = this.contPending.get(sessionID);
+    if (armedAt !== undefined) {
+      if (Date.now() - armedAt > this.contWindowMs()) {
+        // Window expired: the wake turn's execution.started never arrived
+        // (lost in the host event stream) — so this boundary is NOT a
+        // same-turn-end sibling but the wake turn's real terminal. Close the
+        // window and arbitrate normally: a single lost event must not leave
+        // the goal dormant for good (2026-10-17 129 incident — while the
+        // session is dormant NO second boundary ever arrives, so the
+        // bounded skip became unbounded silence until a human woke the
+        // session manually).
+        this.contPending.delete(sessionID);
+        this.pendingSkipped.delete(sessionID);
+      } else {
+        // continuationPending window (fresh): the wake has not landed (no
+        // execution.started yet). Within the window the first boundary is a
+        // same-turn-end sibling (execution.succeeded → session.idle, ms
+        // apart). Bounded fallback (controller ruling I1): skip at most ONE,
+        // a second DISTINCT boundary closes the window. Bounded skip is
+        // preferred over permanent silence; the residual double-wake risk is
+        // acceptable because wakes are ordinary state-carrying messages.
+        const skipped = this.pendingSkipped.get(sessionID);
+        if (skipped === undefined) {
+          // First boundary inside the window → skip it (recorded in the
+          // decision log for visibility — the 129 incident was invisible
+          // precisely because skips left no line) and remember it so a
+          // second DISTINCT boundary can close the window.
+          if (eventID !== undefined) this.pendingSkipped.set(sessionID, eventID);
+          else this.pendingSkipped.set(sessionID, "");
+          if (goal !== undefined && goal.status === "active") {
+            await appendDecision({
+              ts: new Date().toISOString(),
+              sessionID,
+              goalID: goal.id,
+              own: 0,
+              other: 0,
+              ownKnown: false,
+              decision: "skip",
+              reason: "continuationPending window (sibling boundary)",
+            });
+          }
+          this.markTurnInactive(sessionID);
+          await this.recordHandled(sessionID, eventID, goal);
+          return;
+        }
+        if (eventID === skipped) {
+          // Replay of the skipped boundary (dedup-equivalent) → keep ignoring.
+          await this.recordHandled(sessionID, eventID, goal);
+          return;
+        }
+        // Second distinct boundary → close the window and fall through to
+        // normal arbitration below (this boundary proceeds).
+        this.contPending.delete(sessionID);
+        this.pendingSkipped.delete(sessionID);
       }
-      if (eventID === skipped) {
-        // Replay of the skipped boundary (dedup-equivalent) → keep ignoring.
-        await this.recordHandled(sessionID, eventID, goal);
-        return;
-      }
-      // Second distinct boundary → close the window and fall through to
-      // normal arbitration below (this boundary proceeds).
-      this.contPending.delete(sessionID);
-      this.pendingSkipped.delete(sessionID);
     }
     if (goal === undefined || goal.status !== "active") {
       // ② no active goal → ignore (no storage write when there is no goal;
@@ -1197,7 +1231,7 @@ export class GoalController {
       });
       this.lastInbox.set(sessionID, { id: ref.id, kind: "wake", goalID: goal.id });
       this.wakeInbox.set(sessionID, { inboxID: ref.id, goalID: goal.id });
-      this.contPending.set(sessionID, true);
+      this.contPending.set(sessionID, Date.now());
       this.pendingSkipped.delete(sessionID); // fresh window → fresh bounded skip
     } catch (err) {
       // Fault tolerance: a failed injection must not break the loop and must
@@ -1515,6 +1549,13 @@ export class GoalController {
     return this.deps.tickMs ?? this.options.watchdogTickMs;
   }
 
+  /** ContinuationPending window length (deps.contWindowMs in tests); default
+   *  10s — sibling terminal events arrive within milliseconds, a wake turn
+   *  takes seconds-to-minutes. */
+  private contWindowMs(): number {
+    return this.deps.contWindowMs ?? 10_000;
+  }
+
   /**
    * (command, cwd) → host timeout from create.before (timeout > 0 only;
    * payload is mutable — we snapshot the value, we never read it back later).
@@ -1616,7 +1657,7 @@ export class GoalController {
       });
       this.lastInbox.set(sessionID, { id: ref.id, kind: "wake", goalID: goal.id, watchdog: true });
       this.wakeInbox.set(sessionID, { inboxID: ref.id, goalID: goal.id, watchdog: true });
-      this.contPending.set(sessionID, true);
+      this.contPending.set(sessionID, Date.now());
       this.pendingSkipped.delete(sessionID);
       await this.saveGoal(goal);
     } catch (err) {

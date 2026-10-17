@@ -402,3 +402,11 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 - **测试**：`test/background-gate.test.ts` test 5 改为"真活动（新回合）取消"；新增 test 21"终态边界后的迟到 usage/tool 事件不取消已武装的 check-in"（先 RED 后 GREEN）。
 - **实机复验（2.0.32 隔离宿主）**：13/13 全绿——A7 check-in 携真计数落入 inbox 并被消费。
 - 同一轮顺带修正 `scripts/verify-hostapi.ts` 收尾：临时目录删除包 best-effort（Windows 子进程句柄残留导致 `rmSync` 抛错、污染退出码）。
+
+## 19. 2026-10-17 修订（窗口失锚：丢一个事件让 goal 永久休眠）
+
+129 现场事故（用户报障"几次都是我手动唤醒的，插件都没见动作"）：wake 发出后，宿主事件流**丢失了唤醒回合的 `session.execution.started`**（单条事件级丢失，其余事件正常——goal 记录持续在写）。`continuationPending` 窗口因此不关闭 → 唤醒回合真正的终态边界落进窗口被"至多跳一个"静默跳过 → 会话休眠期间**没有任何回合在跑 → 永远不会有第二个边界** → "第二个不同边界关窗"的兜底等不到 → **goal 永久休眠，且零日志行**（skip 路径不写决策日志，事故对外不可见）。设计假设"边界流不断"，休眠恰恰断掉了边界流。
+
+- **修复（`src/controller.ts`）**：窗口改**时间限界**（默认 10s，`deps.contWindowMs` 可注入）——同一回合终态的兄弟事件（`execution.succeeded` → `session.idle`）毫秒级到达；超出窗口才到的边界必是唤醒回合自己的终态 → 关窗、正常仲裁。单条事件丢失不再能把 goal 推出循环。skip 路径同时补**决策日志行**（`decision:"skip"`, `reason:"continuationPending window (sibling boundary)"`）——跳过从此可见。
+- **测试**：`test/single-instance.test.ts` test 4（RED：旧逻辑下 `wakeCount` 停在 1 = 现场签名"goal 死循环"；GREEN：窗口过期后边界被正常仲裁，`wakeCount` 2）。
+- 129 重播种（新构建）待用户 GO，机制同 §18 部署（缓存目录播种 + options nudge）。
