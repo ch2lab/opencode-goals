@@ -8,8 +8,6 @@ const EXPECTED_DEFAULTS: Options = {
   judgeEnabled: false,
   judgeMaxPerGoal: 1,
   watchdogTickMs: 30000,
-  shellStallMs: 300000,
-  waitCheckInMs: 300000,
   checkInDelaySec: 300,
   timeoutWrap: false,
   wakeDetail: "slim",
@@ -24,8 +22,6 @@ test("empty input yields every default exactly", () => {
   expect(o.judgeEnabled).toBe(false);
   expect(o.judgeMaxPerGoal).toBe(1);
   expect(o.watchdogTickMs).toBe(30000);
-  expect(o.shellStallMs).toBe(300000);
-  expect(o.waitCheckInMs).toBe(300000);
   expect(o.checkInDelaySec).toBe(300);
   expect(o.timeoutWrap).toBe(false);
   expect(o.wakeDetail).toBe("slim");
@@ -41,8 +37,6 @@ test("partial overrides take effect, the rest stay default", () => {
     judgeEnabled: false,
     judgeMaxPerGoal: 2,
     watchdogTickMs: 15000,
-    shellStallMs: 600000,
-    waitCheckInMs: 60000,
     timeoutWrap: true,
     wakeText: "continue the goal",
   });
@@ -52,8 +46,6 @@ test("partial overrides take effect, the rest stay default", () => {
   expect(o.judgeEnabled).toBe(false);
   expect(o.judgeMaxPerGoal).toBe(2);
   expect(o.watchdogTickMs).toBe(15000);
-  expect(o.shellStallMs).toBe(600000);
-  expect(o.waitCheckInMs).toBe(60000);
   expect(o.timeoutWrap).toBe(true);
   expect(o.wakeText).toBe("continue the goal");
 });
@@ -65,16 +57,12 @@ test("non-number / invalid numeric input falls back to defaults", () => {
     defaultCapTokens: null,
     judgeMaxPerGoal: 0,
     watchdogTickMs: -1,
-    shellStallMs: NaN,
-    waitCheckInMs: Infinity,
   });
   expect(o.stallLimit).toBe(3);
   expect(o.defaultCapTurns).toBe(10);
   expect(o.defaultCapTokens).toBeUndefined();
   expect(o.judgeMaxPerGoal).toBe(1);
   expect(o.watchdogTickMs).toBe(30000);
-  expect(o.shellStallMs).toBe(300000);
-  expect(o.waitCheckInMs).toBe(300000);
 });
 
 test("stallLimit accepts integers >= 1 only", () => {

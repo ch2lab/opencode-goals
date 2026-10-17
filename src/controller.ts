@@ -1,8 +1,8 @@
 // Goal lifecycle controller (Task 7 + Task 8 + Task 10 + Task 11): command + tool
 // surface, storage discipline, snapshot, the boundary arbiter + wake loop
 // (spec §6 arbitration sequence, §11 budget, §15-9 blocked resume) AND the
-// shell-wait watchdog (spec §7.1: per-goal tick, three-way decision per
-// shell, check-in dual signal, fast path, restart reconciliation).
+// shell-wait background gate (spec §7.1: in-flight boundary does not wake —
+// it arms a one-shot progress check; the event-driven shell exit wake).
 // Composes the tested pure modules (state / options / evidence / judge /
 // wake) over the WakeProbe host surface — none of their logic is
 // reimplemented here.
@@ -41,7 +41,7 @@ import {
   type TranscriptMessage,
 } from "./evidence";
 import type { Judge, JudgeVerdict } from "./judge";
-import { buildWakeMessage } from "./wake";
+import { backgroundCheckInText, buildWakeMessage } from "./wake";
 import { buildCompactionPrompt, composeCompactionSummary } from "./compact";
 import { decidePermission, GOAL_CONTROL_ACTION } from "./permission";
 import type { HostEvent, PermissionDecision, PermissionHookInput, SessionMessage, WakeProbe } from "./types";
@@ -107,103 +107,9 @@ function stopWithTimeout(stop: () => Promise<void>, ms: number, label: string): 
   });
 }
 
-export interface ShellProbe {
-  list(): Promise<Array<{ id: string; state: "running" | "exited"; exitCode?: number; outputTail?: string }>>;
-}
-
 export interface ControllerDeps {
   judge?: Judge;
-  shellProbe?: ShellProbe;
   tickMs?: number;
-}
-
-// ---------------------------------------------------------------------------
-// Task 10 (I2): RpcShellProbe — ShellProbe over the host RPC channel
-// ---------------------------------------------------------------------------
-
-/**
- * RPC method name for the shell fact query (shell records + output tails).
- * Confirmed on 2.0.29 in Task 13 (live smoke + static discovery):
- * @opencode/protocol@2.0.29 dist/groups/shell.js —
- * HttpApiEndpoint.get("shell.list", "/api/shell"), group "server.shell"
- * (REST reply: { location, data: Shell.Info[] }, status ∈
- * running|exited|timeout|killed, exit=number; output via the separate
- * "shell.output" endpoint). test/watchdog.test.ts asserts the constant
- * equals the discovered identifier (regression guard).
- * Live-probe caveat (2.0.29): the plugin RPC bridge only dispatches
- * plugin-registered methods — core host methods (server.shell/…) are
- * NOT reachable through it (400 "RPC is unavailable"). So on this host
- * version the shell-facts channel degrades to "facts unavailable"
- * (fail-safe: no "lost" classification, watchdog keeps re-arming); see
- * README "已知限制" and .superpowers/sdd/2026-10-15-opencode-goal/task-13-report.md.
- */
-export const SHELL_LIST_RPC_METHOD = "shell.list";
-
-/**
- * Thrown by RpcShellProbe when shell facts CANNOT be trusted: the RPC failed
- * OR the reply is not the expected array shape. Callers must treat this as
- * "no facts" (fail-safe: no state change, no "lost" classification) — it
- * must NEVER be read as "no shells" (that would fabricate facts in the
- * opposite direction, review finding C1).
- */
-export class ShellFactsUnavailableError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ShellFactsUnavailableError";
-  }
-}
-
-export type ShellFact = { id: string; state: "running" | "exited"; exitCode?: number; outputTail?: string };
-
-/**
- * ShellProbe over `probe.rpcCall`: list() asks the host for the live shell
- * records. Reply parsing is DEFENSIVE — a bad/missing shape throws
- * ShellFactsUnavailableError (facts missing), it never returns a guessed or
- * empty list (an empty list IS a fact: "no shells", and fabricating it from a
- * malformed reply would turn every waiting shell into a false "lost").
- * index.ts wires this as the production shellProbe (the only host-touching
- * file keeps being index.ts — this class only sees the narrow probe surface).
- */
-export class RpcShellProbe implements ShellProbe {
-  constructor(private readonly rpc: { rpcCall(method: string, input: unknown): Promise<unknown> }) {}
-
-  async list(): Promise<ShellFact[]> {
-    let raw: unknown;
-    try {
-      raw = await this.rpc.rpcCall(SHELL_LIST_RPC_METHOD, {});
-    } catch (err) {
-      throw new ShellFactsUnavailableError(
-        `shell facts RPC (${SHELL_LIST_RPC_METHOD}) failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-    return parseShellFacts(raw);
-  }
-}
-
-/**
- * Defensive reply parse: Array<{ id: string, state: "running"|"exited",
- * exitCode?: number, outputTail?: string }>. ANY malformed shape (non-array,
- * entry without string id, entry with unknown state) → throw
- * ShellFactsUnavailableError (facts missing, not "no shells").
- * TODO(task13): the placeholder shape is what the live smoke will confirm.
- */
-function parseShellFacts(raw: unknown): ShellFact[] {
-  if (!Array.isArray(raw)) throw new ShellFactsUnavailableError("shell facts reply is not an array");
-  const out: ShellFact[] = [];
-  for (const item of raw) {
-    if (!isPlainObject(item) || typeof item.id !== "string" || item.id === "") {
-      throw new ShellFactsUnavailableError("malformed shell fact entry (missing id)");
-    }
-    const state = item.state;
-    if (state !== "running" && state !== "exited") {
-      throw new ShellFactsUnavailableError(`malformed shell fact state: ${String(state)}`);
-    }
-    const fact: ShellFact = { id: item.id, state };
-    if (typeof item.exitCode === "number") fact.exitCode = item.exitCode;
-    if (typeof item.outputTail === "string") fact.outputTail = item.outputTail;
-    out.push(fact);
-  }
-  return out;
 }
 
 const TASK_STATUSES: readonly GoalTaskStatus[] = ["todo", "doing", "done"];
@@ -371,7 +277,7 @@ function shellInfoFrom(props: Record<string, unknown>): {
   };
 }
 
-/** Result wake (fast path / event-lost self-heal / reconcile): status wording. */
+/** Result wake (fast path): status wording. */
 function shellExitText(shellID: string, status: "exited" | "timeout" | "killed", exitCode?: number, tail?: string): string {
   const head =
     status === "timeout"
@@ -382,35 +288,9 @@ function shellExitText(shellID: string, status: "exited" | "timeout" | "killed",
   return `${head} — latest output tail:\n${tail ?? "(none)"}\nDecide the next step; end this turn with a tool call.`;
 }
 
-/** Check-in ("status review") wake: reason wording (likely stalled / long wait needs progress confirmation) + tail. */
-function shellCheckInText(
-  goal: GoalRecord,
-  shellID: string,
-  reason: "stall" | "long",
-  ms: number,
-  tail?: string,
-): string {
-  const why =
-    reason === "stall"
-      ? `The shell you were waiting for, ${shellID}, shows zero output growth for ${ms}ms — likely stalled`
-      : `The shell you were waiting for, ${shellID}, has output but has been waiting ${ms}ms — a long wait needs progress confirmation`;
-  return (
-    `[SHELL CHECK-IN goal ${goal.id}] ${why} — latest output tail:\n${tail ?? "(none)"}\n` +
-    "Judge whether it is making substantive progress: yes → goal_wait(N) to declare the wait explicitly / verify with tools and cite evidence; no → kill it, switch route, or goal_block."
-  );
-}
-
-/** Restart-reconcile lost-script wake (spec §7.1 step 3). */
-function shellLostText(ids: string[]): string {
-  return (
-    `The host restarted; the shells you were waiting for, ${ids.join(", ")}, were lost/cancelled with the restart (lost/cancelled — see the cancellation notices in the session) — ` +
-    "decide the next step (rerun / switch route / give up); end this turn with a tool call."
-  );
-}
-
 export class GoalController {
-  // deps.judge feeds the stall ladder (Task 9); deps.shellProbe + deps.tickMs
-  // drive the Task 10 watchdog (shell fact-checking + tick period).
+  // deps.judge feeds the stall ladder (Task 9); deps.tickMs drives the
+  // watchdog tick (the one-shot background check-in heartbeat).
   constructor(
     private readonly probe: WakeProbe,
     private readonly options: Options,
@@ -490,15 +370,6 @@ export class GoalController {
   /** Per-goal in-flight tick guard (a tick never overlaps itself). */
   private wdBusy = new Set<string>();
   /**
-   * Per-shell watch state (in-memory): `tail`/`lastTailAt` track output growth;
-   * `checkedIn` = this stall segment already got its one check-in (no loop
-   * self-rotation). Cleared on shell exit / terminal goal / cleanup.
-   */
-  private shellWatch = new Map<
-    string,
-    { tail: string | undefined; lastTailAt: number; checkedIn: boolean; changed: boolean }
-  >();
-  /**
    * (command, cwd) → host timeout (ms) captured on create.before (timeout > 0
    * only; timeout 0 = no timeout → not recorded). Correlated onto shell
    * events by command+cwd; correlation failure = no timeout (conservative:
@@ -506,13 +377,6 @@ export class GoalController {
    */
   private shellTimeouts = new Map<string, number>();
   private shellTimeoutOrder: string[] = [];
-  /**
-   * Shell ids whose exit wake is already delivered / in flight (event path
-   * or tick path) — closes the race where a tick whose probe snapshot is a
-   * moment stale would synthesize a second exit wake. Bounded FIFO at 500.
-   */
-  private exitNotified = new Set<string>();
-  private exitNotifiedOrder: string[] = [];
 
   /**
    * Registers the /goal command and the 8 goal_* tools on the probe and
@@ -686,16 +550,17 @@ export class GoalController {
     // timeout } to create.before BEFORE spawn (timeout 0 = no timeout; payload
     // is mutable — spec §7.1 timeout awareness). Task 14 Fix 3b (timeoutWrap,
     // spec §15 决定 7): when the host gives NO timeout (timeout === 0) and this
-    // instance holds an ACTIVE goal, rewrite input.timeout to options.shellStallMs
-    // in place (the payload is mutable) — a stalled spawn then gets reaped
-    // (and the check-in threshold raised) like any host-timeout shell.
+    // instance holds an ACTIVE goal, rewrite input.timeout to
+    // checkInDelaySec * 1000 in place (the payload is mutable) — an unwrapped
+    // spawn gets reaped by the host after the background-wait window, so a
+    // stalled shell can never silently outlive the session's patience.
     // Simplified ruling (controller): "this instance has ANY active goal"
     // (activeGoalSessions, synced in loadGoal/saveGoal) — no per-shell session
     // attribution; the multi-session false-positive cost is only an extra
     // timeout granted by the host (direction-safe).
     this.probe.onShellCreateBefore((input) => {
       if (this.options.timeoutWrap && input.timeout === 0 && this.activeGoalSessions.size > 0) {
-        input.timeout = this.options.shellStallMs;
+        input.timeout = this.options.checkInDelaySec * 1000;
       }
       this.rememberShellTimeout(input.command, input.cwd, input.timeout);
     });
@@ -721,15 +586,10 @@ export class GoalController {
     // containment, expressed on the host permission surface (R9 contract).
     this.probe.onPermissionHook((input) => this.permissionHook(input));
 
-    // Task 10: restart reconciliation (spec §7.1) — rebuild watchdog state from
-    // persisted facts for every active goal BEFORE the event loop starts.
-    // One-shot: it runs once per start(), never loops.
-    await this.reconcile();
-    if (this.stopped) return slot.stop; // displaced during reconcile — do not arm
-    // (Residual note: a displaced instance's reconcile still COMPLETED — a
-    // takeover overlapping the reconcile gap can double a one-shot reconcile
-    // wake. Accepted: one-shot and bounded, versus the v1 per-boundary
-    // duplication it replaces.)
+    // (2026-10-17: restart reconciliation removed — the watchdog no longer
+    // fact-checks shells; a goal with waiting shells survives the restart as
+    // a persisted fact, and the host's own restart sweep resumes the session,
+    // whose next boundary re-arms the background gate.)
 
     // Task 8: single event loop (boundary arbiter + wake loop) over
     // probe.eventSubscribe() — spec §6 arbitration, §11 budget,
@@ -751,14 +611,13 @@ export class GoalController {
     if (this.stopping !== undefined) return this.stopping;
     this.stopping = (async () => {
       this.stopped = true;
-      // Task 10: stop EVERYTHING — all per-goal watchdog timers, watch state
-      // and pending tick work (test/watchdog.test.ts #10).
+      // stop EVERYTHING — all per-goal watchdog timers and pending tick work
+      // (test/watchdog.test.ts #10).
       for (const timer of this.wdTimers.values()) clearInterval(timer);
       this.wdTimers.clear();
       this.wdBusy.clear();
-      this.shellWatch.clear();
-      this.exitNotified.clear();
-      this.exitNotifiedOrder.length = 0;
+      this.checkinDue.clear();
+      this.activeSessions.clear();
       const iter = this.loopIter;
       this.loopIter = undefined;
       try {
@@ -899,10 +758,8 @@ export class GoalController {
     t.toolCalled = false;
     this.contPending.delete(sessionID); // 唤醒已落地 → 关闭 continuationPending 窗口
     this.pendingSkipped.delete(sessionID);
-    // Task 10: the session went active (spec §7.1 cancel ②) — stop the
-    // watchdog's tick for the whole goal (止表). The per-shell watch state
-    // (checkedIn / tail / since) SURVIVES: a re-arm at the next idle boundary
-    // resumes with the same stall segment (no double check-in).
+    // The session went active — stop the watchdog's tick for the whole goal
+    // (止表). Any pending progress check was already cancelled at the top.
     this.disarmWatchdog(sessionID);
   }
 
@@ -912,24 +769,6 @@ export class GoalController {
     if (goal === undefined || goal.status !== "active") return;
     const t = this.turns.get(sessionID);
     if (t !== undefined && t.active) t.toolCalled = true;
-    // Task 10: a model action (tool.called) ends the current stall segment —
-    // fresh countdown from here (checkedIn reset, since re-anchored and
-    // persisted as the restart-reconcile fact). No action → segment persists.
-    const waiting = goal.waitingShells;
-    if (waiting !== undefined && waiting.length > 0) {
-      const now = Date.now();
-      for (const w of waiting) {
-        w.since = now;
-        const st = this.shellWatch.get(w.id);
-        if (st !== undefined) {
-          st.checkedIn = false;
-          st.tail = undefined;
-          st.lastTailAt = now;
-          st.changed = false;
-        }
-      }
-      await this.saveGoal(goal);
-    }
   }
 
   /** spec §11: used.tokens = the CUMULATIVE value from the event (direct
@@ -1135,10 +974,10 @@ export class GoalController {
     // in-flight sessions of this project (subtask sessions) — does NOT inject
     // the ordinary wake; the session is already "waiting". The boundary's
     // entire action: arm the one-shot progress check (checkInDelaySec of
-    // silence, fired by the watchdog tick) + keep the shell watchdog (re)armed.
-    // Two exceptions keep normal arbitration: (a) the last inbox item is one of
-    // OUR watchdog wakes — spec §7.1: a check-in replied with pure text counts
-    // per the stall ladder; (b) goal_wait's waitUntil window silences EVERYTHING
+    // silence, fired by the watchdog tick). Two exceptions keep normal
+    // arbitration: (a) the last inbox item is one of OUR watchdog wakes —
+    // spec §7.1: a check-in replied with pure text counts per the stall
+    // ladder; (b) goal_wait's waitUntil window silences EVERYTHING
     // (record only: no wake, no arm, no stall accounting — "不消耗 stall 预算").
     const inFlight = this.inFlightCount(goal, sessionID);
     if (inFlight > 0) {
@@ -1156,15 +995,11 @@ export class GoalController {
           });
           this.ensureWatchdog(sessionID); // the tick is the deadline's heartbeat
         }
-        if ((goal.waitingShells?.length ?? 0) > 0) this.rearmWatchdog(sessionID, goal);
         this.markTurnInactive(sessionID);
         await this.recordHandled(sessionID, eventID, goal);
         return;
       }
-      // Proceeding (a reply to OUR watchdog wake) is still a boundary while
-      // waiting on shells → re-arm the watchdog (spec §6-②: a boundary with
-      // running shells arms; execution.started having disarmed it).
-      if ((goal.waitingShells?.length ?? 0) > 0) this.rearmWatchdog(sessionID, goal);
+      // (a) reply to OUR watchdog wake: normal arbitration (stall ladder).
     }
     // ⑤ attribution (lastInbox) → stall ladder.
     const toolCalled = this.turns.get(sessionID)?.toolCalled === true;
@@ -1260,9 +1095,10 @@ export class GoalController {
       const ref = await this.probe.prompt({
         sessionID,
         // Task 14 Fix 3a: options.wakeText rides every buildWakeMessage wake
-        // (boundary wake / judge-demoted wake). The watchdog check-in wakes
-        // below are an INDEPENDENT text family (shellCheckInText/…) and do
-        // NOT carry wakeText (ruling: wakeText does not apply to check-ins).
+        // (boundary wake / judge-demoted wake). The background check-in wake
+        // (runWatchdogTick, backgroundCheckInText) is an INDEPENDENT text
+        // family and does NOT carry wakeText (ruling: wakeText does not
+        // apply to check-ins).
         // options.wakeDetail selects the transcript footprint (2026-10-17:
         // default "slim" — objective/budget ride the per-turn system part).
         text: buildWakeMessage(
@@ -1595,16 +1431,6 @@ export class GoalController {
     return this.deps.tickMs ?? this.options.watchdogTickMs;
   }
 
-  /** Mark a shell's exit wake as delivered (bounded; see exitNotified). */
-  private rememberExitNotified(shellID: string): void {
-    if (!this.exitNotified.has(shellID)) this.exitNotifiedOrder.push(shellID);
-    this.exitNotified.add(shellID);
-    while (this.exitNotifiedOrder.length > 500) {
-      const old = this.exitNotifiedOrder.shift();
-      if (old !== undefined) this.exitNotified.delete(old);
-    }
-  }
-
   /**
    * (command, cwd) → host timeout from create.before (timeout > 0 only;
    * payload is mutable — we snapshot the value, we never read it back later).
@@ -1636,30 +1462,6 @@ export class GoalController {
     }
   }
 
-  /**
-   * Boundary re-arm (spec §6-②: arming the watchdog IS the boundary's whole
-   * action): fresh stall point (since re-anchored + persisted — the restart-
-   * reconcile fact anchor), fresh tail bookkeeping, but `checkedIn` is KEPT
-   * (at-most-one-check-in-per-segment — the segment ends only on a model
-   * action or a new shell, never on a plain waiting boundary).
-   */
-  private rearmWatchdog(sessionID: string, goal: GoalRecord): void {
-    const now = Date.now();
-    for (const w of goal.waitingShells ?? []) {
-      w.since = now;
-      const st = this.shellWatch.get(w.id);
-      if (st !== undefined) {
-        st.tail = undefined;
-        st.lastTailAt = now;
-        st.changed = false;
-      } else {
-        this.shellWatch.set(w.id, { tail: undefined, lastTailAt: now, checkedIn: false, changed: false });
-      }
-    }
-    void this.saveGoal(goal); // waitingShells changes persist (best-effort)
-    this.ensureWatchdog(sessionID);
-  }
-
   /** One tick per armed goal: at most one in flight (overlap guard). */
   private watchdogTick(sessionID: string): void {
     if (this.wdBusy.has(sessionID)) return;
@@ -1673,91 +1475,37 @@ export class GoalController {
   }
 
   /**
-   * Tick body — three-way decision per waiting shell:
-   * 1. exited in probe (no corresponding exited event — event-lost self-heal)
-   *    → 止表 for that shell + synthetic result wake;
-   * 2. check-in conditions met (dual signal, idle session only, waitUntil not
-   *    in force, once per stall segment) → 状态核查 wake;
-   * 3. otherwise → keep waiting (no inject, no stall touch — zero cost).
-   * All probe calls are try/catch; a single tick failure never breaks the
-   * timer, never mutates state.
+   * Tick body (2026-10-17 ruling — zero active checks: the tick carries only
+   * the one-shot progress check; shell liveness is EVENT-DRIVEN via
+   * session.shell.started/ended, no probe):
+   * 1. ghost rule: terminal/paused goal → clear the pending deadline + disarm;
+   * 2. checkinDue deadline reached + session idle + not quiet → ONE progress
+   *    reminder (consumed on fire; a missed deadline — active session or
+   *    quiet window — stays pending and fires on the next qualifying tick);
+   * 3. nothing pending (no waiting shells, no deadline) → disarm.
    */
   private async runWatchdogTick(sessionID: string): Promise<void> {
-    if (this.stopped) return; // tick in flight at displacement: no wake
+    if (this.stopped) return;
     const goal = await this.loadGoal(sessionID);
-    // Ghost rule: terminal (or paused) goal → disarmed before ANY probe call.
+    // Ghost rule: terminal (or paused) goal → disarmed before anything else.
     if (goal === undefined || goal.status !== "active") {
-      for (const w of goal?.waitingShells ?? []) this.shellWatch.delete(w.id);
+      this.checkinDue.delete(sessionID);
       this.disarmWatchdog(sessionID);
-      return;
-    }
-    const waiting = goal.waitingShells ?? [];
-    if (waiting.length === 0) {
-      this.disarmWatchdog(sessionID);
-      return;
-    }
-    let probes: Awaited<ReturnType<NonNullable<ControllerDeps["shellProbe"]>["list"]>>;
-    try {
-      probes = await this.deps.shellProbe?.list() ?? [];
-    } catch (err) {
-      console.warn(`opencode-goal: watchdog probe.list failed for ${sessionID}:`, err);
       return;
     }
     const now = Date.now();
-    const byId = new Map(probes.map((p) => [p.id, p]));
     const idle = this.turns.get(sessionID)?.active !== true; // Task 8 per-session active flag
     const quiet = goal.waitUntil !== undefined && now < goal.waitUntil;
-    const exitedNow: string[] = [];
-    for (const w of waiting) {
-      const p = byId.get(w.id);
-      if (p === undefined) continue; // transient probe state — keep waiting (reconcile owns "lost")
-      if (p.state === "exited") {
-        exitedNow.push(w.id);
-        this.shellWatch.delete(w.id);
-        if (this.exitNotified.has(w.id)) continue; // the event path already woke (race guard)
-        this.rememberExitNotified(w.id);
-        await this.deliverWatchdogWake(
-          goal,
-          shellExitText(w.id, "exited", p.exitCode, p.outputTail),
-        );
-        continue;
-      }
-      let st = this.shellWatch.get(w.id);
-      if (st === undefined) {
-        st = { tail: undefined, lastTailAt: now, checkedIn: false, changed: false };
-        this.shellWatch.set(w.id, st);
-      }
-      const tail = p.outputTail ?? "";
-      if (st.tail === undefined) {
-        st.tail = tail; // baseline: zero growth is measured from the first observation
-        st.lastTailAt = now;
-      } else if (st.tail !== tail) {
-        st.tail = tail;
-        st.lastTailAt = now;
-        st.changed = true; // 有增长 — evidence of "alive" (not of progress)
-      }
-      if (st.checkedIn) continue; // at most one check-in per stall segment (no loop self-rotation)
-      if (quiet) continue; // goal_wait in force: silent, no inject, no stall
-      if (!idle) continue; // active session: next boundary carries it
-      // Zero-growth threshold: max(shellStallMs, (timeoutMs ?? 0) + tick) —
-      // with a host timeout the host reaps at T; silence before T+tick is not
-      // evidence of a hang.
-      const threshold = Math.max(this.options.shellStallMs, (w.timeoutMs ?? 0) + this.tickMsValue());
-      if (now - st.lastTailAt >= threshold) {
-        st.checkedIn = true; // set BEFORE the async inject: an overlapping tick must see it
-        await this.deliverWatchdogWake(goal, shellCheckInText(goal, w.id, "stall", now - st.lastTailAt, tail));
-      } else if (st.changed && now - w.since >= this.options.waitCheckInMs) {
-        // 有增长但久等: only an ACTUALLY growing tail qualifies (spec §7.1's
-        // "活着地失败" checkpoint) — a silent shell is owned by the zero-growth
-        // branch above and by its host timeout (test 1: no check-in before T+tick).
-        st.checkedIn = true;
-        await this.deliverWatchdogWake(goal, shellCheckInText(goal, w.id, "long", now - w.since, tail));
-      }
+    const due = this.checkinDue.get(sessionID);
+    if (due !== undefined && now >= due.due && idle && !quiet) {
+      this.checkinDue.delete(sessionID); // one-shot: consumed on fire
+      await this.deliverWatchdogWake(
+        goal,
+        backgroundCheckInText(due.inFlight, this.options.checkInDelaySec),
+      );
     }
-    if (exitedNow.length > 0) {
-      goal.waitingShells = waiting.filter((w) => !exitedNow.includes(w.id));
-      await this.saveGoal(goal);
-      if (goal.waitingShells.length === 0) this.disarmWatchdog(sessionID);
+    if ((goal.waitingShells?.length ?? 0) === 0 && this.checkinDue.get(sessionID) === undefined) {
+      this.disarmWatchdog(sessionID);
     }
   }
 
@@ -1797,9 +1545,9 @@ export class GoalController {
 
   /**
    * Arm on shell creation (spec §7.1): write the waitingShells entry
-   * (timeoutMs correlated via command+cwd; since = segment start) and start
-   * the tick. Active goal only (a terminal/paused goal is never armed — the
-   * ghost rule).
+   * (timeoutMs correlated via command+cwd; since = segment start). Active
+   * goal only (a terminal/paused goal is never armed — the ghost rule).
+   * Pure event-driven: no tick — the exit arrives as a shell.ended event.
    */
   private async onShellStarted(sessionID: string, props: Record<string, unknown>): Promise<void> {
     this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
@@ -1815,17 +1563,15 @@ export class GoalController {
     const entry: NonNullable<GoalRecord["waitingShells"]>[number] = { id: shell.id, since: Date.now() };
     if (timeoutMs !== undefined) entry.timeoutMs = timeoutMs;
     goal.waitingShells = [...(goal.waitingShells ?? []), entry];
-    this.shellWatch.set(shell.id, { tail: undefined, lastTailAt: Date.now(), checkedIn: false, changed: false });
     await this.saveGoal(goal);
-    this.ensureWatchdog(sessionID);
   }
 
   /**
-   * Fast path exit (spec §7.1): the shell ended (event; or reconciled) →
+   * Fast path exit (spec §7.1): the shell ended (event) →
    * 止表 + result wake carrying the status wording (timeout = "超时",
    * killed = "被杀", else "退出 (exit)") and the output tail. No-op when the
    * goal is not active (ghost) or the shell was never armed / already
-   * processed.
+   * processed (the waitingShells membership IS the once-only guard).
    */
   private async onShellEnded(sessionID: string, props: Record<string, unknown>): Promise<void> {
     this.checkinDue.delete(sessionID); // 2026-10-17: session activity cancels the progress check
@@ -1836,157 +1582,13 @@ export class GoalController {
     const waiting = goal.waitingShells ?? [];
     if (!waiting.some((w) => w.id === shell.id)) return;
     goal.waitingShells = waiting.filter((w) => w.id !== shell.id);
-    this.shellWatch.delete(shell.id);
-    const alreadyWoke = this.exitNotified.has(shell.id);
-    this.rememberExitNotified(shell.id);
     const out = isPlainObject(props.output) ? props.output : undefined;
     const tail = out !== undefined && typeof out.output === "string" ? out.output : undefined;
     const status: "exited" | "timeout" | "killed" =
       shell.status === "timeout" ? "timeout" : shell.status === "killed" ? "killed" : "exited";
     await this.saveGoal(goal);
     if (goal.waitingShells.length === 0) this.disarmWatchdog(sessionID);
-    if (alreadyWoke) return; // the tick path already synthesized this exit wake
     await this.deliverWatchdogWake(goal, shellExitText(shell.id, status, shell.exit, tail));
-  }
-
-  /**
-   * Restart reconciliation (spec §7.1, once in start() before the event
-   * loop) — rebuild from persisted facts for every active goal:
-   * 1. host already took over (a context message carries metadata
-   *    notice === "restart" — the host restart.ts synthetic; TODO(task13)) →
-   *    NO new wake, only re-arm the watchdog (re-verify each waiting shell
-   *    against probe.list; the host's sweep re-runs the turn, so "session
-   *    active" is mechanically implied by the notice's presence — a fresh
-   *    controller cannot observe activity any other way at start time);
-   * 2. otherwise (truly idle — the common unattended case): per waiting
-   *    shell — gone from probe → lost wake (+ cancel OUR pending inbox
-   *    wakes so the old wake cannot double-deliver later); still running →
-   *    re-arm with since re-anchored to now; exited → result wake.
-   */
-  private async reconcile(): Promise<void> {
-    let entries: Array<{ key: string; value: unknown }>;
-    try {
-      entries = await this.probe.storageScan("goal/");
-    } catch (err) {
-      console.warn("opencode-goal: restart reconciliation skipped (storage scan failed):", err);
-      return;
-    }
-    for (const entry of entries) {
-      if (entry.key.includes("/archived/")) continue;
-      const goal = entry.value as GoalRecord | undefined;
-      if (goal === undefined || goal.status !== "active") continue;
-      try {
-        await this.reconcileGoal(goal);
-      } catch (err) {
-        console.warn(`opencode-goal: restart reconciliation failed for goal ${goal.id}:`, err);
-      }
-    }
-  }
-
-  private async reconcileGoal(goal: GoalRecord): Promise<void> {
-    const sessionID = goal.sessionID;
-    const waiting = goal.waitingShells ?? [];
-    if (waiting.length === 0) return;
-    let context: SessionMessage[];
-    try {
-      context = await this.probe.context(sessionID);
-    } catch {
-      context = [];
-    }
-    // Probe facts must be TRUSTED before any per-shell disposition: an
-    // unavailable probe (not wired at all, or list() failed) means we have NO
-    // facts — the watchdog only checks facts, never predicts (看门狗只查事实
-    // 不预测). "No facts" is NOT "shells are gone": a lost wake or a dropped
-    // waitingShells entry on empty facts would fabricate the opposite.
-    let probes: Awaited<ReturnType<NonNullable<ControllerDeps["shellProbe"]>["list"]>> = [];
-    let probeOk = true;
-    if (this.deps.shellProbe === undefined) {
-      probeOk = false;
-      console.warn(`opencode-goal: reconcile — no shell probe wired for ${sessionID}; keeping waiting shells as-is`);
-    } else {
-      try {
-        probes = await this.deps.shellProbe.list();
-      } catch (err) {
-        probeOk = false;
-        console.warn(`opencode-goal: reconcile probe.list failed for ${sessionID}:`, err);
-      }
-    }
-    if (!probeOk) {
-      // No facts: skip per-shell disposition ENTIRELY — keep every waiting
-      // shell, re-anchor the countdown, re-arm (the running ticks keep trying
-      // and will act as soon as facts come back). No wake, no inboxCancel.
-      for (const w of waiting) {
-        w.since = Date.now();
-        this.shellWatch.set(w.id, { tail: undefined, lastTailAt: Date.now(), checkedIn: false, changed: false });
-      }
-      await this.saveGoal(goal);
-      this.ensureWatchdog(sessionID);
-      return;
-    }
-    const byId = new Map(probes.map((p) => [p.id, p]));
-    const restartNotice = context.some((m) => {
-      const md = (m as { metadata?: unknown }).metadata;
-      return isPlainObject(md) && (md as Record<string, unknown>).notice === "restart";
-    });
-    if (restartNotice) {
-      // Host took over: no new wake. Re-verify; keep only shells still
-      // running (gone ones: the host delivered the cancelled notice; exited
-      // ones: the host's fast path delivered the real result).
-      goal.waitingShells = waiting.filter((w) => byId.get(w.id)?.state === "running");
-      for (const w of goal.waitingShells) {
-        w.since = Date.now();
-        this.shellWatch.set(w.id, { tail: undefined, lastTailAt: Date.now(), checkedIn: false, changed: false });
-      }
-      await this.saveGoal(goal);
-      this.ensureWatchdog(sessionID);
-      return;
-    }
-    // Truly idle: reconcile each waiting shell against the probe facts.
-    const lostIds: string[] = [];
-    const stillWaiting: NonNullable<GoalRecord["waitingShells"]> = [];
-    for (const w of waiting) {
-      const p = byId.get(w.id);
-      if (p === undefined) {
-        lostIds.push(w.id);
-        this.shellWatch.delete(w.id);
-        continue;
-      }
-      if (p.state === "exited") {
-        this.shellWatch.delete(w.id);
-        await this.deliverWatchdogWake(goal, shellExitText(w.id, "exited", p.exitCode, p.outputTail));
-        continue;
-      }
-      w.since = Date.now(); // re-arm with a fresh countdown anchor
-      stillWaiting.push(w);
-      this.shellWatch.set(w.id, { tail: undefined, lastTailAt: Date.now(), checkedIn: false, changed: false });
-    }
-    if (lostIds.length > 0) {
-      // Cancel OUR pending inbox wakes so the old wake cannot double-deliver
-      // later (spec §7.1 step 2, verbatim "metadata goalWake": the NORMAL
-      // stall-ladder wakes from injectWake carry metadata goalWake and are
-      // what get cancelled. Watchdog wakes carry goalControl and are NOT
-      // cancelled by reconcile. TODO(task13) verify the inbox payload shape
-      // in live smoke).
-      try {
-        const items = await this.probe.inboxList(sessionID);
-        for (const item of items) {
-          const md = item.payload?.metadata;
-          if (isPlainObject(md) && (md as Record<string, unknown>).goalWake === true) {
-            try {
-              await this.probe.inboxCancel(item.id);
-            } catch {
-              // best-effort
-            }
-          }
-        }
-      } catch (err) {
-        console.warn(`opencode-goal: reconcile inboxList failed for ${sessionID}:`, err);
-      }
-      await this.deliverWatchdogWake(goal, shellLostText(lostIds));
-    }
-    goal.waitingShells = stillWaiting;
-    await this.saveGoal(goal);
-    if (stillWaiting.length > 0) this.ensureWatchdog(sessionID);
   }
 
   /** Bounded in-memory eventID dedup (FIFO at HANDLED_ID_LIMIT). */

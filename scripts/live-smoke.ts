@@ -2,8 +2,8 @@
 // 2.0.29 host (scripts/host.ts) and asserts the behaviors that matter:
 //
 //   1. /goal command registered by the directory-installed plugin
-//   2. static RPC discovery: SHELL_LIST_RPC_METHOD matches the 2.0.29
-//      protocol identifier (node_modules/@opencode/protocol shell group)
+//   2. static protocol discovery: the 2.0.29 shell group endpoint identifiers
+//      (node_modules/@opencode/protocol — host-side fact for the report)
 //   3. live RPC discovery: which addressings reach the host (evidence for
 //      the report — the bridge's scope is recorded, not assumed)
 //   4. /goal set via the command endpoint + goals.get RPC round-trip
@@ -46,7 +46,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { startHost, REPO_ROOT, labProvider, type IsolatedHost, type ProviderSpec } from "./host.ts";
-import { SHELL_LIST_RPC_METHOD } from "../src/controller.ts";
 
 // ---------------------------------------------------------------------------
 
@@ -84,21 +83,12 @@ async function waitFor(cond: () => Promise<boolean> | boolean, timeoutMs: number
 // ---------------------------------------------------------------------------
 
 async function staticDiscovery() {
-  console.log("== static RPC discovery (@opencode/protocol) ==");
+  console.log("== static protocol discovery (@opencode/protocol) ==");
   const shellJs = join(REPO_ROOT, "node_modules", "@opencode", "protocol", "dist", "groups", "shell.js");
   const src = await readFile(shellJs, "utf8");
   const ids = [...src.matchAll(/HttpApiEndpoint\.(?:get|post|delete|patch|put)\("([a-z0-9.]+)"/g)].map((m) => m[1]);
   record("static-discovery", ids.includes("shell.list") ? "PASS" : "FAIL",
     `shell group endpoint identifiers in 2.0.29: ${JSON.stringify(ids)}`);
-  const match = SHELL_LIST_RPC_METHOD === "shell.list";
-  record(
-    "rpc-constant-matches-discovery",
-    match ? "PASS" : "FAIL",
-    `SHELL_LIST_RPC_METHOD="${SHELL_LIST_RPC_METHOD}" vs discovered "shell.list" ` +
-      `(HttpApiEndpoint.get("shell.list", "/api/shell") — GET list, reply { location, data: Shell.Info[] }, ` +
-      `status ∈ running|exited|timeout|killed, exit=number, output via separate shell.output)`,
-  );
-  return match;
 }
 
 // ---------------------------------------------------------------------------

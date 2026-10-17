@@ -10,7 +10,7 @@
 // re-thrown into the host (fault-tolerance discipline).
 import { Plugin } from "@opencode/plugin";
 import type { Registration } from "@opencode/plugin/promise/registration";
-import { GoalController, RpcShellProbe } from "./src/controller";
+import { GoalController } from "./src/controller";
 import { resolveOptions, selectJudgeModel } from "./src/options";
 import { SessionGenerateJudge } from "./src/judge";
 import type { HostEvent, InboxItem, InboxRef, SessionMessage, WakeProbe } from "./src/types";
@@ -392,14 +392,10 @@ export default Plugin.define({
       },
     };
 
-    // Task 10: the watchdog's shell fact source is the host RPC channel
-    // (RpcShellProbe over the generic rpc call above — method name is a
-    // TODO(task13) placeholder until live smoke confirms it). Task 12
-    // folds in the judge side channel: SessionGenerateJudge over the probe's
-    // generate channel (the stall ladder's single non-mechanical step —
-    // deps.judge, at most one verdict per goal).
+    // Task 12 folds in the judge side channel: SessionGenerateJudge over the
+    // probe's generate channel (the stall ladder's single non-mechanical step
+    // — deps.judge, at most one verdict per goal).
     const controller = new GoalController(probe, options, {
-      shellProbe: new RpcShellProbe(probe),
       tickMs: options.watchdogTickMs,
       judge: new SessionGenerateJudge(probe.generate),
     });

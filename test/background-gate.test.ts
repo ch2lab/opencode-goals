@@ -14,12 +14,18 @@
 // polling, never exact wall-clock moments.
 import { expect, test } from "bun:test";
 import { resolveOptions } from "../src/options.ts";
+import { goalStorageKey, type GoalRecord } from "../src/state.ts";
+import { backgroundCheckInText } from "../src/wake.ts";
 import type { HostEvent } from "../src/types.ts";
 import { GoalController } from "../src/controller.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 const S = "s1";
 const CHILD = "s2";
+
+function goalOf(h: Harness, sessionID = S): GoalRecord | undefined {
+  return h.storage.get(goalStorageKey(sessionID)) as GoalRecord | undefined;
+}
 
 // 1s clock (checkInDelaySec: integer seconds >= 1)
 const OPTS = resolveOptions({ checkInDelaySec: 1 });
@@ -76,6 +82,7 @@ function sleep(ms: number): Promise<void> {
 
 interface Boot {
   h: Harness;
+  ctrl: GoalController;
   stop: () => Promise<void>;
 }
 
@@ -83,7 +90,7 @@ async function boot(overrides?: Record<string, unknown>): Promise<Boot> {
   const h = await createHarness(overrides);
   const ctrl = new GoalController(h.probe, OPTS, { tickMs: 1 });
   const stop = await ctrl.start();
-  return { h, stop };
+  return { h, ctrl, stop };
 }
 
 test("1: regression — boundary with a waiting shell does not wake immediately (gate via the new count)", async () => {
@@ -168,5 +175,112 @@ test("7: goal_wait quiet — in-flight boundary arms nothing (no wake, no timer)
   await h.emit(succeeded("b1", S)); // in-flight boundary inside the waitUntil window
   await sleep(1500);
   expect(h.prompts.length).toBe(0);
+  await stop();
+});
+
+/** Whitebox access to the in-memory turn flags (house pattern: test 14 of
+ * test/watchdog.test.ts reaches private state through a cast). */
+function turnsOf(ctrl: GoalController): Map<string, { active: boolean; toolCalled: boolean }> {
+  return (ctrl as unknown as { turns: Map<string, { active: boolean; toolCalled: boolean }> }).turns;
+}
+
+// --- Task 3: the one-shot progress check (watchdog tick fires it) ---
+
+test("9: due fires exactly once - pinned reminder text + goalControl metadata; a re-arm after activity fires again", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Fire9");
+  await h.emit(started("c1", CHILD));
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // in-flight boundary → arm (1s)
+  await sleep(1500); // past due: the 1ms tick fires the one-shot
+  expect(h.prompts.length).toBe(1);
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
+  expect(h.prompts[0].input.metadata?.goalControl).toBe(true);
+  await sleep(300); // one-shot: no recurrence before a re-arm
+  expect(h.prompts.length).toBe(1);
+  // a user message refreshes lastInbox (otherwise the boundary would take the
+  // §7.1 (a) exception: a reply to OUR watchdog wake is arbitrated normally);
+  // then a working turn + another in-flight boundary → re-arm → fires again
+  await h.emit(ev("session.inbox.enqueued", "i1", {
+    sessionID: S,
+    inboxID: "inbox_9",
+    item: { type: "user", payload: { text: "keep going" }, delivery: "queue" },
+  }));
+  await modelWorked(h, "b");
+  await h.emit(succeeded("b2", S));
+  await sleep(1500);
+  expect(h.prompts.length).toBe(2);
+  expect(h.prompts[1].input.text).toBe(backgroundCheckInText(1, 1));
+  await stop();
+});
+
+test("10: child terminal event LOST (overcount persists) - the reminder still fires; no silent deadlock", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Lost10");
+  await h.emit(started("c1", CHILD)); // the child NEVER reports a terminal boundary
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // in flight = 1, forever
+  await sleep(1500);
+  expect(h.prompts.length).toBe(1); // the reminder fires despite the stale count
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
+  await stop();
+});
+
+test("11: due passes while the session is ACTIVE (lost-started belt) - held; once idle the pending deadline fires", async () => {
+  const { h, ctrl, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Hold11");
+  await h.emit(started("c1", CHILD));
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // arm (1s)
+  // simulate a lost execution.started: the host is active but we never saw it
+  turnsOf(ctrl).set(S, { active: true, toolCalled: false });
+  await sleep(1500); // due passes while active: the tick holds, the deadline stays pending
+  expect(h.prompts.length).toBe(0);
+  turnsOf(ctrl).get(S)!.active = false; // the turn ends (its boundary lost too)
+  await sleep(500); // next tick: idle now → the pending deadline fires
+  expect(h.prompts.length).toBe(1);
+  await stop();
+});
+
+test("12: quiet (goal_wait window) covers the deadline - no reminder is injected", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Quiet12");
+  await h.emit(started("c1", CHILD));
+  await h.toolExecutor("goal_wait", { minutes: 1 }, S); // waitUntil in force
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // in-flight boundary inside the window → armed nothing
+  await sleep(1500); // the due moment passes inside the quiet window
+  expect(h.prompts.length).toBe(0);
+  await stop();
+});
+
+test("13: terminal guard - goal cleared after arming: no ghost reminder, checkinDue cleared, tick disarmed", async () => {
+  const { h, ctrl, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Guard13");
+  await h.emit(started("c1", CHILD));
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // arm (1s)
+  // /goal clear is fail-closed: it needs a user clear request in the transcript
+  h.setMessages(S, [{ id: "m1", type: "user", text: "please discard the branch and stop the work" }]);
+  await h.commandExecutor(S, "/goal clear");
+  expect(goalOf(h)!.status).toBe("cleared");
+  await sleep(1500); // the deadline passes: the ghost rule must hold it back
+  expect(h.prompts.length).toBe(0);
+  const any = ctrl as unknown as { checkinDue: Map<string, unknown>; wdTimers: Map<string, unknown> };
+  expect(any.checkinDue.has(S)).toBe(false);
+  expect(any.wdTimers.has(S)).toBe(false);
+  await stop();
+});
+
+test("14: stale shell (started, no ended) - no self-heal, no permanent silence: the reminder rhythm keeps the session alive", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Stale14");
+  await h.emit(shellStarted("e1", "sh1")); // the shell never reports its end
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // in flight (the stale shell) → arm
+  await sleep(1500);
+  expect(h.prompts.length).toBe(1); // a reminder — never a fabricated "lost"
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
+  expect(h.prompts[0].input.text).not.toContain("lost");
   await stop();
 });

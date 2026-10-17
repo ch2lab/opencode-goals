@@ -9,8 +9,6 @@ export interface Options {
   judgeEnabled: boolean;
   judgeMaxPerGoal: number;
   watchdogTickMs: number;
-  shellStallMs: number;
-  waitCheckInMs: number;
   /** 2026-10-17 ruling: background in-flight gate — a boundary with background
    * work (shells / subtask sessions) in flight does NOT wake immediately; it
    * arms a one-shot progress check after this many SECONDS of silence
@@ -40,8 +38,6 @@ const DEFAULT_OPTIONS: Options = {
   judgeEnabled: false,
   judgeMaxPerGoal: 1,
   watchdogTickMs: 30000,
-  shellStallMs: 300000,
-  waitCheckInMs: 300000,
   checkInDelaySec: 300,
   timeoutWrap: false,
   wakeDetail: "slim",
@@ -79,8 +75,6 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
     judgeEnabled: bool("judgeEnabled", DEFAULT_OPTIONS.judgeEnabled),
     judgeMaxPerGoal: num("judgeMaxPerGoal", DEFAULT_OPTIONS.judgeMaxPerGoal),
     watchdogTickMs: num("watchdogTickMs", DEFAULT_OPTIONS.watchdogTickMs),
-    shellStallMs: num("shellStallMs", DEFAULT_OPTIONS.shellStallMs),
-    waitCheckInMs: num("waitCheckInMs", DEFAULT_OPTIONS.waitCheckInMs),
     checkInDelaySec: num("checkInDelaySec", DEFAULT_OPTIONS.checkInDelaySec),
     timeoutWrap: bool("timeoutWrap", DEFAULT_OPTIONS.timeoutWrap),
     wakeDetail,
