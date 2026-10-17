@@ -168,6 +168,8 @@ type GoalRecord = {
 
 ### 7.1 看门狗：脚本等待保证（治痛点 3：回调丢失）
 
+> 注：本节描述的主动检查机制（shell 事实探测、双信号 check-in、重启对账）已于 2026-10-17 裁决全部移除，由 §7.2 后台等待门禁取代；本节保留为设计史。
+
 立场（用户确认）：**脚本的命运不可控、也不预测**——被外部进程杀掉、卡住不动、缓慢输出、**"活着地失败"**（依赖进程故障导致永远无法结束但日志持续增长）都可能发生。关键认知：**输出增长只是"活着"的证据，不是"在推进"的证据**——因此等待不是无界等待，而是带检票点的等待。check-in 由三种信号触发，全部收敛到同一个"状态核查唤醒"动作（理由文案不同）：
 
 | 信号 | 时机 | 说明 |
@@ -212,6 +214,27 @@ type GoalRecord = {
 4. 宿主续跑耗尽预算产生的 `session.execution.failed` 走正常边界处理（当作一次普通终态边界，带失败上下文唤醒）；
 5. 重新武装所有看门狗；持久化的 `lastHandledEventID` + inbox 关联 + `notice: "restart"` 识别，保证宿主 sweep、旧 pending 唤醒、插件合成唤醒三者不产生双重续接。
 6. **原则**：宿主的自动恢复是快路径（免费，管"turn 进行中"），插件的对账是保证（管"真 idle"）。两者边界由"会话是否 active / 宿主 restart 通知是否已出现"机械判定。
+
+### 7.2 后台等待门禁（2026-10-17 裁决，取代 §7.1 的主动检查机制）
+
+**裁决原文**（用户三条消息 + 两条补充，2026-10-17）：
+
+1. "主任务结束立马唤醒的前提是，没有任何 shell 或者子任务在运行。一旦有任何后台任务在运行，就不能立即唤醒，因为会话本来就是在等待。这种情况只做一件事情，就是开始计时5分钟。"
+2. "如果5分钟内，会话还没有活动，只是触发一下进展检查而已，如果在这期间有任何活动，都立即停止计时并等待下一个idle触发。"
+3. "这个等待时间，默认值5分钟，可以作为插件的配置参数来修改。以秒为单位。"
+4. 补充："拿不到子任务或者shell名称不重要，我们只需要全程跟踪，当前有无正在执行的 shell 或子任务数量 > 0。"
+5. 补充："插件也不用主动去替会话检查任务是否死掉了——只是在会话 idle 了一定时间后提醒会话自己检查。"
+
+**设计**：
+
+- **门禁武装**：终态边界（`execution.succeeded/failed/idle`）到达时，若在飞后台工作 = 本 goal 的 `waitingShells.length` + 同 project 内其它在飞会话数（子任务会话，纯事件跟踪、goal 无关、不认名称/父子关系）之和 > 0 → **不立即唤醒**。边界的全部动作：武装一次性进展检查 `checkinDue = { due: now + checkInDelaySec×1000, inFlight }`（option `checkInDelaySec`，秒，默认 300）。
+- **时钟只在静默期走动**：任何会话活动（`started` / `tool.called` / `usage.updated` / `inbox.enqueued` / `shell.started` / `shell.ended`）取消计时；下一个在飞边界重新武装（全新倒计时）。
+- **触发**：看门狗 tick（周期 `watchdogTickMs`）见 deadline 到 + 会话 idle + 非 `goal_wait` 静默窗 → 一次性注入进展检查文案（英文 byte-pinned）："Background check-in: N background item(s) in flight, no session activity for Xs. Check progress: what finished, what is next — advance the goal." one-shot：fire 即删 deadline；到点但会话 active 或处于静默窗 → 不消费，下个合格 tick 再试（事件丢失的 belt）。
+- **两个例外保持正常仲裁**（§7.1 语义不变）：(a) 最后一条 inbox 是本插件看门狗唤醒 → 模型对进展检查的回复按 §8 stall 阶梯正常计数；(b) `goal_wait` 的 `waitUntil` 窗内一切静默（不唤醒、不武装、不数 stall）。
+- **shell 状态机纯事件驱动**：`session.shell.started` → `waitingShells` +1；`session.shell.ended` → −1，最后一个结束时投递结果唤醒（status 文案 + 输出尾部）。`waitingShells` 成员关系即 once-only 守卫。
+- **删除清单**（主动检查机制全部出码）：shell 事实探测（`shell.list` RPC + 防御解析 + fail-safe）、双信号 check-in（零增长 / 有增长久等）、tail 状态、重启对账、`exitNotified` 竞态守卫、options `shellStallMs`/`waitCheckInMs`；`timeoutWrap` 的 wrap 值改为 `checkInDelaySec × 1000`。
+- **失败方向**（事件丢失不死锁）：子任务终态事件丢失 → 计数永远偏高 → 退化为进展检查节奏，永不"永不唤醒"；shell 终态事件丢失 → 僵尸 `waitingShells` 条目同样退化。任何方向都不产生假唤醒。
+- **重启**：不做对账（已删）。僵尸 `waitingShells` 保留为持久事实、退化为进展检查节奏；宿主自身的重启清扫（§7.1 所述 `resumeSuspendedSessions`）恢复会话，下一个边界重新武装门禁。
 
 ## 8. Stall 阶梯与旁路裁判
 

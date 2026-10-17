@@ -27,10 +27,10 @@ This plugin gives the host a goal state machine + a wake mechanism, so the model
 
 | 机制 Mechanism | 作用 Effect |
 |---|---|
-| 目标循环 Goal loop | 每个执行边界（回合成功/失败、用户消息、脚本退出、看门狗 check-in）至多唤醒一次，模型继续推进，直到目标收尾或预算耗尽。 Wakes the model at most once per execution boundary until the goal completes or the budget is exhausted. |
+| 目标循环 Goal loop | 每个执行边界（回合成功/失败、用户消息、脚本退出）至多唤醒一次；有后台工作在飞时不立即唤醒，静默期后武装一次性进展检查；模型继续推进，直到目标收尾或预算耗尽。 Wakes the model at most once per execution boundary (turn success/failure, user message, script exit); a boundary with background work in flight does not wake immediately — it arms a one-shot progress check after a silence window. |
 | 证据门控 Evidence gate | `complete` 必须给出具体、可核查的证据（≥24 字符、锚定事实、接地于对话），否则视为未完成。 `complete` requires concrete, verifiable evidence (≥24 chars, fact-anchored, grounded in the conversation); otherwise it counts as not done. |
 | 停滞仲裁 Stall arbitration | 连续 N（默认 3）次"无动作"唤醒 → 旁路 LLM 裁判解读停滞原因（每 goal 至多 1 次）→ 继续 / 收尾 / 转人工；裁判输出不可解析 = give up，绝不伪造。 N consecutive no-action wakes (default 3) → a bypass LLM judge interprets the stall (at most once per goal) → continue / wrap up / hand off to a human; unparseable judge output = give up, never fabricated. |
-| 看门狗 Watchdog | 只查事实、不预测脚本命运：脚本退出 → 合成唤醒；久等且输出零增长 → 状态核查（仅 idle 会话注入）。 Checks facts only: script exited → synthesized wake; long wait with zero output growth → status check-in (idle sessions only). |
+| 看门狗 Watchdog | 零主动检查：脚本退出 → 结果唤醒（纯事件驱动）；有后台工作在飞（shell/子任务会话）的边界不立即唤醒，武装一次性进展检查（静默 `checkInDelaySec` 秒后触发），期间任何活动取消它。 No active checking: script exit → result wake (event-driven); a boundary with in-flight background work (shells / subtask sessions) does not wake — it arms a one-shot progress check that fires after `checkInDelaySec` of silence, and any activity cancels it. |
 | 预算 Budget | 默认 10 turns；token 默认**仅统计、不设限**，上限可 opt-in（`--tokens N` / `defaultCapTokens`）。 Default 10 turns; tokens are stats-only by default — a cap is opt-in. |
 | 待办任务 Task list | 每 goal 至多 50 条，`todo / doing / done` 三态，`/goal view` 可见。 Up to 50 tasks per goal, `todo / doing / done` states, visible via `/goal view`. |
 | 等待声明 `goal_wait` | 模型声明"我在等"并挂起 N 分钟（整数 1–60），不消耗停滞预算。 The model declares "I'm waiting" and suspends for N minutes (integer 1–60), without consuming the stall budget. |
@@ -121,10 +121,9 @@ The model then enters the goal loop: it is woken at each execution boundary to k
 | `judgeEnabled` | boolean | `true` | 是否启用旁路裁判（其输出解析失败 = give up，fail-closed）。 Enable the bypass judge (unparseable output = give up, fail-closed). |
 | `judgeMaxPerGoal` | number | `1` | 每个 goal 裁判至多使用次数。 Max judge invocations per goal. |
 | `watchdogTickMs` | number | `30000` | 看门狗 tick 周期（每个 active goal 一个 timer）。 Watchdog tick period (one timer per active goal). |
-| `shellStallMs` | number | `300000` | 脚本零输出增长时，触发 check-in 状态核查的等待阈值。 Wait threshold for a check-in when a script's output shows zero growth. |
-| `waitCheckInMs` | number | `300000` | 脚本有输出增长时，触发 check-in 的等待阈值。 Wait threshold for a check-in when the script is still producing output. |
-| `timeoutWrap` | boolean | `false` | 是否强制为无超时脚本包装超时（opt-in）。开启后：有 active goal 时，宿主对 `timeout === 0` 的 spawn 把 `timeout` 就地改写为 `shellStallMs`（按"本实例有任一 active goal"判定，不做 per-shell 归属）。 Opt-in: while any goal in this instance is active, spawns with `timeout === 0` get `timeout` rewritten in place to `shellStallMs`. |
-| `wakeText` | string | （无 none） | 自定义唤醒文案；设置后作为末行 `补充指示: <wakeText>` 追加到边界/裁判降级唤醒消息（看门狗 check-in 是独立文案，不套用）。 Custom wake text; appended as a final `补充指示: <wakeText>` line to boundary/judge-downgrade wake messages (the watchdog check-in uses its own text). |
+| `checkInDelaySec` | number | `300` | 后台等待门禁：边界上有后台工作（shell/子任务会话）在飞时不立即唤醒，静默达到这么多秒后触发一次进展检查；期间任何活动取消它。以秒为单位。 Background in-flight gate: a boundary with background work in flight (shells / subtask sessions) does not wake immediately; it arms a one-shot progress check after this many SECONDS of silence. Any activity cancels it. |
+| `timeoutWrap` | boolean | `false` | 是否强制为无超时脚本包装超时（opt-in）。开启后：有 active goal 时，宿主对 `timeout === 0` 的 spawn 把 `timeout` 就地改写为 `checkInDelaySec × 1000`（按"本实例有任一 active goal"判定，不做 per-shell 归属）。 Opt-in: while any goal in this instance is active, spawns with `timeout === 0` get `timeout` rewritten in place to `checkInDelaySec × 1000`. |
+| `wakeText` | string | （无 none） | 自定义唤醒文案；设置后作为末行 `补充指示: <wakeText>` 追加到边界/裁判降级唤醒消息（后台进展检查是独立文案，不套用）。 Custom wake text; appended as a final `补充指示: <wakeText>` line to boundary/judge-downgrade wake messages (the background progress check uses its own text). |
 | `wakeDetail` | `"full"` \| `"slim"` | `slim` | 边界/裁判降级唤醒消息在转录里的显示粒度。`slim`（默认）= 标题 + 一行"必须用工具调用结束本轮"触发语——目标/预算每个回合已由 context hook 的 system 部分携带，唤醒消息不再重复，转录里只留一行。`full` = 旧行为（唤醒消息内完整重述预算 + 目标 + 任务进度，强 re-grounding）。仅接受这两个字面值，其余回退默认。 Wake transcript footprint. `slim` (default) = header + one-line forced-tool-call trigger (objective/budget already ride the per-turn system part, so the transcript stays quiet); `full` = legacy behavior (budget + objective + task progress re-grounded inside the wake). Strict literal; other values fall back to the default. |
 | `model` | string | （会话当前模型 session model） | 旁路生成（裁判 + 压缩摘要）所用模型，格式 `"providerID/modelID"`（如 `"ch2lab/Qwen3.8-Flash-Next"`）。**不设 = 跟随会话当前使用的模型**（逐会话，含会话内切换；会话无显式模型时回落宿主默认）。严格两段、非法格式告警并回退。 Model used for bypass generation (judge + compaction summary), `"providerID/modelID"`. **Omitted = follow the session's current model** (per-session, including mid-session switches; falls back to the host default when the session has no explicit model). Strict two-segment format; invalid values warn and fall back. |
 
@@ -136,8 +135,8 @@ Numbers must be positive integers, booleans must be boolean literals; anything e
 
 - **每个边界一次唤醒，唤醒消息是普通状态消息**——没有特殊审计通道、没有状态升级：模型在自己的上下文里决定如何继续，循环不劫持宿主的正常会话流。
   **One wake per boundary, and the wake message is a plain state message** — no special audit channel, no state escalation: the model decides how to continue from its own context; the loop never hijacks the host's normal conversation flow.
-- **fail-closed**：事实查不到 → 不分类、不伪造"无 shell"；裁判输出不可解析 → give up；证据不达标 → 视为未完成；`clear` 未引用用户原话 → 拒绝。
-  **fail-closed**: missing facts → no classification, no fabricated "no shell"; unparseable judge output → give up; insufficient evidence → treated as not done; `clear` without the user's own words → refused.
+- **fail-closed**：在飞事实只靠事件计数，事件丢失至多让进展检查延迟、绝不产生假唤醒；裁判输出不可解析 → give up；证据不达标 → 视为未完成；`clear` 未引用用户原话 → 拒绝。
+  **fail-closed**: in-flight facts are event-counted — a lost event can at most delay the progress check, never cause a false wake; unparseable judge output → give up; insufficient evidence → treated as not done; `clear` without the user's own words → refused.
 - **控制面 / 数据面分权**：8 个 `goal_*` 工具统一声明专属权限动作 `goal.control`，插件只在"会话有 active goal 且归属本实例"时自授 allow（日志可审计）；数据面的路径沙箱永不放宽用户已配置的 deny。
   **Control plane / data plane separation**: all 8 `goal_*` tools declare the dedicated permission action `goal.control`; the plugin self-grants allow only when "the session has an active goal and belongs to this instance" (audited in logs); the data-plane path sandbox never relaxes user-configured deny rules.
 - **旁路生成默认跟随会话当前模型**，可用 `model` 钉一个更便宜的模型——裁判与压缩摘要不污染主对话上下文。
@@ -168,19 +167,19 @@ All 8 tools declare the `goal.control` permission; one-line gating rule per tool
   **Path sandbox**: engages in permission evaluation only while a goal is active; absolute paths inside the session working directory → auto-allow, outside → auto-deny (the message steers the model to `goal_block`).
 - **deny 永不放宽**：用户已配置的 deny 条目插件永不放宽；URL、命令等非路径资源一律不表态（保留宿主原有决策）。
   **deny is never relaxed**: user-configured deny entries are never overridden by the plugin; non-path resources (URLs, commands) are left undecided (the host's own policy applies).
-- **fail-closed 原则**：shell 事实查不到 → 不分类、不伪造；裁判输出不可解析 → give up；证据不达标 → 视为未完成。
-  **fail-closed**: if shell facts cannot be fetched → no classification, no fabrication; unparseable judge output → give up; insufficient evidence → treated as not done.
+- **fail-closed 原则**：在飞事实只靠事件计数，事件丢失至多让进展检查延迟、绝不产生假唤醒；裁判输出不可解析 → give up；证据不达标 → 视为未完成。
+  **fail-closed**: in-flight facts are event-counted — a lost event can at most delay the progress check, never cause a false wake; unparseable judge output → give up; insufficient evidence → treated as not done.
 
 ## 已知限制（2.0.29 宿主实测）· Known Limitations (measured on host 2.0.29)
 
 1. **CLI serve 形态不向模型暴露插件工具**：插件注册成功，但模型调用任何 `goal_*` 均被宿主拒绝；**桌面端运行时完整可用**（8 个工具全部对模型可见）。影响：CLI 形态下模型侧终态动作（`goal_complete` 等）不可用，无人值守收尾只能靠停滞/预算终态或用户侧 `/goal` 命令。
    **The CLI serve form does not expose plugin tools to the model**: the plugin registers fine, but the host rejects any `goal_*` call; **the desktop app runtime is fully functional** (all 8 tools visible to the model). Consequence: in the CLI form, model-side terminal actions (`goal_complete`, …) are unavailable — unattended closure relies on stall/budget terminals or the user-side `/goal` commands.
-2. **插件 RPC bridge 够不到宿主核心方法**（`server.shell/list` 等返回 400）：看门狗的 shell 事实通道拿不到事实时 fail-safe 处置（不分类、保留 waiting shells、re-arm）。
-   **The plugin RPC bridge cannot reach host core methods** (e.g. `server.shell/list` → 400): when the watchdog's shell facts are unavailable it fails safe (no classification, waiting shells retained, re-armed).
+2. **插件 RPC bridge 够不到宿主核心方法**（`server.shell/list` 等返回 400）：插件不做 shell 主动探测（零探测裁决，2026-10-17），只走宿主 `session.shell.started/ended` 事件流——该 bridge 限制不再影响插件；在飞计数纯靠事件，事件丢失至多退化为进展检查延迟。
+   **The plugin RPC bridge cannot reach host core methods** (e.g. `server.shell/list` → 400): the plugin does no active shell probing (zero-probe ruling, 2026-10-17) and rides the host's `session.shell.started/ended` event stream only — the bridge limitation no longer affects the plugin; the in-flight count is event-based, a lost event degrades to a delayed progress check at worst.
 3. **唤醒投递的两级语义**：宿主只在会话 idle 时投递 queued inbox 项；模型自己的回合进行中（含阻塞在 `question` 表单）投递被推迟——宿主调度行为，非插件缺陷。
    **Two-level wake delivery**: the host delivers queued inbox items only when the session is idle; delivery is deferred while the model's own turn is in flight (including when blocked on a `question` form) — host scheduling behavior, not a plugin defect.
-4. **宿主重启**（idle 等 shell 时杀 service 重启）：shell 记录消失且宿主不发任何取消通知；插件对账按"无事实"fail-safe 保留 waiting shells。
-   **Host restart** (killing the service while idling on a shell): shell records vanish and the host sends no cancellation notice; the plugin's reconciliation fails safe and retains waiting shells.
+4. **宿主重启**（idle 等 shell 时杀 service 重启）：shell 记录消失且宿主不发任何取消通知；插件不做重启对账（2026-10-17 已删），僵尸 waiting shell 保留为持久事实，退化为周期性进展检查的节奏，宿主自身的重启清扫恢复会话、下一个边界重新武装门禁。
+   **Host restart** (killing the service while idling on a shell): shell records vanish and the host sends no cancellation notice; the plugin no longer reconciles on restart (removed 2026-10-17) — a stale waiting shell persists as a fact and degrades to the progress-check cadence, while the host's own restart sweep resumes the session, whose next boundary re-arms the gate.
 5. **宿主原生恢复未触发**（turn 进行中杀 serve 进程重启）：无 restart 合成消息、无挂起会话清扫——`serve` 形态下实证。
    **Host-native recovery not triggered** (killing the serve process mid-turn and restarting): no restart synthetic message, no suspended-session sweep — verified in the serve form.
 6. **宿主 quirk**：未配置模型时宿主回退到内置 `exo-free`（已废弃）；`POST /api/session/:id/shell` 的响应在 **shell 退出时才返回**（长脚本会挂住 POST）。
