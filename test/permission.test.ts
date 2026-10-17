@@ -323,3 +323,44 @@ test("filesystem root '/' does not contain windows drive paths", () => {
     "goal_block",
   );
 });
+
+// ── group 10 — 2026-10-17 ruling: reads unrestricted, only write actions are
+// path-contained; indistinguishable actions are unrestricted ─────────────────
+
+test("fs.read outside the directory leaves (reads are unrestricted)", () => {
+  expect(
+    decidePermission(input({ action: "fs.read", resources: ["/etc/passwd"] })),
+  ).toEqual({ effect: "leave" });
+});
+
+test("fs.read inside the directory also leaves (the plugin takes no stance on reads)", () => {
+  expect(
+    decidePermission(input({ action: "fs.read", resources: ["/root/proj/a.txt"] })),
+  ).toEqual({ effect: "leave" });
+});
+
+test("fs.read outside on a windows path leaves", () => {
+  expect(
+    decidePermission(
+      input({
+        action: "fs.read",
+        sessionDirectory: "D:\\dev\\proj",
+        resources: ["E:\\other\\file.txt"],
+      }),
+    ),
+  ).toEqual({ effect: "leave" });
+});
+
+test("an unknown action with an outside path leaves (indistinguishable = unrestricted)", () => {
+  expect(
+    decidePermission(input({ action: "bash", resources: ["/etc/passwd"] })),
+  ).toEqual({ effect: "leave" });
+});
+
+test("fs.write outside the directory still denies (write containment is kept)", () => {
+  expectDeny(
+    decidePermission(input({ action: "fs.write", resources: ["/etc/passwd"] })),
+    "/etc/passwd",
+    "goal_block",
+  );
+});

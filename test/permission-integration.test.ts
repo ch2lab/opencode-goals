@@ -47,7 +47,7 @@ test("1: self-grant — active goal allows goal.control even with empty resource
   }
 });
 
-test("2: in-directory path — active goal allows a resource inside the session directory", async () => {
+test("2: in-directory read — no stance (reads are unrestricted, 2026-10-17 ruling)", async () => {
   const { h, stop } = await boot();
   try {
     h.setSession("s1", { location: { directory: "/proj" } });
@@ -58,13 +58,13 @@ test("2: in-directory path — active goal allows a resource inside the session 
       sessionID: "s1",
       incoming: "ask",
     });
-    expect(decision).toEqual({ effect: "allow" });
+    expect(decision).toBeUndefined();
   } finally {
     await stop();
   }
 });
 
-test("3: out-of-directory path — denied with a message naming the path and goal_block", async () => {
+test("3: out-of-directory read — no stance (reads are unrestricted, 2026-10-17 ruling)", async () => {
   const { h, stop } = await boot();
   try {
     h.setSession("s1", { location: { directory: "/proj" } });
@@ -75,9 +75,7 @@ test("3: out-of-directory path — denied with a message naming the path and goa
       sessionID: "s1",
       incoming: "ask",
     });
-    expect(decision?.effect).toBe("deny");
-    expect(decision?.message).toContain("/etc/passwd");
-    expect(decision?.message).toContain("goal_block");
+    expect(decision).toBeUndefined();
   } finally {
     await stop();
   }
@@ -159,7 +157,7 @@ test("8: missing sessionID — no attribution possible, no stance", async () => 
   }
 });
 
-test("9: windows paths through the real wiring — case- and separator-mixed forms still normalize to allow", async () => {
+test("9: windows read through the real wiring — no stance (reads are unrestricted)", async () => {
   const { h, stop } = await boot();
   try {
     h.setSession("s1", { location: { directory: "D:\\dev\\proj" } });
@@ -170,7 +168,26 @@ test("9: windows paths through the real wiring — case- and separator-mixed for
       sessionID: "s1",
       incoming: "ask",
     });
-    expect(decision).toEqual({ effect: "allow" });
+    expect(decision).toBeUndefined();
+  } finally {
+    await stop();
+  }
+});
+
+test("11: out-of-directory WRITE — denied with a message naming the path and goal_block", async () => {
+  const { h, stop } = await boot();
+  try {
+    h.setSession("s1", { location: { directory: "/proj" } });
+    await setGoal(h, "s1");
+    const decision = await h.permissionHook({
+      action: "fs.write",
+      resources: ["/etc/passwd"],
+      sessionID: "s1",
+      incoming: "ask",
+    });
+    expect(decision?.effect).toBe("deny");
+    expect(decision?.message).toContain("/etc/passwd");
+    expect(decision?.message).toContain("goal_block");
   } finally {
     await stop();
   }

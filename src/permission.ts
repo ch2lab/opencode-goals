@@ -1,19 +1,25 @@
 /**
- * Permission decisions for the goal loop: path sandboxing (unix + windows
- * absolute paths) plus the goal.control self-grant.
+ * Permission decisions for the goal loop: path sandboxing of known write
+ * actions (unix + windows absolute paths) plus the goal.control self-grant.
  *
  * Pure functions, zero imports. Rule order (first match wins):
  *  1. incoming === "deny"                    -> leave (a deny is never relaxed)
  *  2. action === GOAL_CONTROL_ACTION         -> allow iff goalActive (before any path check)
- *  3. !goalActive                             -> leave (path rules only apply to an active goal)
- *  4. sessionDirectory missing/empty/degenerate (normalizes to "") -> leave
- *  5. empty resources                         -> leave (nothing to sandbox)
- *  6. any resource not an absolute path       -> leave (never a partial opinion)
- *  7. any resource outside the session dir    -> deny, message names the path and goal_block
- *  8. every resource inside                   -> allow on ask, leave on allow
+ *  3. action not in WRITE_ACTIONS            -> leave (reads and indistinguishable
+ *                                               actions are unrestricted — 2026-10-17
+ *                                               ruling: only writes are contained)
+ *  4. !goalActive                             -> leave (path rules only apply to an active goal)
+ *  5. sessionDirectory missing/empty/degenerate (normalizes to "") -> leave
+ *  6. empty resources                         -> leave (nothing to sandbox)
+ *  7. any resource not an absolute path       -> leave (never a partial opinion)
+ *  8. any resource outside the session dir    -> deny, message names the path and goal_block
+ *  9. every resource inside                   -> allow on ask, leave on allow
  */
 
 export const GOAL_CONTROL_ACTION = "goal.control";
+
+/** Actions whose resources are path-contained while a goal is active. */
+export const WRITE_ACTIONS: readonly string[] = ["fs.write"];
 
 export type PermissionDecision =
   | { effect: "allow" | "deny"; message?: string }
@@ -33,6 +39,10 @@ export function decidePermission(input: PermissionInput): PermissionDecision {
   if (input.action === GOAL_CONTROL_ACTION) {
     return input.goalActive ? { effect: "allow" } : { effect: "leave" };
   }
+
+  // Only known write actions are path-contained; reads and indistinguishable
+  // actions get no opinion (2026-10-17 ruling: reads are unrestricted).
+  if (!WRITE_ACTIONS.includes(input.action)) return { effect: "leave" };
 
   if (!input.goalActive) return { effect: "leave" };
 

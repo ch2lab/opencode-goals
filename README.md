@@ -164,7 +164,7 @@ All 8 tools declare the `goal.control` permission; one-line gating rule per tool
 ## 无人值守安全 · Unattended Safety
 
 - **路径沙箱**：仅当 goal 为 active 时介入权限评估；会话工作目录内的绝对路径 → 自动 allow，目录外 → 自动 deny（消息引导模型走 `goal_block`）。
-  **Path sandbox**: engages in permission evaluation only while a goal is active; absolute paths inside the session working directory → auto-allow, outside → auto-deny (the message steers the model to `goal_block`).
+  **Path sandbox**: engages in permission evaluation only while a goal is active, and only for write actions (`fs.write`); absolute paths inside the session working directory → auto-allow, outside → auto-deny (the message steers the model to `goal_block`). Read actions and indistinguishable actions are unrestricted (the plugin takes no stance; 2026-10-17 ruling: reads open, writes contained only).
 - **deny 永不放宽**：用户已配置的 deny 条目插件永不放宽；URL、命令等非路径资源一律不表态（保留宿主原有决策）。
   **deny is never relaxed**: user-configured deny entries are never overridden by the plugin; non-path resources (URLs, commands) are left undecided (the host's own policy applies).
 - **fail-closed 原则**：在飞事实只靠事件计数，事件丢失至多让进展检查延迟、绝不产生假唤醒；裁判输出不可解析 → give up；证据不达标 → 视为未完成。
