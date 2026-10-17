@@ -54,6 +54,36 @@ test("1: a second controller for the same location stops the previous owner — 
   await stopA(); // displaced owner's cleanup: must be idempotent, no resurrection
 });
 
+test("3: CONCURRENT starts (raced hot-reload loads) converge to one live consumer", async () => {
+  // Field follow-up 2026-10-17: after the 129 serve restart the host loaded
+  // the plugin 7 times in 52s (pairs ~110-210ms apart). The v1 guard claimed
+  // its slot at the END of start() (after `await reconcile()`), so two starts
+  // whose gaps overlapped both read an empty registry and both armed →
+  // 2-3 live consumers (duplicate wakes, inflated used.turns, burned budget).
+  // Reproduce the overlap deterministically: widen reconcile's storage gap so
+  // the second start lands INSIDE the first start's gap.
+  const h = await createHarness({ locationDirectory: "/tmp/ocg-guard-3" });
+  const origScan = h.probe.storageScan;
+  h.probe.storageScan = async (prefix) => {
+    await new Promise((r) => setTimeout(r, 150));
+    return origScan(prefix);
+  };
+  const a = new GoalController(h.probe, resolveOptions({}), {});
+  const b = new GoalController(h.probe, resolveOptions({}), {});
+  // Both starts interleave: b's start runs while a is inside its storage gap.
+  const [stopA, stopB] = await Promise.all([a.start(), b.start()]);
+
+  await setGoal(h);
+  await h.emit(boundary("b1"));
+  // Pre-fix: 2 (both loops armed — the exact field signature). Post-fix: 1.
+  expect(wakeCount(h)).toBe(1);
+  await h.emit(boundary("b2")); // continuationPending window: still 1
+  expect(wakeCount(h)).toBe(1);
+
+  await stopA(); // the displaced one: idempotent, no resurrection
+  await stopB();
+});
+
 test("2: stopping a displaced instance does not deregister the live successor", async () => {
   const h = await createHarness({ locationDirectory: "/tmp/ocg-guard-2" });
   const a = new GoalController(h.probe, resolveOptions({}), {});

@@ -47,32 +47,48 @@ import { decidePermission, GOAL_CONTROL_ACTION } from "./permission";
 import type { HostEvent, PermissionDecision, PermissionHookInput, SessionMessage, WakeProbe } from "./types";
 
 // ---------------------------------------------------------------------------
-// Single-instance guard (2026-10-16 field incident, aiserver5/129): the host's
-// plugin hot-reload re-runs setup() WITHOUT disposing the previous instance
-// (host log: 3x "loading plugin" within one second on the config swap, zero
-// unload lines) → N live controllers on the same event stream + shared
-// storage → every terminal boundary arbitrated N times → N duplicate boundary
-// wakes (identical turn stamp), which piled up in the session inbox queue
-// during long busy scripts and flooded the model at once.
+// Single-instance guard — v2 (2026-10-17 field follow-up, aiserver5/129).
 //
-// The registry lives on globalThis, NOT module state: a host hot-reload can
+// v1 (2026-10-16 incident): the host's plugin hot-reload re-runs setup()
+// WITHOUT disposing the previous instance (host log: 3x "loading plugin"
+// within one second on the config swap, zero unload lines) → N live
+// controllers on the same event stream + shared storage → every terminal
+// boundary arbitrated N times → N duplicate boundary wakes (identical turn
+// stamp).
+//
+// v2 fixes the v1 race: v1 claimed its registry slot at the END of start()
+// (after `await reconcile()`), so concurrent loads (field evidence: 7 plugin
+// loads in the 52s after a serve restart, pairs 110–210ms apart) could both
+// read an empty slot and both arm → 2–3 live consumers survived. Symptoms:
+// duplicate wakes again (goalTurn 8×3, 11–34 mostly ×2) AND inflated
+// used.turns (every duplicate injection bumps the shared counter) → the
+// turn budget burned 2–3x faster than real model turns (cap 10 turns hit in
+// ~10 model turns; the budget_limited notice was delivered ×4).
+//
+// v2: EXACTLY ONE live controller per host process, claimed on the FIRST
+// line of start() (before any await). The predecessor is stopped right after
+// the claim; a start displaced mid-flight aborts before arming its loop.
+// One-per-process is correct for this plugin: the adapter pins
+// probe.projectID = undefined (every instance sees every session) and all
+// instances share one event stream + one storage — a second consumer can
+// only duplicate work, never specialize per location.
+//
+// The slot lives on globalThis, NOT module state: a host hot-reload can
 // re-import the plugin module, which would reset module-level variables.
-// Key = plugin id + location directory (the host may legitimately run
-// separate instances per location; same location → one live controller).
 // ---------------------------------------------------------------------------
 
-const LIVE_REGISTRY = Symbol.for("opencode-goal:live-controllers");
+const LIVE_SLOT = Symbol.for("opencode-goal:live-controller");
 
 type LiveSlot = { stop: () => Promise<void> };
 
-function liveRegistry(): Map<string, LiveSlot> {
+function liveSlotHolder(): { slot: LiveSlot | undefined } {
   const g = globalThis as unknown as Record<symbol, unknown>;
-  let reg = g[LIVE_REGISTRY] as Map<string, LiveSlot> | undefined;
-  if (reg === undefined) {
-    reg = new Map();
-    g[LIVE_REGISTRY] = reg;
+  let holder = g[LIVE_SLOT] as { slot: LiveSlot | undefined } | undefined;
+  if (holder === undefined) {
+    holder = { slot: undefined };
+    g[LIVE_SLOT] = holder;
   }
-  return reg;
+  return holder;
 }
 
 /** Bounded wait: the takeover must never hang on a stuck previous instance. */
@@ -392,6 +408,10 @@ export class GoalController {
   private loopIter: AsyncIterator<HostEvent> | undefined;
   private loopPromise: Promise<void> | undefined;
   private stopped = false;
+  /** This instance's live-slot reference (set at the first line of start()). */
+  private liveSlotRef: LiveSlot | undefined;
+  /** Memoized stop: stopInstance is idempotent (takeover + host unload share it). */
+  private stopping: Promise<void> | undefined;
 
   // ------------------------------------------------------------------
   // Task 10: watchdog (spec §7.1) — per-goal tick timers + per-shell
@@ -433,21 +453,22 @@ export class GoalController {
    * returns the cleanup function (awaited by the plugin entry on dispose).
    */
   async start(): Promise<() => Promise<void>> {
-    // Single-instance guard: a host hot-reload may set this plugin up again
-    // while the previous instance is still alive — stop the displaced owner
-    // of this location key BEFORE arming (field incident 2026-10-16: triple
-    // wakes per boundary from three concurrent controllers). Ownership is
-    // taken up front so a stalled old stop (bounded below) cannot block the
-    // takeover.
-    const key = `opencode-goal:${
-      typeof this.probe.locationDirectory === "string" ? this.probe.locationDirectory : "global"
-    }`;
-    const reg = liveRegistry();
-    const prev = reg.get(key);
+    // Single-instance guard (v2): claim the process-wide slot on the FIRST
+    // line — before ANY await — so two concurrent starts cannot both observe
+    // an empty slot (the v1 race: claim at the end of start(), after
+    // `await reconcile()`, let raced hot-reload loads both arm). Then stop
+    // the displaced predecessor (bounded — a stuck old stop cannot block the
+    // takeover), and a start that is itself displaced mid-flight aborts
+    // below without arming its event loop.
+    const slot: LiveSlot = { stop: () => this.stopInstance() };
+    this.liveSlotRef = slot;
+    const holder = liveSlotHolder();
+    const prev = holder.slot;
+    holder.slot = slot;
     if (prev !== undefined) {
-      reg.delete(key);
-      await stopWithTimeout(prev.stop, 10_000, `stopping displaced controller (${key}) timed out`);
+      await stopWithTimeout(prev.stop, 10_000, "stopping displaced controller timed out");
     }
+    if (this.stopped) return slot.stop; // displaced during the takeover — do not arm
 
     this.probe.registerCommand("goal", (text, sessionID) => this.handleCommand(sessionID, text));
 
@@ -617,6 +638,11 @@ export class GoalController {
     // persisted facts for every active goal BEFORE the event loop starts.
     // One-shot: it runs once per start(), never loops.
     await this.reconcile();
+    if (this.stopped) return slot.stop; // displaced during reconcile — do not arm
+    // (Residual note: a displaced instance's reconcile still COMPLETED — a
+    // takeover overlapping the reconcile gap can double a one-shot reconcile
+    // wake. Accepted: one-shot and bounded, versus the v1 per-boundary
+    // duplication it replaces.)
 
     // Task 8: single event loop (boundary arbiter + wake loop) over
     // probe.eventSubscribe() — spec §6 arbitration, §11 budget,
@@ -624,10 +650,22 @@ export class GoalController {
     this.stopped = false;
     this.loopIter = this.probe.eventSubscribe()[Symbol.asyncIterator]();
     this.loopPromise = this.runLoop(this.loopIter);
-    const cleanup = async (): Promise<void> => {
+    return slot.stop;
+  }
+
+  /**
+   * Bounded, idempotent instance stop — the live-slot `stop` and the
+   * host-unload cleanup both route here. Safe at ANY point in start():
+   * pre-arming (no loop to tear down), armed (loop teardown), or repeated
+   * (memoized). Deregisters only while this instance still OWNS the slot —
+   * a displaced instance's late stop must not remove the successor's claim.
+   */
+  private stopInstance(): Promise<void> {
+    if (this.stopping !== undefined) return this.stopping;
+    this.stopping = (async () => {
       this.stopped = true;
-      // Task 10: cleanup stops EVERYTHING — all per-goal watchdog timers,
-      // watch state and pending tick work (test/watchdog.test.ts #10).
+      // Task 10: stop EVERYTHING — all per-goal watchdog timers, watch state
+      // and pending tick work (test/watchdog.test.ts #10).
       for (const timer of this.wdTimers.values()) clearInterval(timer);
       this.wdTimers.clear();
       this.wdBusy.clear();
@@ -648,15 +686,10 @@ export class GoalController {
       } catch {
         // runLoop swallows per-event failures (fault-tolerance discipline)
       }
-      // Single-instance guard: deregister only while this instance still
-      // OWNS the key — a displaced instance's late cleanup must not delete
-      // the successor's entry.
-      const r = liveRegistry();
-      if (r.get(key) === slot) r.delete(key);
-    };
-    const slot: LiveSlot = { stop: cleanup };
-    reg.set(key, slot);
-    return cleanup;
+      const holder = liveSlotHolder();
+      if (holder.slot === this.liveSlotRef) holder.slot = undefined;
+    })();
+    return this.stopping;
   }
 
   // ------------------------------------------------------------------
@@ -687,6 +720,7 @@ export class GoalController {
   }
 
   private async handleEvent(event: HostEvent): Promise<void> {
+    if (this.stopped) return; // displaced mid-flight: in-flight event no-ops
     const sessionID = event.properties?.sessionID;
     if (typeof sessionID !== "string" || sessionID === "") return; // 无归属：无 sessionID
     if (!(await this.sessionBelongs(sessionID))) return; // 无归属：非本实例 project
@@ -1547,6 +1581,7 @@ export class GoalController {
    * timer, never mutates state.
    */
   private async runWatchdogTick(sessionID: string): Promise<void> {
+    if (this.stopped) return; // tick in flight at displacement: no wake
     const goal = await this.loadGoal(sessionID);
     // Ghost rule: terminal (or paused) goal → disarmed before ANY probe call.
     if (goal === undefined || goal.status !== "active") {
