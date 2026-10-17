@@ -325,6 +325,8 @@ export class GoalController {
    * watchdog tick.
    */
   private checkinDue = new Map<string, { due: number; inFlight: number }>();
+  /** warn-once set: shell-store query failures (safe direction keeps the gate armed). */
+  private shellQueryWarned = new Set<string>();
   /** continuationPending window: set at wake injection, cleared by execution.started. */
   private contPending = new Map<string, boolean>();
   /**
@@ -894,12 +896,37 @@ export class GoalController {
    *    the verdict is disposed inline (continue re-wakes with the optional
    *    instruction; complete / needs_human / give_up end the goal).
    */
-  /** In-flight background work for the gate (2026-10-17 ruling): this goal's
-   * waiting shells + every OTHER in-flight session of this project. Subtask
-   * sessions: names and parent links are neither known nor needed — the count
-   * alone is the signal ("拿不到子任务或 shell 名称不重要，只需数量 > 0"). */
-  private inFlightCount(goal: GoalRecord, sessionID: string): number {
-    let n = goal.waitingShells?.length ?? 0;
+  /** In-flight background work for the gate (2026-10-17 shell-store ruling):
+   * the goal session's OWN running shells, queried live from the host shell
+   * store (shell.list — location-scoped, running-only), plus every OTHER
+   * in-flight session of this project (subtask sessions: names and parent
+   * links are neither known nor needed — count only).
+   * Why the store and not the session.shell.* events: the host does not emit
+   * those events for MODEL-ORIGINATED background shells (root cause #12138) —
+   * the event-driven waitingShells count is blind to exactly the case that
+   * motivated the gate. The store is the host's own truth: stateless
+   * (self-heals across plugin reloads) and self-pruning (exited shells vanish).
+   * Query failure → treat as in-flight (safe direction: degrades to the
+   * progress-check cadence, never a false wake); warn-once per session. */
+  private async inFlightCount(sessionID: string): Promise<number> {
+    let own = 0;
+    try {
+      const info = await this.probe.sessionGet(sessionID);
+      const directory = info?.location?.directory;
+      if (directory !== undefined) {
+        own = (await this.probe.shellList(directory)).filter(
+          (e) => e.sessionID === sessionID && e.status === "running",
+        ).length;
+      }
+      this.shellQueryWarned.delete(sessionID); // a success re-arms the warn
+    } catch (err) {
+      if (!this.shellQueryWarned.has(sessionID)) {
+        this.shellQueryWarned.add(sessionID);
+        console.warn(`opencode-goal: shell store query failed for ${sessionID}; treating as in-flight:`, err);
+      }
+      return 1;
+    }
+    let n = own;
     for (const sid of this.activeSessions.keys()) {
       if (sid !== sessionID) n += 1;
     }
@@ -970,8 +997,9 @@ export class GoalController {
       return;
     }
     // Background in-flight gate (2026-10-17 ruling): a terminal boundary with
-    // ANY background work in flight — the goal's waiting shells OR other
-    // in-flight sessions of this project (subtask sessions) — does NOT inject
+    // ANY background work in flight — the goal's own running shells (host
+    // shell store, shell.list) OR other in-flight sessions of this project
+    // (subtask sessions) — does NOT inject
     // the ordinary wake; the session is already "waiting". The boundary's
     // entire action: arm the one-shot progress check (checkInDelaySec of
     // silence, fired by the watchdog tick). Two exceptions keep normal
@@ -979,7 +1007,7 @@ export class GoalController {
     // spec §7.1: a check-in replied with pure text counts per the stall
     // ladder; (b) goal_wait's waitUntil window silences EVERYTHING
     // (record only: no wake, no arm, no stall accounting — "不消耗 stall 预算").
-    const inFlight = this.inFlightCount(goal, sessionID);
+    const inFlight = await this.inFlightCount(sessionID);
     if (inFlight > 0) {
       const quiet = goal.waitUntil !== undefined && Date.now() < goal.waitUntil;
       const last = this.lastInbox.get(sessionID);

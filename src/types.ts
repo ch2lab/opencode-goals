@@ -164,6 +164,16 @@ export interface PermissionHookInput {
  */
 export type PermissionDecision = { effect: "allow" | "deny"; message?: string };
 
+/** A running shell as reported by the host shell store (shell.list).
+ * Contract pinned 2026-10-17 (2.0.32 binary forensics): location-scoped and
+ * running-only ("Exited commands are not included"); metadata.sessionID
+ * attributes the shell to the session that started it (absent = unattributed). */
+export interface ShellEntry {
+  id: string;
+  status: string; // "running"
+  sessionID?: string;
+}
+
 /**
  * The probe the controller codes against. The real host (adapter, Task 7)
  * and the deterministic test harness (test/harness.ts) both implement it.
@@ -182,6 +192,7 @@ export interface WakeProbe {
   sessionGet(sessionID: string): Promise<{ location?: { directory?: string }; projectID?: string } | undefined>;
   inboxList(sessionID: string): Promise<InboxItem[]>;
   inboxCancel(inboxID: string): Promise<void>;
+  shellList(locationDirectory: string): Promise<ShellEntry[]>; // shell.list（宿主 shell store）
   projectID?: string;
   locationDirectory?: string;
   // —— 注册面（adapter 转真实 ctx；harness 记录供断言；hook 载荷字段以 2.0.29 .d.ts 为准）——

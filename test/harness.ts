@@ -20,6 +20,7 @@ import type {
   PermissionHookInput,
   PromptInput,
   SessionMessage,
+  ShellEntry,
   SyntheticInput,
   WakeProbe,
 } from "../src/types.ts";
@@ -60,6 +61,8 @@ export interface Harness {
   permissionDecisions: Array<PermissionDecision | undefined>;
   setSession(sessionID: string, settings: { location?: { directory?: string }; projectID?: string }): void; // sessionGet 后端
   setMessages(sessionID: string, messages: SessionMessage[]): void; // context() 后端
+  setShells(entries: ShellEntry[]): void; // host shell-store 后端（shell.list）；事件同步维护（见 emit）
+  failShellList(on: boolean): void; // 脚本化 shell.list 抛错（安全方向用例）
   commands: Map<string, (text: string, sessionID: string) => Promise<void>>;
   commandDescriptions: Map<string, string>; // 命令菜单里的友好描述（宿主 CommandDefinition.description）
   tools: Map<
@@ -255,6 +258,11 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
   const permissionFns: Array<(input: PermissionHookInput) => Promise<PermissionDecision | undefined>> = [];
   let inboxSeq = 0;
   let generateReply: string | ((input: { sessionID: string; prompt: string }) => string) = "";
+  // Host shell store (contract: location-scoped, running-only, self-pruning —
+  // "Exited commands are not included"). Maintained by emit() like the host;
+  // model-originated shells (no events on the real host) enter via setShells.
+  let shellStore: ShellEntry[] = [];
+  let shellListFail = false;
 
   const probe: WakeProbe = {
     projectID: typeof overrides?.projectID === "string" ? overrides.projectID : undefined,
@@ -317,6 +325,10 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
         }
       }
     },
+    shellList: async () => {
+      if (shellListFail) throw new Error("shell store query failed (scripted)");
+      return structuredClone(shellStore);
+    },
     registerCommand: (name, description, run) => {
       commands.set(name, run);
       commandDescriptions.set(name, description);
@@ -337,7 +349,22 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
 
   const harness: Harness = {
     probe,
-    emit: (event) => stream.emit(event),
+    emit: (event) => {
+      // Mirror the host: the shell store is host-maintained — started adds a
+      // running entry, ended removes it (exited shells are not in the store).
+      // On the real host, model-originated shells get NO events; such entries
+      // are injected directly via setShells in tests.
+      if (event.type === "session.shell.started") {
+        const p = event.properties as { sessionID?: string; shell?: { id?: string; status?: string } };
+        if (p?.sessionID !== undefined && p.shell?.id !== undefined) {
+          shellStore.push({ id: p.shell.id, status: p.shell.status ?? "running", sessionID: p.sessionID });
+        }
+      } else if (event.type === "session.shell.ended") {
+        const id = (event.properties as { shell?: { id?: string } })?.shell?.id;
+        if (id !== undefined) shellStore = shellStore.filter((e) => e.id !== id);
+      }
+      return stream.emit(event);
+    },
     storage,
     prompts,
     synthetics,
@@ -396,6 +423,12 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
     permissionDecisions,
     setSession: (sessionID, settings) => {
       sessions.set(sessionID, structuredClone(settings));
+    },
+    setShells: (entries) => {
+      shellStore = structuredClone(entries);
+    },
+    failShellList: (on) => {
+      shellListFail = on;
     },
     setMessages: (sessionID, msgs) => {
       messages.set(sessionID, structuredClone(msgs));

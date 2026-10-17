@@ -142,6 +142,7 @@ function toolCalled(id: string, sessionID = S): HostEvent {
 test("1: boundary with a waiting shell does not wake; shell.ended delivers the result wake (timeout / killed wording)", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Fast");
+  h.setSession(S, { location: { directory: "/w" } }); // the shell-store query needs the session's location
   await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }));
   await h.emit(succeeded("b1")); // boundary while waiting → no wake
   expect(h.prompts.length).toBe(0);
@@ -178,6 +179,7 @@ test("1: boundary with a waiting shell does not wake; shell.ended delivers the r
 test("2: late/duplicate shell.ended after the entry was dropped does not re-wake", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Late");
+  h.setSession(S, { location: { directory: "/w" } });
   await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }));
   await h.emit(shellEnded("x1", "sh1", "exited"));
   expect(h.prompts.length).toBe(1); // the one result wake
@@ -195,6 +197,7 @@ test("2: late/duplicate shell.ended after the entry was dropped does not re-wake
 test("3: progress check replied with pure text → the boundary stalls normally and carries its wake", async () => {
   const { h, stop } = await boot(resolveOptions({ watchdogTickMs: 1, checkInDelaySec: 1 }));
   await h.commandExecutor(S, "/goal set Text3");
+  h.setSession(S, { location: { directory: "/w" } });
   await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }));
   await h.emit(succeeded("b1")); // in-flight boundary → arm the one-shot check
   await waitFor(() => h.prompts.length === 1, 3000, "progress check-in");
@@ -215,6 +218,7 @@ test("3: progress check replied with pure text → the boundary stalls normally 
 test("4: cleanup — after stop() the tick is gone (no timer, no further activity)", async () => {
   const { h, ctrl, stop } = await boot(resolveOptions({ watchdogTickMs: 1, checkInDelaySec: 1 }));
   await h.commandExecutor(S, "/goal set Clean");
+  h.setSession(S, { location: { directory: "/w" } });
   await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }));
   await h.emit(succeeded("b1")); // arm → the tick is the deadline's heartbeat
   await waitFor(() => (ctrl as unknown as { wdTimers: Map<string, unknown> }).wdTimers.has(S), 2000, "tick armed");

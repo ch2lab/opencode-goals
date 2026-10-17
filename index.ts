@@ -261,6 +261,34 @@ export default Plugin.define({
         await callRpc("session.inbox.cancel", { sessionID, inboxID });
       },
 
+      // shell.list — the host shell store (contract pinned 2026-10-17 by
+      // 2.0.32 binary forensics): same jn-registered API family as
+      // session.inbox.list (the live-verified in-process channel precedent),
+      // direct input convention { location: { directory } }. Location-scoped,
+      // running-only ("Exited commands are not included"); entries carry
+      // metadata.sessionID for attribution. Non-array reply = contract
+      // violation → throw (the caller fails safe: treat as in-flight).
+      shellList: async (locationDirectory) => {
+        const raw = await callRpc("shell.list", { location: { directory: locationDirectory } });
+        if (!Array.isArray(raw)) {
+          throw new Error(`shell.list returned non-array (${JSON.stringify(raw)?.slice(0, 120)})`);
+        }
+        const out: Array<{ id: string; status: string; sessionID?: string }> = [];
+        for (const e of raw as Array<Record<string, unknown>>) {
+          if (typeof e !== "object" || e === null || typeof e.id !== "string") continue;
+          const metadata =
+            typeof e.metadata === "object" && e.metadata !== null
+              ? (e.metadata as Record<string, unknown>)
+              : undefined;
+          out.push({
+            id: e.id,
+            status: typeof e.status === "string" ? e.status : "running",
+            sessionID: typeof metadata?.sessionID === "string" ? metadata.sessionID : undefined,
+          });
+        }
+        return out;
+      },
+
       // ctx.command.transform(e => e.add(CommandDefinition { name,
       // description?, execute(input: CommandInvocation { sessionID,
       // prompt: { text }, delivery }) })) (plugin/dist/promise/command.d.ts).

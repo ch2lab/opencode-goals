@@ -1,8 +1,10 @@
 // Task 2 (plan 2026-10-17-background-checkin-gate): background in-flight gate.
 //
-// In-flight = goal.waitingShells.length + every OTHER active session of this
-// project (subtask sessions — no names, no parent links, COUNT ONLY: ruling
-// "拿不到子任务或者shell名称不重要，我们只需要全程跟踪…数量 > 0").
+// In-flight = the goal session's OWN running shells in the host shell store
+// (shell.list — the host does not emit session.shell.* events for model-
+// originated background shells, so the store is the count's source) + every
+// OTHER active session of this project (subtask sessions — no names, no
+// parent links, COUNT ONLY: ruling "拿不到子任务或者shell名称不重要，我们只需要全程跟踪…数量 > 0").
 //
 // A terminal boundary with in-flight > 0 does NOT wake immediately (the
 // session is already "waiting"); its entire action is arming the one-shot
@@ -96,6 +98,7 @@ async function boot(overrides?: Record<string, unknown>): Promise<Boot> {
 test("1: regression — boundary with a waiting shell does not wake immediately (gate via the new count)", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set ShellGate");
+  h.setSession(S, { location: { directory: "/w" } }); // the store query needs the session's location
   await h.emit(shellStarted("e1", "sh1"));
   await h.emit(succeeded("b1", S)); // boundary while in flight → no wake
   expect(h.prompts.length).toBe(0);
@@ -275,6 +278,7 @@ test("13: terminal guard - goal cleared after arming: no ghost reminder, checkin
 test("14: stale shell (started, no ended) - no self-heal, no permanent silence: the reminder rhythm keeps the session alive", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Stale14");
+  h.setSession(S, { location: { directory: "/w" } }); // the store query needs the session's location
   await h.emit(shellStarted("e1", "sh1")); // the shell never reports its end
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in flight (the stale shell) → arm
@@ -282,5 +286,44 @@ test("14: stale shell (started, no ended) - no self-heal, no permanent silence: 
   expect(h.prompts.length).toBe(1); // a reminder — never a fabricated "lost"
   expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
   expect(h.prompts[0].input.text).not.toContain("lost");
+  await stop();
+});
+
+// --- 2026-10-17 shell-store gate: the in-flight count comes from the host
+// shell store (shell.list), not from session.shell.* events (the host does
+// not emit them for model-originated background shells — root cause #12138). ---
+
+test("15: store-only shell (no events — the model's background shell) holds the boundary", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Store15");
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "shX", status: "running", sessionID: S }]); // store truth, no events
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // own running shell in the store → hold (no wake)
+  expect(h.prompts.length).toBe(0);
+  await stop();
+});
+
+test("16: another session's shell in the same location is not counted → immediate wake", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Other16");
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "shY", status: "running", sessionID: "someone-else" }]);
+  await modelWorked(h, "b");
+  await h.emit(succeeded("b1", S)); // no shell of ours in flight → ordinary wake
+  expect(h.prompts.length).toBe(1);
+  await stop();
+});
+
+test("17: query failure → treat as in-flight (safe direction: no wake, no throw, check-in still fires)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Fail17");
+  h.setSession(S, { location: { directory: "/w" } });
+  h.failShellList(true);
+  await modelWorked(h, "c");
+  await h.emit(succeeded("b1", S)); // query throws → in-flight → hold + arm
+  expect(h.prompts.length).toBe(0);
+  await sleep(1500); // the armed one-shot still fires (no permanent silence)
+  expect(h.prompts.length).toBe(1);
   await stop();
 });
