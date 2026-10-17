@@ -377,3 +377,19 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 - 语义证据验证（裁判带 shell 执行权跑真实检查）；
 - TUI 侧边栏 widget（`rpc` 域预留；参考项目 issue #3 教训：宿主 JSX transform 不处理 node_modules 下 `.tsx`，widget 必须预编译成 `dist/*.js` 随包发布）；
 - 裁判可用 `ctx.generate.text({ model })` 指定更便宜的模型。
+
+## 17. 2026-10-17 修订（数据面通道变更）
+
+§77（门禁 shell 查询走 `ctx.rpc.call`，见 §7 与上文）在 2.0.32 **不成立**：进程内 `ctx.rpc` 是**宿主→插件**的注册面通道，插件侧查询不可用（2.0.32 全链自测 19 个候选域全 "RPC is unavailable"）——§77 的初选错误。数据面改为宿主自身的 **HTTP client 面**（实施计划与契约钉死：`docs/superpowers/plans/2026-10-17-http-data-plane.md`）：
+
+- **发现**：`%USERPROFILE%\.local\state\opencode\service.json`（XDG_STATE_HOME 可重定向）`{id, version, url, pid, password}`；Basic 鉴权（username 固定 `opencode`）；注册文件 `pid` 自识别（mismatch = 查询失败）。
+- **端点**：`GET /api/shell?location.directory=` / `GET /api/session/:id/inbox` / `DELETE /api/session/:id/inbox/:inboxID`（404 `SessionNotFoundError` → 空列表 / 已完成语义）。
+- **裁定（2026-10-17）**：查询失败 = 宿主上下文死亡 → 边界 **skip**（不唤醒、不武装 check-in、不消耗 stall 预算）+ 决策日志一行（`<tempdir>/opencode-goal/decisions-<hostpid>.jsonl`，wake/hold/skip 各一行）+ 每会话一次 warn；**复活会话不是插件的活**。权限沙箱：**读放行、只限写**（`WRITE_ACTIONS = [fs.write]`，不可区分的 action 一律不表态）。
+- **实机验证（2026-10-17，2.0.32 一次性隔离宿主，13/13 全绿）**：`scripts/verify-hostapi.ts`——注册文件落点 / pid 契约 / 受管端口 / 本地源码插件加载（`/goal` 注册）/ hold 真计数（`own=1, ownKnown=true`）/ 无即时唤醒 / check-in 真计数 / 界外读无 plugin deny / 活 `service.json` mtime 不变 / 数据目录隔离（`XDG_DATA_HOME`）。
+
+宿主侧发现（2.0.32，无头 `serve --service`，实证）：
+
+1. shell 列表是**每位置一份的内存表**（仅 `status=running`；`POST /api/shell` 等创建路径进表）——location 查询参数**不路由位置**（所有请求落默认位置），非默认位置的在飞 shell 对列表不可见（宿主缺口；桌面端未实证）。
+2. `XDG_CONFIG_HOME` 对**主配置不生效**（该处配置文件只被 watcher 订阅、不被读取——模型会静默回退内置默认）；显式配置源 env `OPENCODE_CONFIG_CONTENT` 生效（隔离验证宿主依赖它）；受管服务端口文件 `<XDG_CONFIG_HOME>/opencode/service.json` 有效。
+3. 2.0.32 的 command 端点 body 为 `{ name, text }`（2.0.29 协议为 `{ text }`）。
+4. **模型会自行终止 goal**（model-side completion）：goal 终态后所有边界静默 no-op、check-in 被 ghost 规则 disarm——长跑场景的 goal 文案须显式禁止模型自行 complete（验证脚本 `HOLD-FOREVER` 文案即此用途）。

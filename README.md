@@ -170,12 +170,30 @@ All 8 tools declare the `goal.control` permission; one-line gating rule per tool
 - **fail-closed 原则**：在飞事实只靠事件计数，事件丢失至多让进展检查延迟、绝不产生假唤醒；裁判输出不可解析 → give up；证据不达标 → 视为未完成。
   **fail-closed**: in-flight facts are event-counted — a lost event can at most delay the progress check, never cause a false wake; unparseable judge output → give up; insufficient evidence → treated as not done.
 
+## 数据面（宿主数据面）· Data plane
+
+插件经宿主自身的 **HTTP client 面**读取宿主状态（进程内 `ctx.rpc` 是宿主→插件的注册面，插件→宿主的查询在 2.0.32 不可用——2026-10-17 修订，见 spec 附录 §17）：
+
+- **发现**：`%USERPROFILE%\.local\state\opencode\service.json`（`XDG_STATE_HOME` 可重定向）：`{id, version, url, pid, password}`——受管服务的注册文件。
+- **鉴权**：HTTP Basic，username 固定 `opencode`，password 取自注册文件。
+- **自识别**：注册文件 `pid` 必须等于加载本插件的宿主进程 pid；mismatch / 解析失败 → 走查询失败路径（绝不猜测、绝不连错宿主）。
+- **端点**：`GET /api/shell?location.directory=<abs>`（在飞后台 shell）、`GET /api/session/:id/inbox`、`DELETE /api/session/:id/inbox/:inboxID`（404 `SessionNotFoundError` = 空列表 / 已完成的语义，不是错误）。
+- **三态信号**：在飞信号为 `{own, other, ownKnown}`——查询失败报 `own=0, other=0, ownKnown=false`（不假报计数）：该边界 **skip**（不唤醒、不武装 check-in、不消耗 stall 预算）——宿主上下文已死，复活会话不是插件的活。每个 wake / hold / skip 各写一行 **决策日志** `<tempdir>/opencode-goal/decisions-<hostpid>.jsonl`（append-only，best-effort）。
+
+The plugin reads host state over the host's own **HTTP client surface** (in-process `ctx.rpc` is the host→plugin registration channel; plugin→host queries are unavailable on 2.0.32 — 2026-10-17 revision, spec appendix §17):
+
+- **Discovery**: `%USERPROFILE%\.local\state\opencode\service.json` (`XDG_STATE_HOME`-redirectable): `{id, version, url, pid, password}` — the managed-service registration file.
+- **Auth**: HTTP Basic, username fixed `opencode`, password from the registration file.
+- **Self-identification**: the registration file's `pid` must equal the host process that loaded this plugin; mismatch / parse failure → the query-failure path (never guess, never connect to the wrong host).
+- **Endpoints**: `GET /api/shell?location.directory=<abs>` (in-flight background shells), `GET /api/session/:id/inbox`, `DELETE /api/session/:id/inbox/:inboxID` (a 404 `SessionNotFoundError` = empty-list / already-done semantics, not an error).
+- **Tri-state signal**: the in-flight signal is `{own, other, ownKnown}` — a failed query reports `own=0, other=0, ownKnown=false` (never a fake count): that boundary is **skipped** (no wake, no check-in arm, no stall budget spend) — the host context is dead, and reviving sessions is not the plugin's job. Every wake / hold / skip appends one line to the **decision log** `<tempdir>/opencode-goal/decisions-<hostpid>.jsonl` (append-only, best-effort).
+
 ## 已知限制（2.0.29 宿主实测）· Known Limitations (measured on host 2.0.29)
 
 1. **CLI serve 形态不向模型暴露插件工具**：插件注册成功，但模型调用任何 `goal_*` 均被宿主拒绝；**桌面端运行时完整可用**（8 个工具全部对模型可见）。影响：CLI 形态下模型侧终态动作（`goal_complete` 等）不可用，无人值守收尾只能靠停滞/预算终态或用户侧 `/goal` 命令。
    **The CLI serve form does not expose plugin tools to the model**: the plugin registers fine, but the host rejects any `goal_*` call; **the desktop app runtime is fully functional** (all 8 tools visible to the model). Consequence: in the CLI form, model-side terminal actions (`goal_complete`, …) are unavailable — unattended closure relies on stall/budget terminals or the user-side `/goal` commands.
-2. **插件 RPC bridge 够不到宿主核心方法**（`server.shell/list` 等返回 400）：插件不做 shell 主动探测（零探测裁决，2026-10-17），只走宿主 `session.shell.started/ended` 事件流——该 bridge 限制不再影响插件；在飞计数纯靠事件，事件丢失至多退化为进展检查延迟。
-   **The plugin RPC bridge cannot reach host core methods** (e.g. `server.shell/list` → 400): the plugin does no active shell probing (zero-probe ruling, 2026-10-17) and rides the host's `session.shell.started/ended` event stream only — the bridge limitation no longer affects the plugin; the in-flight count is event-based, a lost event degrades to a delayed progress check at worst.
+2. **插件→宿主数据通道 = HTTP client 面（2026-10-17 变更）**：进程内 `ctx.rpc`（宿主→插件注册面）在 2.0.32 对插件侧查询不可用——早期的"零探测、纯事件流"裁决已被替换：门禁走 shell store 查询（`GET /api/shell`），check-in / 取消走 inbox 读删（见"数据面"节）；看门狗仍事件驱动（`session.shell.started/ended`）。
+   **The plugin→host data channel is the HTTP client surface (2026-10-17 change)**: in-process `ctx.rpc` (the host→plugin registration channel) is unavailable for plugin-side queries on 2.0.32 — the earlier zero-probe / events-only ruling is replaced: the gate queries the shell store (`GET /api/shell`), and check-ins / cancellations read and delete inbox items (see the Data plane section); the watchdog remains event-driven (`session.shell.started/ended`).
 3. **唤醒投递的两级语义**：宿主只在会话 idle 时投递 queued inbox 项；模型自己的回合进行中（含阻塞在 `question` 表单）投递被推迟——宿主调度行为，非插件缺陷。
    **Two-level wake delivery**: the host delivers queued inbox items only when the session is idle; delivery is deferred while the model's own turn is in flight (including when blocked on a `question` form) — host scheduling behavior, not a plugin defect.
 4. **宿主重启**（idle 等 shell 时杀 service 重启）：shell 记录消失且宿主不发任何取消通知；插件不做重启对账（2026-10-17 已删），僵尸 waiting shell 保留为持久事实，退化为周期性进展检查的节奏，宿主自身的重启清扫恢复会话、下一个边界重新武装门禁。
@@ -184,6 +202,8 @@ All 8 tools declare the `goal.control` permission; one-line gating rule per tool
    **Host-native recovery not triggered** (killing the serve process mid-turn and restarting): no restart synthetic message, no suspended-session sweep — verified in the serve form.
 6. **宿主 quirk**：未配置模型时宿主回退到内置 `exo-free`（已废弃）；`POST /api/session/:id/shell` 的响应在 **shell 退出时才返回**（长脚本会挂住 POST）。
    **Host quirk**: with no model configured the host falls back to the built-in (deprecated) `exo-free`; the `POST /api/session/:id/shell` response only returns **when the shell exits** (long scripts hang the POST).
+7. **2.0.32 无头 `serve --service` 的位置路由缺口（2026-10-17 实机实证）**：shell 列表（`GET /api/shell`）是**每位置一份的内存表**（仅列 `status=running`），而 location 查询参数（`location.directory` / `directory`）**不切换位置**——所有请求都落到默认（home）位置；非默认位置里在飞的 shell（含模型自己起的后台 shell）对列表不可见 → 在飞门禁（hold 判定）只覆盖默认位置 store 里可见的 shell。宿主侧缺口（是否上报由用户拍板）；桌面端行为未实证（不探活服务）。
+   **2.0.32 headless `serve --service` location-routing gap (verified 2026-10-17)**: the shell list (`GET /api/shell`) is a **per-location in-memory table** (lists only `status=running`), and the location query params (`location.directory` / `directory`) **do not switch locations** — every request lands on the default (home) location; in-flight shells in a non-default location (including the model's own background shells) are invisible to the list, so the in-flight gate (hold decision) only covers shells visible in the default location's store. A host-side gap (whether to report upstream is the user's call); desktop behavior untested (the live service is not probed).
 
 ## 开发 · Development
 
