@@ -7,4 +7,5 @@ dist/
 memory.jsonc
 
 .publish-kit/
+AGENTS.local.md
 
