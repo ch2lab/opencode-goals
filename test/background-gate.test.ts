@@ -2,14 +2,21 @@
 //
 // In-flight = the goal session's OWN running shells in the host shell store
 // (shell.list — the host does not emit session.shell.* events for model-
-// originated background shells, so the store is the count's source) + every
-// OTHER active session of this project (subtask sessions — no names, no
-// parent links, COUNT ONLY: ruling "拿不到子任务或者shell名称不重要，我们只需要全程跟踪…数量 > 0").
+// originated background shells, so the store is the count's source).
 //
-// A terminal boundary with in-flight > 0 does NOT wake immediately (the
-// session is already "waiting"); its entire action is arming the one-shot
-// progress check (fires in Task 3). Any session activity cancels the timer;
-// each in-flight boundary re-arms it (the clock only runs while quiescent).
+// 2026-10-18 ruling (129 incident, then refined): "other" active sessions NO
+// LONGER gate as a blanket — different sessions are DIFFERENT tasks, and the
+// old blanket count let the user's interactive session hold the campaign
+// goal's loop. Instead, `other` is now ATTRIBUTED via the host's
+// Session.Info.parentID chain: only a sibling session that is a SUBTASK of
+// THIS session (its ancestors include this sessionID) is counted. A foreign
+// session (no parent link to us) is invisible to the gate.
+//
+// A terminal boundary with in-flight (own shells + attributed subtask
+// sessions) > 0 does NOT wake immediately (the session is already "waiting");
+// its entire action is arming the one-shot progress check (fires in Task 3).
+// Any session activity cancels the timer; each in-flight boundary re-arms it
+// (the clock only runs while quiescent).
 //
 // Time control follows the house pattern (watchdog.test.ts): real timers with
 // small option values (checkInDelaySec 1s = the 1-second minimum) + STATE
@@ -107,12 +114,23 @@ test("1: regression — boundary with a waiting shell does not wake immediately 
   await stop();
 });
 
-test("2: NEW gate — boundary with an active subtask session (no shells) does not wake immediately", async () => {
+test("2: 2026-10-18 ruling — an active FOREIGN session (no parent link to us) does NOT gate → immediate wake", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set ChildGate");
-  await h.emit(started("c1", CHILD)); // subtask session goes active
+  await h.emit(started("c1", CHILD)); // another session, NO parentID → a different task
   await modelWorked(h, "a");
-  await h.emit(succeeded("b1", S)); // goal-session boundary, in flight = 1 → no wake
+  await h.emit(succeeded("b1", S)); // in-flight = 0 (own shells 0, subtasks 0) → ordinary wake
+  expect(h.prompts.length).toBe(1);
+  await stop();
+});
+
+test("2c: a SUBTASK session (parentID = us) IS counted → gate holds, like the original intent", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set SubtaskGate");
+  h.setSession(CHILD, { parentID: S }); // host record: CHILD is OUR subtask
+  await h.emit(started("c1", CHILD));
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // in-flight = 1 (our subtask) → no wake
   expect(h.prompts.length).toBe(0);
   await stop();
 });
@@ -134,14 +152,14 @@ test("3: regression — nothing in flight → the immediate wake is unchanged", 
   await stop();
 });
 
-test("4: another project's active session is not counted (sessionBelongs gate)", async () => {
+test("4: another project's active session does not gate (cross-project, observability only)", async () => {
   const { h, stop } = await boot({ projectID: "prj" });
   h.setSession(S, { projectID: "prj" });
   h.setSession(CHILD, { projectID: "other" });
   await h.commandExecutor(S, "/goal set CrossProj");
-  await h.emit(started("c1", CHILD)); // gated out: different project
+  await h.emit(started("c1", CHILD)); // a different project's session — never gates
   await modelWorked(h, "b");
-  await h.emit(succeeded("b1", S)); // in flight = 0 → immediate wake
+  await h.emit(succeeded("b1", S)); // own in-flight = 0 → immediate wake
   expect(h.prompts.length).toBe(1);
   await stop();
 });
@@ -149,9 +167,10 @@ test("4: another project's active session is not counted (sessionBelongs gate)",
 test("5: real session activity (a new turn starting) cancels the timer (no check-in after the deadline)", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Cancel");
-  await h.emit(started("c1", CHILD));
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
   await modelWorked(h, "a");
-  await h.emit(succeeded("b1", S)); // in-flight boundary → timer armed (1s)
+  await h.emit(succeeded("b1", S)); // own-in-flight boundary → timer armed (1s)
   await h.emit(started("c2", S)); // the session goes active again → cancel
   await sleep(1500); // past the deadline: a cancelled timer never fires
   expect(h.prompts.length).toBe(0);
@@ -161,9 +180,15 @@ test("5: real session activity (a new turn starting) cancels the timer (no check
 test("6: boundary storm while in flight — every boundary re-arms, no immediate wakes", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Storm");
-  await h.emit(started("c1", CHILD));
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  await h.emit(ev("session.inbox.enqueued", "i1", {
+    sessionID: S,
+    inboxID: "inbox_6",
+    item: { type: "user", payload: { text: "storm" }, delivery: "queue" },
+  })); // keep lastInbox = user so every boundary takes the hold path
   await modelWorked(h, "a");
-  await h.emit(succeeded("b1", S)); // arm
+  await h.emit(succeeded("b1", S)); // own-in-flight boundary → arm
   await modelWorked(h, "b"); // a full working turn in between (cancels, re-arms below)
   await h.emit(succeeded("b2", S)); // re-arm
   expect(h.prompts.length).toBe(0);
@@ -173,7 +198,8 @@ test("6: boundary storm while in flight — every boundary re-arms, no immediate
 test("7: goal_wait quiet — in-flight boundary arms nothing (no wake, no timer)", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Quiet");
-  await h.emit(started("c1", CHILD));
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
   const reply = await h.toolExecutor("goal_wait", { minutes: 1 }, S);
   expect(reply).toContain("will not be woken");
   await modelWorked(h, "a");
@@ -194,9 +220,10 @@ function turnsOf(ctrl: GoalController): Map<string, { active: boolean; toolCalle
 test("9: due fires exactly once - pinned reminder text + goalControl metadata; a re-arm after activity fires again", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Fire9");
-  await h.emit(started("c1", CHILD));
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
   await modelWorked(h, "a");
-  await h.emit(succeeded("b1", S)); // in-flight boundary → arm (1s)
+  await h.emit(succeeded("b1", S)); // own-in-flight boundary → arm (1s)
   await sleep(1500); // past due: the 1ms tick fires the one-shot
   expect(h.prompts.length).toBe(1);
   expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
@@ -219,24 +246,17 @@ test("9: due fires exactly once - pinned reminder text + goalControl metadata; a
   await stop();
 });
 
-test("10: child terminal event LOST (overcount persists) - the reminder still fires; no silent deadlock", async () => {
-  const { h, stop } = await boot();
-  await h.commandExecutor(S, "/goal set Lost10");
-  await h.emit(started("c1", CHILD)); // the child NEVER reports a terminal boundary
-  await modelWorked(h, "a");
-  await h.emit(succeeded("b1", S)); // in flight = 1, forever
-  await sleep(1500);
-  expect(h.prompts.length).toBe(1); // the reminder fires despite the stale count
-  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
-  await stop();
-});
+// (test 10 dropped, 2026-10-18: it exercised the now-removed "other session
+// is in flight, forever" premise — other sessions no longer gate, so no
+// overcount scenario exists. The stale-OWN-shell case is test 14.)
 
 test("11: due passes while the session is ACTIVE (lost-started belt) - held; once idle the pending deadline fires", async () => {
   const { h, ctrl, stop } = await boot();
   await h.commandExecutor(S, "/goal set Hold11");
-  await h.emit(started("c1", CHILD));
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
   await modelWorked(h, "a");
-  await h.emit(succeeded("b1", S)); // arm (1s)
+  await h.emit(succeeded("b1", S)); // own-in-flight boundary → arm (1s)
   // simulate a lost execution.started: the host is active but we never saw it
   turnsOf(ctrl).set(S, { active: true, toolCalled: false });
   await sleep(1500); // due passes while active: the tick holds, the deadline stays pending
@@ -250,7 +270,8 @@ test("11: due passes while the session is ACTIVE (lost-started belt) - held; onc
 test("12: quiet (goal_wait window) covers the deadline - no reminder is injected", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Quiet12");
-  await h.emit(started("c1", CHILD));
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
   await h.toolExecutor("goal_wait", { minutes: 1 }, S); // waitUntil in force
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight boundary inside the window → armed nothing
@@ -262,9 +283,10 @@ test("12: quiet (goal_wait window) covers the deadline - no reminder is injected
 test("13: terminal guard - goal cleared after arming: no ghost reminder, checkinDue cleared, tick disarmed", async () => {
   const { h, ctrl, stop } = await boot();
   await h.commandExecutor(S, "/goal set Guard13");
-  await h.emit(started("c1", CHILD));
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
   await modelWorked(h, "a");
-  await h.emit(succeeded("b1", S)); // arm (1s)
+  await h.emit(succeeded("b1", S)); // own-in-flight boundary → arm (1s)
   // /goal clear is fail-closed: it needs a user clear request in the transcript
   h.setMessages(S, [{ id: "m1", type: "user", text: "please discard the branch and stop the work" }]);
   await h.commandExecutor(S, "/goal clear");
@@ -401,9 +423,10 @@ test("19: skipped boundary logs skip (ownKnown false) and warns once per session
 test("21: late usage.updated / tool.called after a terminal boundary do NOT cancel the armed check-in", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Straggler21");
-  await h.emit(started("c1", CHILD));
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
   await modelWorked(h, "a");
-  await h.emit(succeeded("b1", S)); // in-flight boundary → arm (1s)
+  await h.emit(succeeded("b1", S)); // own-in-flight boundary → arm (1s)
   // the just-ended turn's bookkeeping events arrive AFTER the boundary
   // (turns[S].active is false now — the session is idle)
   await h.emit(usageUpdated("u1", S));
@@ -411,6 +434,37 @@ test("21: late usage.updated / tool.called after a terminal boundary do NOT canc
   await sleep(1500); // past the deadline: the uncancelled check-in fires
   expect(h.prompts.length).toBe(1);
   expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
+  await stop();
+});
+
+test("22: 2026-10-18 ruling — a foreign session is not counted at all: wake with own=0, other=0", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Ruling22");
+  h.setSession(S, { location: { directory: "/w" } });
+  await h.emit(started("c1", CHILD)); // different session, no parent link → invisible
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // in-flight = 0 → wake (not hold)
+  expect(h.prompts.length).toBe(1);
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("wake");
+  expect(line?.own).toBe(0);
+  expect(line?.other).toBe(0); // only attributed subtasks count
+  await stop();
+});
+
+test("22b: a subtask session (parentID = us) IS logged as other=1 and gates: hold, no wake", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set SubtaskLog22b");
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setSession(CHILD, { parentID: S });
+  await h.emit(started("c1", CHILD));
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // in-flight = 1 (our subtask) → hold
+  expect(h.prompts.length).toBe(0);
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("hold");
+  expect(line?.own).toBe(0);
+  expect(line?.other).toBe(1); // attributed subtask
   await stop();
 });
 

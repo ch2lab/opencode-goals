@@ -462,3 +462,14 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 
 - **修改**（`src/controller.ts` §15-9 resume 路径）：resume 时 `goal.blocker = undefined`——blocker 的历史留在线合（block 合成消息）里，活记录不再携带终态字段。
 - **测试**：`test/arbiter.test.ts` test 8 补 `expect(after.blocker).toBeUndefined()`（RED → GREEN）。
+
+## 24. 2026-10-18 修订（在飞门禁：other 按 host parentID 链归属——先裁定"不混"，再裁定"子任务要认得"）
+
+129 现场：campaign goal 的边界被 `other:2` 反复 hold。取证发现 `other` 数的不是 shell，是**其他正在跑模型回合的会话数**（2026-10-17 引入的 subtask 代理计数，无任何会话归属）——用户的交互会话把 campaign 的循环一直按住，check-in 文案还把忙碌会话数谎报成"background items in flight"。
+
+**用户裁定（两轮）**：① "两个独立会话是不同的任务，不能混的" → 外来的活跃会话不得门禁；② "子任务不能区分是哪个会话的子任务？" → 查宿主 2.0.32 schema 实证：`Session.Info.parentID`（`packages/schema/src/session.ts` L33）**存在**——当年"no parent links, COUNT ONLY"的判断是错的。
+
+- **修改**（`src/controller.ts`）：`inFlightSignal` 的 `other` 从"全部其他活跃会话"改为**父链归属**——新 `isSubtaskOf(sid, root)`：沿宿主 `sessionGet(sid).parentID` 链上溯（上限 8 跳，子代理深度有限），命中本会话才计 1；查询失败 fail-open 计 0（陌生会话永不 hold 循环）。门禁 `inFlight = own + other`（other 现在只含真子任务）；决策日志字段语义随之收窄（`other` = 归属子任务数）。
+- **效果**：用户的交互会话（无父链）对 campaign 完全不可见；模型自己派生的 subtask 会话（parentID 链连到本会话）仍按原设计意图计为在飞背景。
+- **测试**：`test/background-gate.test.ts` 全面改造——test 2 改"外来会话（无 parentID）不门禁→wake"；新增 2c（`setSession(CHILD,{parentID:S})` → 子任务门禁 hold）；新增 22（外来会话 wake 且 other=0）与 22b（子任务 hold 且 other=1）；原 5/6/7/9/11/12/13/21 的 CHILD 代理全部换成 own shell（`setShells`）；test 10 删除（"child 永不下线"前提随 blanket 计数一起消失）；`test/harness.ts` `setSession` 扩展 `parentID` 字段（RED → GREEN）。
+- 教训：探针看 `other` 字段时先假设它是 shell 数是错的——先读计数器实现再下结论；"当年不可得"的宿主能力要拿当前版本 schema 复核。

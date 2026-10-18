@@ -55,7 +55,7 @@ export interface Harness {
   permissions: Array<{ input: PermissionHookInput; error?: unknown }>;
   // R9: 每个回调调用的决定（throw 的回调记 undefined）
   permissionDecisions: Array<PermissionDecision | undefined>;
-  setSession(sessionID: string, settings: { location?: { directory?: string }; projectID?: string }): void; // sessionGet 后端
+  setSession(sessionID: string, settings: { location?: { directory?: string }; projectID?: string; parentID?: string }): void; // sessionGet 后端
   setMessages(sessionID: string, messages: SessionMessage[]): void; // context() 后端
   setShells(entries: ShellEntry[]): void; // host shell-store 后端（shell.list）；事件同步维护（见 emit）
   failShellList(on: boolean): void; // 脚本化 shell.list 抛错（信号不可用用例）
@@ -237,7 +237,7 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
 
   const stream = new EventStream();
   const storage = new Map<string, unknown>();
-  const sessions = new Map<string, { location?: { directory?: string }; projectID?: string }>();
+  const sessions = new Map<string, { location?: { directory?: string }; projectID?: string; parentID?: string }>();
   const messages = new Map<string, SessionMessage[]>();
   const inbox = new Map<string, InboxItem[]>();
   const cancelledInbox: string[] = [];

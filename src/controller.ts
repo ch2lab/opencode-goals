@@ -962,10 +962,39 @@ export class GoalController {
     let other = 0;
     if (ownKnown) {
       for (const sid of this.activeSessions.keys()) {
-        if (sid !== sessionID) other += 1;
+        // 2026-10-18 (amended ruling, 129 incident): count ONLY sessions
+        // whose host parentID chain leads back to THIS session — its
+        // subtasks. A foreign session (a different task — e.g. the user's
+        // interactive session) is invisible to the gate.
+        if (sid !== sessionID && (await this.isSubtaskOf(sid, sessionID))) other += 1;
       }
     }
     return { own, other, ownKnown };
+  }
+
+  /**
+   * 2026-10-18 (amended): does `sid` belong to `root`'s subtask tree — i.e.
+   * does its host session record's parentID chain (Session.Info.parentID)
+   * walk back to `root`? Different sessions are different tasks; only this
+   * session's own subtasks count as its in-flight background work.
+   * Fail-OPEN: a dead/unreadable session record is NOT a subtask (a
+   * stranger must never hold the loop). Bounded walk (subagent depth is
+   * small; 8 hops far exceeds any nesting).
+   */
+  private async isSubtaskOf(sid: string, root: string): Promise<boolean> {
+    let cur = sid;
+    for (let hop = 0; hop < 8; hop++) {
+      let info: { parentID?: string } | undefined;
+      try {
+        info = (await this.probe.sessionGet(cur)) as { parentID?: string } | undefined;
+      } catch {
+        return false;
+      }
+      if (info?.parentID === root) return true;
+      if (info?.parentID === undefined) return false;
+      cur = info.parentID;
+    }
+    return false;
   }
 
   private async arbitrateBoundary(sessionID: string, event: HostEvent): Promise<void> {
@@ -1115,18 +1144,27 @@ export class GoalController {
         await this.saveGoal(goal);
       }
     }
-    // Background in-flight gate (2026-10-17 ruling): a terminal boundary with
-    // ANY background work in flight — the goal's own running shells (host
-    // shell store, shell.list) OR other in-flight sessions of this project
-    // (subtask sessions) — does NOT inject
+    // Background in-flight gate (2026-10-17 ruling, 2026-10-18 amendment): a
+    // terminal boundary with this session's background work in flight — its
+    // OWN running shells (host shell store, shell.list) or its SUBTASK
+    // sessions (attributed via the host parentID chain) — does NOT inject
     // the ordinary wake; the session is already "waiting". The boundary's
     // entire action: arm the one-shot progress check (checkInDelaySec of
-    // silence, fired by the watchdog tick). Two exceptions keep normal
+    // silence, fired by the watchdog tick).
+    //
+    // 2026-10-18 amended ruling (129 incident): in-flight = this session's
+    // OWN running shells + its SUBTASK sessions (attributed via the host's
+    // parentID chain, see inFlightSignal/isSubtaskOf). Foreign sessions —
+    // different tasks (the user's interactive session, a separate campaign)
+    // — NEVER gate this goal's loop, and never appear in the check-in
+    // count (no more fake "background items in flight"). Two exceptions keep normal
     // arbitration: (a) the last inbox item is one of OUR watchdog wakes —
     // spec §7.1: a check-in replied with pure text counts per the stall
     // ladder; (b) goal_wait's waitUntil window silences EVERYTHING
     // (record only: no wake, no arm, no stall accounting — "不消耗 stall 预算").
     const { own, other, ownKnown } = await this.inFlightSignal(sessionID);
+    // Gate = own running shells + attributed subtask sessions (2026-10-18
+    // amended ruling); `other` in the decision log carries the same value.
     const inFlight = own + other;
     if (!ownKnown) {
       // Query failure = the host context is dead (2026-10-17 ruling): log +
@@ -1247,7 +1285,7 @@ export class GoalController {
         other,
         ownKnown: true,
         decision: "wake",
-        reason: `boundary (in-flight ${inFlight})`,
+        reason: `boundary (in-flight ${own + other})`,
       });
       // A provider-errored boundary wakes without counting the doomed turn.
       await this.injectWake(goal, !errored);
