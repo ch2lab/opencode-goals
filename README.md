@@ -32,7 +32,7 @@ This plugin gives the host a goal state machine + a wake mechanism, so the model
 | 停滞仲裁 Stall arbitration | 连续 N（默认 3）次"无动作"唤醒 → 旁路 LLM 裁判解读停滞原因（每 goal 至多 1 次）→ 继续 / 收尾 / 转人工；裁判输出不可解析 = give up，绝不伪造。 N consecutive no-action wakes (default 3) → a bypass LLM judge interprets the stall (at most once per goal) → continue / wrap up / hand off to a human; unparseable judge output = give up, never fabricated. |
 | 看门狗 Watchdog | 零主动检查：脚本退出 → 结果唤醒（纯事件驱动）；有后台工作在飞（shell/子任务会话）的边界不立即唤醒，武装一次性进展检查（静默 `checkInDelaySec` 秒后触发），期间任何活动取消它。 No active checking: script exit → result wake (event-driven); a boundary with in-flight background work (shells / subtask sessions) does not wake — it arms a one-shot progress check that fires after `checkInDelaySec` of silence, and any activity cancels it. |
 | 预算 Budget | 默认 10 turns；token 默认**仅统计、不设限**，上限可 opt-in（`--tokens N` / `defaultCapTokens`）。 Default 10 turns; tokens are stats-only by default — a cap is opt-in. |
-| 待办任务 Task list | 每 goal 至多 50 条，`todo / doing / done` 三态，`/goal view` 可见。 Up to 50 tasks per goal, `todo / doing / done` states, visible via `/goal view`. |
+| 待办任务 Task list | 每 goal 无上限（2026-10-18 裁定撤销 50 上限；结算历史归项目文档），`todo / doing / done` 三态，`/goal view` 可见。 Tasks per goal are uncapped (the old 50 limit was removed 2026-10-18; settled history belongs in project docs), `todo / doing / done` states, visible via `/goal view`. |
 | 等待声明 `goal_wait` | 模型声明"我在等"并挂起 N 分钟（整数 1–60），不消耗停滞预算。 The model declares "I'm waiting" and suspends for N minutes (integer 1–60), without consuming the stall budget. |
 
 ## 安装 · Install
@@ -98,7 +98,7 @@ git clone https://github.com/ch2lab/opencode-goals
 | `/goal block <reason>` | 标记受阻（原因必填；blocked 后任意用户消息即恢复）。 Mark blocked (reason required; any user message resumes it). |
 | `/goal clear` | 清除当前 goal（请求必须引用用户原话，fail-closed）。 Clear the goal (the request must quote the user's own words; fail-closed). |
 | `/goal history` | 本会话已归档 goal 列表。 List archived goals of this session. |
-| `/goal task add <title>` | 添加待办任务（每 goal 至多 50 条）。 Add a task (max 50 per goal). |
+| `/goal task add <title>` | 添加待办任务（无上限）。 Add a task (uncapped). |
 | `/goal task <n> <todo\|doing\|done>` | 改任务状态，`n` = 1-based 序号或任务 id。 Change a task's status; `n` = 1-based index or task id. |
 
 ### 典型流程 · Typical Flow
@@ -116,6 +116,8 @@ The model then enters the goal loop: it is woken at each execution boundary to k
 | option | 类型 Type | 默认 Default | 说明 Description |
 |---|---|---|---|
 | `stallLimit` | number | `3` | 连续无动作唤醒达到该数后进入停滞仲裁（旁路裁判）。 Consecutive no-action wakes before stall arbitration (bypass judge) kicks in. |
+| `providerFailLimit` | number | `2` | provider 失败暂停：连续 N 个"最后一条 assistant 消息带 provider 错误"的边界触发静默暂停——不唤醒、不烧 turn、不计 stall，每事故一条 synthetic 通知；干净边界自动恢复并清零连击。 Consecutive provider-error boundaries before a silent pause: no wakes, no turns burned, no stall count, one synthetic notice per incident; a clean boundary auto-resumes and resets the streak. |
+| `providerPauseMs` | number | `1800000` | provider 失败暂停时长（毫秒，默认 30 分钟）；到期发一条一次性重试唤醒，失败重试续期不重复通知。 Provider-failure pause duration in ms (default 30 min); a one-shot retry wake fires at expiry, and failed retries extend the pause without re-noticing. |
 | `defaultCapTurns` | number | `10` | 默认预算：turn 数（`/goal set` 未给 `--turns` 时生效）。 Default turn budget when `/goal set` omits `--turns`. |
 | `defaultCapTokens` | number | （无 none） | 默认 token 上限。**不设 = token 仅统计不限制**；设置后，未给 `--tokens` 的 goal 按此值设上限。 Default token cap. **Omitted = tokens are stats-only**; set it to cap goals that omit `--tokens`. |
 | `judgeEnabled` | boolean | `true` | 是否启用旁路裁判（其输出解析失败 = give up，fail-closed）。 Enable the bypass judge (unparseable output = give up, fail-closed). |
@@ -124,7 +126,7 @@ The model then enters the goal loop: it is woken at each execution boundary to k
 | `checkInDelaySec` | number | `300` | 后台等待门禁：边界上有后台工作（shell/子任务会话）在飞时不立即唤醒，静默达到这么多秒后触发一次进展检查；期间任何活动取消它。以秒为单位。 Background in-flight gate: a boundary with background work in flight (shells / subtask sessions) does not wake immediately; it arms a one-shot progress check after this many SECONDS of silence. Any activity cancels it. |
 | `timeoutWrap` | boolean | `false` | 是否强制为无超时脚本包装超时（opt-in）。开启后：有 active goal 时，宿主对 `timeout === 0` 的 spawn 把 `timeout` 就地改写为 `checkInDelaySec × 1000`（按"本实例有任一 active goal"判定，不做 per-shell 归属）。 Opt-in: while any goal in this instance is active, spawns with `timeout === 0` get `timeout` rewritten in place to `checkInDelaySec × 1000`. |
 | `wakeText` | string | （无 none） | 自定义唤醒文案；设置后作为末行 `补充指示: <wakeText>` 追加到边界/裁判降级唤醒消息（后台进展检查是独立文案，不套用）。 Custom wake text; appended as a final `补充指示: <wakeText>` line to boundary/judge-downgrade wake messages (the background progress check uses its own text). |
-| `wakeDetail` | `"full"` \| `"slim"` | `slim` | 边界/裁判降级唤醒消息在转录里的显示粒度。`slim`（默认）= 标题 + 一行"必须用工具调用结束本轮"触发语，共 2 行——目标由会话上下文携带，工具已暴露在系统提示，唤醒不再重述。`full` = 旧行为（唤醒消息内完整重述预算 + 目标 + 任务进度，强 re-grounding）。仅接受这两个字面值，其余回退默认。 Wake transcript footprint. `slim` (default) = header + one-line forced-tool-call trigger only (the objective rides the conversation context; the goal tools are exposed in the system prompt, so the wake re-states nothing); `full` = legacy behavior (budget + objective + task progress re-grounded inside the wake). Strict literal; other values fall back to the default. |
+| `wakeDetail` | `"full"` \| `"slim"` | `slim` | 边界/裁判降级唤醒消息在转录里的显示粒度。`slim`（默认）= 标题 + 一行 goal 模式自主提醒（无人值守按纪律推进、别停在提问上；停止只有 `goal_complete` / `goal_block`；用户消息永远优先），共 2 行——目标由会话上下文携带，工具已暴露在系统提示，唤醒不再重述。`full` = 唤醒消息内完整重述预算 + 目标 + 任务进度，附同一自主条款（强 re-grounding）。仅接受这两个字面值，其余回退默认。 Wake transcript footprint. `slim` (default) = header + one goal-mode autonomy line only (advance unattended per the goal's discipline, don't stall on questions; the only stops are `goal_complete` / `goal_block`; a user message always overrides — the objective rides the conversation context and the goal tools are exposed in the system prompt, so the wake re-states nothing); `full` = budget + objective + task progress re-grounded inside the wake, with the same autonomy clause. Strict literal; other values fall back to the default. |
 | `model` | string | （会话当前模型 session model） | 旁路生成（裁判 + 压缩摘要）所用模型，格式 `"providerID/modelID"`（如 `"ch2lab/Qwen3.8-Flash-Next"`）。**不设 = 跟随会话当前使用的模型**（逐会话，含会话内切换；会话无显式模型时回落宿主默认）。严格两段、非法格式告警并回退。 Model used for bypass generation (judge + compaction summary), `"providerID/modelID"`. **Omitted = follow the session's current model** (per-session, including mid-session switches; falls back to the host default when the session has no explicit model). Strict two-segment format; invalid values warn and fall back. |
 
 数值项只接受正整数、布尔项只接受 boolean 字面量，其余一律回退默认值（纯函数解析，无副作用）。
@@ -157,7 +159,7 @@ All 8 tools declare the `goal.control` permission; one-line gating rule per tool
 | `goal_block` | 需 active goal + 非空 reason。 Requires an active goal + non-empty reason. |
 | `goal_clear` | 需 active goal；请求必须引用用户原话（接地于非 assistant 消息，fail-closed）。 Requires an active goal; the request must quote the user's own words (grounded in non-assistant messages; fail-closed). |
 | `goal_history` | 只读，无 goal 也可用。 Read-only; works without a goal. |
-| `goal_add_task` | 需非终态 goal；每 goal 至多 50 条。 Requires a non-terminal goal; max 50 tasks per goal. |
+| `goal_add_task` | 需非终态 goal；账本无上限。 Requires a non-terminal goal; the task ledger is uncapped. |
 | `goal_update_task` | 需非终态 goal + 有任务；`status ∈ todo\|doing\|done`。 Requires a non-terminal goal with tasks; `status ∈ todo\|doing\|done`. |
 | `goal_wait` | 需 active goal；挂起唤醒 N 分钟（整数 1–60），声明"我在等"、不消耗停滞预算。 Requires an active goal; suspends the wake for N minutes (integer 1–60), declares "I'm waiting", does not consume the stall budget. |
 
