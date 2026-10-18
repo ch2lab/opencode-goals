@@ -155,6 +155,10 @@ test("1: boundary with a waiting shell does not wake; shell.ended delivers the r
   expect(t).toContain("timeout");
   expect(t).not.toContain("killed");
   expect(t).toContain("last output line"); // output tail carried
+  // 2026-10-18 autonomy ruling: reframed tail — no imperative forced-tool-call phrasing
+  expect(t).toContain("Goal mode:");
+  expect(t).toContain("next safe step");
+  expect(t).not.toContain("end this turn");
   expect(h.prompts[0].input.metadata?.goalControl).toBe(true);
   expect(h.prompts[0].input.delivery).toBe("queue");
   expect((goalOf(h)!.waitingShells ?? []).length).toBe(0);

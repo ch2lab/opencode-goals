@@ -449,3 +449,9 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 - **语义护栏**：① `goal_block` 保留为"需要用户决策"的合法等待出口（02:01 那次 block 等立项裁决是正确行为，不得误杀）；② "用户消息永远优先"条款防止自主权越过真人。
 - **强制力不变**：文案只是框架——既不 stop（complete/block）也不推进的空转回合仍由 stall 阶梯兜底，机制不动。
 - **测试**：`test/wake.test.ts` 两处模板钉改 + slim 新增 `not.toContain("End this turn")` 断言（RED → GREEN）。
+- **同批审查（用户下令"充分审查后再修改"）**：全部 8 个注入渠道逐一过审——
+  - `backgroundCheckInText`（后台静默一次性提醒）：尾句 "advance the goal" 命令式 → 改授权式（"check what finished, then take the next safe step per the goal's discipline…don't stall on a question to the user. A user message always overrides this reminder."）——check-in 时刻恰是"后台在跑、想干等/问人"场景，正是裁定要覆盖的。
+  - `shellExitText`（后台 shell 退出唤醒，controller 私有）：尾句 "Decide the next step; end this turn with a tool call" → "Goal mode: take the next safe step per the goal's discipline (act on this result, or make independent progress). A user message always overrides this reminder."
+  - `providerPauseRetryText`（断供暂停到期重试）：尾句 "say so and end this turn with a goal tool call" → 报告并停（"If a request still fails, note it in your reply — the loop auto-pauses and retries at the next deadline; a clean turn resumes."）——机制不变（边界解决暂停：errored 重新武装 / clean 清除），模型永不被逼重锤死 provider。
+  - 保留不动（各有理由）：`providerPauseNoticeText`（面向人的事故告警，非对模型逼迫）；goal 状态通知（纯事实，零命令）；judge instruction（judge LLM 自产自由文本）；compaction 提示词/摘要（非会话注入，摘要任务的指令式合理）。
+  - **测试**：`test/wake.test.ts` check-in 两钉改 + `providerPauseRetryText` 新钉 + `not.toContain("end this turn")`；`test/watchdog.test.ts` shell 退出断言补 "Goal mode:"/"next safe step"/无 "end this turn"（RED ×3 → GREEN）。

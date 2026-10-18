@@ -13,9 +13,15 @@ import type { GoalRecord } from "./state";
  * work (`inFlight` items — shells / subtask sessions) still in flight. Pure
  * reminder: the plugin does NO liveness checking of the background work
  * itself — the session (model) goes and checks.
+ *
+ * 2026-10-18 autonomy ruling: reframed from the imperative "…advance the
+ * goal." tail — this moment is exactly "background running, model tempted
+ * to wait/ask", so the line grants goal-mode autonomy (take the next safe
+ * step per the goal's discipline, don't stall on a question to the user) and
+ * carries the user-message-overrides clause, like the slim wake.
  */
 export function backgroundCheckInText(inFlight: number, waitSec: number): string {
-  return `Background check-in: ${inFlight} background item(s) in flight, no session activity for ${waitSec}s. Check progress: what finished, what is next — advance the goal.`;
+  return `Background check-in: ${inFlight} background item(s) in flight, no session activity for ${waitSec}s. Goal mode: keep working unattended — check what finished, then take the next safe step per the goal's discipline (verify the background result, or make independent progress); don't stall on a question to the user. A user message always overrides this reminder.`;
 }
 
 /**
@@ -32,9 +38,14 @@ export function providerPauseNoticeText(goalID: string, minutes: number): string
  * Watchdog retry wake fired at the pause deadline (watchdog text family —
  * no options.wakeText, like the check-in). If the provider is still down the
  * boundary re-arms the pause (no duplicate notice); a clean turn resumes.
+ *
+ * 2026-10-18 autonomy ruling: the tail no longer commands "end this turn with
+ * a goal tool call" — the model only reports; the mechanism (boundary
+ * resolves the pause) is unchanged, the model is never forced to re-hammer a
+ * dead provider.
  */
 export function providerPauseRetryText(goalID: string): string {
-  return `Provider pause retry: model requests were failing with a provider error (quota/funds) — retrying goal ${goalID}. If the provider is still failing, say so and end this turn with a goal tool call.`;
+  return `Provider pause retry: model requests were failing with a provider error (quota/funds) — retrying goal ${goalID}. If a request still fails, note it in your reply — the loop auto-pauses and retries at the next deadline; a clean turn resumes. A user message always overrides this reminder.`;
 }
 
 /** Turns usage text: `used/cap`, or `used/(unbounded)` when cap is open. */

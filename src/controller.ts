@@ -289,7 +289,10 @@ function shellExitText(shellID: string, status: "exited" | "timeout" | "killed",
       : status === "killed"
         ? `The shell you were waiting for, ${shellID}, was killed (killed, terminated externally)`
         : `The shell you were waiting for, ${shellID}, exited (exit${exitCode !== undefined ? `, code ${exitCode}` : ""})`;
-  return `${head} — latest output tail:\n${tail ?? "(none)"}\nDecide the next step; end this turn with a tool call.`;
+  // 2026-10-18 autonomy ruling: reframed tail (was "Decide the next step; end
+  // this turn with a tool call.") — grant goal-mode autonomy instead of an
+  // imperative forced-tool-call; user-message-overrides clause for consistency.
+  return `${head} — latest output tail:\n${tail ?? "(none)"}\nGoal mode: take the next safe step per the goal's discipline (act on this result, or make independent progress). A user message always overrides this reminder.`;
 }
 
 export class GoalController {

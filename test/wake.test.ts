@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createGoal, type GoalRecord, type GoalTask } from "../src/state.ts";
-import { backgroundCheckInText, buildWakeMessage } from "../src/wake.ts";
+import { backgroundCheckInText, buildWakeMessage, providerPauseRetryText } from "../src/wake.ts";
 
 const NOW = 1_700_000_000_000;
 
@@ -208,15 +208,25 @@ test("full detail is the explicit opt-out (5th arg, same as the default)", () =>
 test("backgroundCheckInText: byte-pinned reminder (in-flight count + wait, English)", () => {
   const t1 = backgroundCheckInText(1, 300);
   expect(t1).toBe(
-    "Background check-in: 1 background item(s) in flight, no session activity for 300s. Check progress: what finished, what is next — advance the goal.",
+    "Background check-in: 1 background item(s) in flight, no session activity for 300s. Goal mode: keep working unattended — check what finished, then take the next safe step per the goal's discipline (verify the background result, or make independent progress); don't stall on a question to the user. A user message always overrides this reminder.",
   );
   const t3 = backgroundCheckInText(3, 90);
   expect(t3).toBe(
-    "Background check-in: 3 background item(s) in flight, no session activity for 90s. Check progress: what finished, what is next — advance the goal.",
+    "Background check-in: 3 background item(s) in flight, no session activity for 90s. Goal mode: keep working unattended — check what finished, then take the next safe step per the goal's discipline (verify the background result, or make independent progress); don't stall on a question to the user. A user message always overrides this reminder.",
   );
   // i18n ruling: plugin-generated text is CJK-free
   expect(/[一-鿿]/.test(t1)).toBe(false);
   expect(/[一-鿿]/.test(t3)).toBe(false);
+  // autonomy ruling (2026-10-18): no imperative forced-tool-call phrasing
+  expect(t1).not.toContain("end this turn");
+});
+
+test("providerPauseRetryText: byte-pinned retry wake (2026-10-18 reframe: report-and-stop, the loop auto-retries)", () => {
+  const t = providerPauseRetryText("g_abc");
+  expect(t).toBe(
+    "Provider pause retry: model requests were failing with a provider error (quota/funds) — retrying goal g_abc. If a request still fails, note it in your reply — the loop auto-pauses and retries at the next deadline; a clean turn resumes. A user message always overrides this reminder.",
+  );
+  expect(t).not.toContain("end this turn");
 });
 
 // --- empty tasks ---
