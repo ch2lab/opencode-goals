@@ -230,7 +230,7 @@ type GoalRecord = {
 - **门禁武装**：终态边界（`execution.succeeded/failed/idle`）到达时，若在飞后台工作 = 本 goal 的 `waitingShells.length` + 同 project 内其它在飞会话数（子任务会话，纯事件跟踪、goal 无关、不认名称/父子关系）之和 > 0 → **不立即唤醒**。边界的全部动作：武装一次性进展检查 `checkinDue = { due: now + checkInDelaySec×1000, inFlight }`（option `checkInDelaySec`，秒，默认 300）。
 - **时钟只在静默期走动**：任何会话活动（`started` / `tool.called` / `usage.updated` / `inbox.enqueued` / `shell.started` / `shell.ended`）取消计时；下一个在飞边界重新武装（全新倒计时）。
 - **触发**：看门狗 tick（周期 `watchdogTickMs`）见 deadline 到 + 会话 idle + 非 `goal_wait` 静默窗 → 一次性注入进展检查文案（英文 byte-pinned）："Background check-in: N background item(s) in flight, no session activity for Xs. Check progress: what finished, what is next — advance the goal." one-shot：fire 即删 deadline；到点但会话 active 或处于静默窗 → 不消费，下个合格 tick 再试（事件丢失的 belt）。
-- **两个例外保持正常仲裁**（§7.1 语义不变）：(a) 最后一条 inbox 是本插件看门狗唤醒 → 模型对进展检查的回复按 §8 stall 阶梯正常计数；(b) `goal_wait` 的 `waitUntil` 窗内一切静默（不唤醒、不武装、不数 stall）。
+- **两个例外保持正常仲裁**（§7.1 语义不变）：(a) 最后一条 inbox 是本插件看门狗唤醒 → 模型对进展检查的回复按 §8 stall 阶梯正常计数；(b) `goal_wait` 的 `waitUntil` 窗**只静默 check-in**（不武装、不触发，待存者出窗后触发）；边界唤醒、shell 退出唤醒与 stall 计数照常（窗内纯文本回应按 §7.2 计 stall——窗不是 stall 豁免，2026-10-18 裁定窄口径，见附录 §38）。
 - **shell 状态机纯事件驱动**：`session.shell.started` → `waitingShells` +1；`session.shell.ended` → −1，最后一个结束时投递结果唤醒（status 文案 + 输出尾部）。`waitingShells` 成员关系即 once-only 守卫。
 - **删除清单**（主动检查机制全部出码）：shell 事实探测（`shell.list` RPC + 防御解析 + fail-safe）、双信号 check-in（零增长 / 有增长久等）、tail 状态、重启对账、`exitNotified` 竞态守卫、options `shellStallMs`/`waitCheckInMs`；`timeoutWrap` 的 wrap 值改为 `checkInDelaySec × 1000`。
 - **失败方向**（事件丢失不死锁）：子任务终态事件丢失 → 计数永远偏高 → 退化为进展检查节奏，永不"永不唤醒"；shell 终态事件丢失 → 僵尸 `waitingShells` 条目同样退化。任何方向都不产生假唤醒。
@@ -531,3 +531,7 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 - **语义备注**：budget_limited resume 后 cap 照常强制——cap 未放宽时（当前无上调既有 goal cap 的命令）下一个边界会再次判 budget_limited（synthetic 通知写明 used/cap，自解释）。
 - **测试**：`test/goal-loop.test.ts` 16–18（blocked 恢复清 stale blocker + 唤醒；budget_limited 恢复唤醒；completed 硬终态不可恢复）。
 - **README**：`/goal resume` 与 `/goal block` 两行同步可恢复集。
+
+## 38. 2026-10-18 修订（goal_wait 静默窗裁定为窄口径：只静默 check-in，L233(b) 措辞修正）
+
+§7.2 的 `waitUntil` 窗三处表述自相矛盾（§5 字段注释与 §7.2 均为"check-in 不注入"窄口径，L233(b) 为"窗内一切静默（不唤醒、不武装、不数 stall）"宽口径）。2026-10-18 用户裁定**窄口径为准、代码零改动**：窗只静默 check-in（不武装、不触发、待存者出窗后触发）；边界唤醒、shell 退出唤醒（`onShellEnded` 逐 shell 结果唤醒本就不受 quiet 门控）与 stall 计数照常。理由：① spec 自身 2:1 偏窄；② 宽口径与 §7.2"纯文本'看着正常'不是有效回应"契约打架（窗内纯文本回应按 L193 语义就该计 stall）；③ 宽口径会让模型在窗内脚本早已结束时白睡到窗满，且窗到期无任何唤醒机制。L233(b) 已改写为窄口径表述。
