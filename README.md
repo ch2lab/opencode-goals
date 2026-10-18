@@ -27,12 +27,12 @@ This plugin gives the host a goal state machine + a wake mechanism, so the model
 
 | 机制 Mechanism | 作用 Effect |
 |---|---|
-| 目标循环 Goal loop | 每个执行边界（回合成功/失败、用户消息、脚本退出）至多唤醒一次；有后台工作在飞时不立即唤醒，静默期后武装一次性进展检查；模型继续推进，直到目标收尾或预算耗尽。 Wakes the model at most once per execution boundary (turn success/failure, user message, script exit); a boundary with background work in flight does not wake immediately — it arms a one-shot progress check after a silence window. |
+| 目标循环 Goal loop | 每个执行边界（回合成功/失败、会话空闲、脚本退出）至多唤醒一次；有后台工作在飞时不立即唤醒，静默期后武装一次性进展检查；模型继续推进，直到目标收尾或预算耗尽。 Wakes the model at most once per execution boundary (turn success/failure, session idle, script exit); a boundary with background work in flight does not wake immediately — it arms a one-shot progress check after a silence window. |
 | 证据门控 Evidence gate | `complete` 必须给出具体、可核查的证据（≥24 字符、锚定事实、接地于对话），否则视为未完成。 `complete` requires concrete, verifiable evidence (≥24 chars, fact-anchored, grounded in the conversation); otherwise it counts as not done. |
 | 停滞仲裁 Stall arbitration | 连续 N（默认 3）次"无动作"唤醒达到上限 → **默认直接把 goal 标记为 stalled**（停滞报告 + 归档，浮出给人裁决）；旁路 LLM 裁判是**可选**仲裁（`judgeEnabled` 开启时，停滞前每 goal 至多解读 1 次停滞原因：继续 / 收尾 / 转人工；裁判输出不可解析 = give up，绝不伪造）。 Consecutive no-action wakes (default 3) reaching the limit → **by default the goal is marked stalled outright** (stall report + archive, surfaced to the human); the bypass LLM judge is **opt-in** (with `judgeEnabled` on, it interprets the stall cause at most once per goal before stalling: continue / wrap up / hand off; unparseable judge output = give up, never fabricated). |
 | 看门狗 Watchdog | 零主动检查：脚本退出 → 结果唤醒（纯事件驱动）；有后台工作在飞（shell/子任务会话）的边界不立即唤醒，武装一次性进展检查（静默 `checkInDelaySec` 秒后触发），期间任何活动取消它。 No active checking: script exit → result wake (event-driven); a boundary with in-flight background work (shells / subtask sessions) does not wake — it arms a one-shot progress check that fires after `checkInDelaySec` of silence, and any activity cancels it. |
 | 预算 Budget | 默认 10 turns；token 默认**仅统计、不设限**，上限可 opt-in（`--tokens N` / `defaultCapTokens`）。 Default 10 turns; tokens are stats-only by default — a cap is opt-in. |
-| 待办任务 Task list | 每 goal 无上限（2026-10-18 裁定撤销 50 上限；结算历史归项目文档），`todo / doing / done` 三态，`/goal view` 可见。 Tasks per goal are uncapped (the old 50 limit was removed 2026-10-18; settled history belongs in project docs), `todo / doing / done` states, visible via `/goal view`. |
+| 待办任务 Task list | 每 goal 无上限（2026-10-18 裁定撤销 50 上限；结算历史归项目文档），`todo / doing / done` 三态，随唤醒消息/停滞报告/压缩 `[GOAL STATE]` 块呈现。 Tasks per goal are uncapped (the old 50 limit was removed 2026-10-18; settled history belongs in project docs), `todo / doing / done` states, surfaced in wake messages / stall reports / the compaction `[GOAL STATE]` block. |
 | 等待声明 `goal_wait` | 模型声明"我在等"并挂起 N 分钟（整数 1–60），不消耗停滞预算。 The model declares "I'm waiting" and suspends for N minutes (integer 1–60), without consuming the stall budget. |
 
 ## 安装 · Install
@@ -61,16 +61,16 @@ If the file already has a `plugins` array, just merge the entry in:
 }
 ```
 
-保存后宿主热重载即生效（2.0.29+ 已实测；不想等热重载就重启宿主）。装好后 `/goal` 出现在命令列表，插件状态显示 `active`。`options` 留空用默认值，可调项见下文 options 表。按版本钉住可写 `"@ch2lab/opencode-goals@1.0.3"`。
+保存后宿主热重载即生效（2.0.29+ 已实测；不想等热重载就重启宿主）。装好后 `/goal` 出现在命令列表，插件状态显示 `active`。`options` 留空用默认值，可调项见下文 options 表。按版本钉住可写 `"@ch2lab/opencode-goals@1.1.0"`。
 
-The host hot-reloads the plugin when the config changes (verified on 2.0.29+; restart the host if you prefer). After install, `/goal` appears in the command list and the plugin shows `active`. Leave `options` empty for the defaults; the tunables are in the options table below. Pin a version with `"@ch2lab/opencode-goals@1.0.3"`.
+The host hot-reloads the plugin when the config changes (verified on 2.0.29+; restart the host if you prefer). After install, `/goal` appears in the command list and the plugin shows `active`. Leave `options` empty for the defaults; the tunables are in the options table below. Pin a version with `"@ch2lab/opencode-goals@1.1.0"`.
 
 > 入口是剥离 wrapper 的零 import 变体（活宿主验证过的形态），对 `@opencode/plugin` 宿主版本漂移免疫。
 > The entry is a wrapper-stripped, zero-import variant (the host-verified form), immune to `@opencode/plugin` version drift.
 
-本地源码目录（开发/自测）：克隆源码仓库，入口 `index.ts` 可直接加载、无需构建（`@opencode/plugin` 需 pin 到宿主版本作类型依赖：`bun add -d @opencode/plugin@2.0.29`）：
+本地源码目录（开发/自测）：克隆源码仓库，入口 `index.ts` 可直接加载、无需构建（`@opencode/plugin` 需 pin 到宿主版本作 dev 依赖：`bun add -d @opencode/plugin@2.0.29`）：
 
-Local source directory (for development): clone the source repo; `index.ts` loads directly, no build needed (`@opencode/plugin` pinned to the host version as a type-only dev dependency: `bun add -d @opencode/plugin@2.0.29`):
+Local source directory (for development): clone the source repo; `index.ts` loads directly, no build needed (`@opencode/plugin` pinned to the host version as a dev dependency: `bun add -d @opencode/plugin@2.0.29`):
 
 ```bash
 git clone https://github.com/ch2lab/opencode-goals
@@ -101,6 +101,8 @@ git clone https://github.com/ch2lab/opencode-goals
 | `/goal task add <title>` | 添加待办任务（无上限）。 Add a task (uncapped). |
 | `/goal task <n> <todo\|doing\|done>` | 改任务状态，`n` = 1-based 序号或任务 id。 Change a task's status; `n` = 1-based index or task id. |
 
+每个子命令另注册独立细粒度命令（`/goal-set` / `/goal-view` / `/goal-pause` / `/goal-resume` / `/goal-complete` / `/goal-block` / `/goal-clear`），在 `/` 菜单逐行可见、参数帮助独立——裸 `/goal` 输出 usage 菜单。 Each subcommand is also registered as a fine-grained command (`/goal-set` / … / `/goal-clear`), visible as separate `/` menu lines with per-command argument help — bare `/goal` prints the usage menu.
+
 ### 典型流程 · Typical Flow
 
 ```
@@ -121,11 +123,11 @@ The model then enters the goal loop: it is woken at each execution boundary to k
 | `defaultCapTurns` | number | `10` | 默认预算：turn 数（`/goal set` 未给 `--turns` 时生效）。 Default turn budget when `/goal set` omits `--turns`. |
 | `defaultCapTokens` | number | （无 none） | 默认 token 上限。**不设 = token 仅统计不限制**；设置后，未给 `--tokens` 的 goal 按此值设上限。 Default token cap. **Omitted = tokens are stats-only**; set it to cap goals that omit `--tokens`. |
 | `judgeEnabled` | boolean | `false` | 是否启用旁路裁判（**默认关**：停滞上限到达时 goal 直接 stalled 并浮出给人；开启后输出解析失败 = give up，fail-closed）。 Enable the bypass judge (**default off**: at the stall limit the goal stalls and surfaces to the human; when on, unparseable output = give up, fail-closed). |
-| `judgeMaxPerGoal` | number | `1` | 每个 goal 裁判至多使用次数。 Max judge invocations per goal. |
+| `judgeMaxPerGoal` | number | `1` | 解析保留，但**行为 spec 固定为每 goal 至多 1 次**（防裁判/代理互踢环；设其他值无效）。 Resolved but **behavior is spec-fixed to at most once per goal** (anti judge/agent kick-loop; other values have no effect). |
 | `watchdogTickMs` | number | `30000` | 看门狗 tick 周期（每个 active goal 一个 timer）。 Watchdog tick period (one timer per active goal). |
 | `checkInDelaySec` | number | `300` | 后台等待门禁：边界上有后台工作（shell/子任务会话）在飞时不立即唤醒，静默达到这么多秒后触发一次进展检查；期间任何活动取消它。以秒为单位。 Background in-flight gate: a boundary with background work in flight (shells / subtask sessions) does not wake immediately; it arms a one-shot progress check after this many SECONDS of silence. Any activity cancels it. |
 | `timeoutWrap` | boolean | `false` | 是否强制为无超时脚本包装超时（opt-in）。开启后：有 active goal 时，宿主对 `timeout === 0` 的 spawn 把 `timeout` 就地改写为 `checkInDelaySec × 1000`（按"本实例有任一 active goal"判定，不做 per-shell 归属）。 Opt-in: while any goal in this instance is active, spawns with `timeout === 0` get `timeout` rewritten in place to `checkInDelaySec × 1000`. |
-| `wakeText` | string | （无 none） | 自定义唤醒文案；设置后作为末行 `补充指示: <wakeText>` 追加到边界/裁判降级唤醒消息（后台进展检查是独立文案，不套用）。 Custom wake text; appended as a final `补充指示: <wakeText>` line to boundary/judge-downgrade wake messages (the background progress check uses its own text). |
+| `wakeText` | string | （无 none） | 自定义唤醒文案；设置后作为末行 `Extra instruction: <wakeText>` 追加到边界/裁判降级唤醒消息（后台进展检查是独立文案，不套用）。 Custom wake text; appended as a final `Extra instruction: <wakeText>` line to boundary/judge-downgrade wake messages (the background progress check uses its own text). |
 | `wakeDetail` | `"full"` \| `"slim"` | `slim` | 边界/裁判降级唤醒消息在转录里的显示粒度。`slim`（默认）= 标题 + 一行 goal 模式自主提醒（无人值守按纪律推进、别停在提问上；停止只有 `goal_complete` / `goal_block`；用户消息永远优先），共 2 行——目标由会话上下文携带，工具已暴露在系统提示，唤醒不再重述。`full` = 唤醒消息内完整重述预算 + 目标 + 任务进度，附同一自主条款（强 re-grounding）。仅接受这两个字面值，其余回退默认。 Wake transcript footprint. `slim` (default) = header + one goal-mode autonomy line only (advance unattended per the goal's discipline, don't stall on questions; the only stops are `goal_complete` / `goal_block`; a user message always overrides — the objective rides the conversation context and the goal tools are exposed in the system prompt, so the wake re-states nothing); `full` = budget + objective + task progress re-grounded inside the wake, with the same autonomy clause. Strict literal; other values fall back to the default. |
 | `model` | string | （会话当前模型 session model） | 旁路生成（裁判 + 压缩摘要）所用模型，格式 `"providerID/modelID"`（如 `"ch2lab/Qwen3.8-Flash-Next"`）。**不设 = 跟随会话当前使用的模型**（逐会话，含会话内切换；会话无显式模型时回落宿主默认）。严格两段、非法格式告警并回退。 Model used for bypass generation (judge + compaction summary), `"providerID/modelID"`. **Omitted = follow the session's current model** (per-session, including mid-session switches; falls back to the host default when the session has no explicit model). Strict two-segment format; invalid values warn and fall back. |
 
@@ -139,8 +141,8 @@ Numbers must be positive integers, booleans must be boolean literals; anything e
   **One wake per boundary, and the wake message is a plain state message** — no special audit channel, no state escalation: the model decides how to continue from its own context; the loop never hijacks the host's normal conversation flow.
 - **fail-closed**：在飞事实只靠事件计数，事件丢失至多让进展检查延迟、绝不产生假唤醒；裁判输出不可解析 → give up；证据不达标 → 视为未完成；`clear` 未引用用户原话 → 拒绝。
   **fail-closed**: in-flight facts are event-counted — a lost event can at most delay the progress check, never cause a false wake; unparseable judge output → give up; insufficient evidence → treated as not done; `clear` without the user's own words → refused.
-- **控制面 / 数据面分权**：8 个 `goal_*` 工具统一声明专属权限动作 `goal.control`，插件只在"会话有 active goal 且归属本实例"时自授 allow（日志可审计）；数据面的路径沙箱永不放宽用户已配置的 deny。
-  **Control plane / data plane separation**: all 8 `goal_*` tools declare the dedicated permission action `goal.control`; the plugin self-grants allow only when "the session has an active goal and belongs to this instance" (audited in logs); the data-plane path sandbox never relaxes user-configured deny rules.
+- **控制面 / 数据面分权**：8 个 `goal_*` 工具统一声明专属权限动作 `goal.control`，插件只在"会话有 active goal 且归属本实例"时自授 allow；数据面的路径沙箱永不放宽用户已配置的 deny。
+  **Control plane / data plane separation**: all 8 `goal_*` tools declare the dedicated permission action `goal.control`; the plugin self-grants allow only when "the session has an active goal and belongs to this instance"; the data-plane path sandbox never relaxes user-configured deny rules.
 - **旁路生成默认跟随会话当前模型**，可用 `model` 钉一个更便宜的模型——裁判与压缩摘要不污染主对话上下文。
   **Bypass generation follows the session's current model by default**; pin a cheaper one via `model` — the judge and compaction summary never pollute the main conversation context.
 - **零运行时依赖**：发布入口是剥离 wrapper 的零 import 变体，对 `@opencode/plugin` 版本漂移免疫。
@@ -194,8 +196,8 @@ The plugin reads host state over the host's own **HTTP client surface** (in-proc
 
 1. **CLI serve 形态不向模型暴露插件工具**：插件注册成功，但模型调用任何 `goal_*` 均被宿主拒绝；**桌面端运行时完整可用**（8 个工具全部对模型可见）。影响：CLI 形态下模型侧终态动作（`goal_complete` 等）不可用，无人值守收尾只能靠停滞/预算终态或用户侧 `/goal` 命令。
    **The CLI serve form does not expose plugin tools to the model**: the plugin registers fine, but the host rejects any `goal_*` call; **the desktop app runtime is fully functional** (all 8 tools visible to the model). Consequence: in the CLI form, model-side terminal actions (`goal_complete`, …) are unavailable — unattended closure relies on stall/budget terminals or the user-side `/goal` commands.
-2. **插件→宿主数据通道 = HTTP client 面（2026-10-17 变更）**：进程内 `ctx.rpc`（宿主→插件注册面）在 2.0.32 对插件侧查询不可用——早期的"零探测、纯事件流"裁决已被替换：门禁走 shell store 查询（`GET /api/shell`），check-in / 取消走 inbox 读删（见"数据面"节）；看门狗仍事件驱动（`session.shell.started/ended`）。
-   **The plugin→host data channel is the HTTP client surface (2026-10-17 change)**: in-process `ctx.rpc` (the host→plugin registration channel) is unavailable for plugin-side queries on 2.0.32 — the earlier zero-probe / events-only ruling is replaced: the gate queries the shell store (`GET /api/shell`), and check-ins / cancellations read and delete inbox items (see the Data plane section); the watchdog remains event-driven (`session.shell.started/ended`).
+2. **插件→宿主数据通道 = HTTP client 面（2026-10-17 变更）**：进程内 `ctx.rpc`（宿主→插件注册面）在 2.0.32 对插件侧查询不可用——早期的"零探测、纯事件流"裁决已被替换：门禁走 shell store 查询（`GET /api/shell`），进展检查（check-in）走 queued 消息投递、取消是插件内存态（inbox 端点保留在数据面契约上，但不再用于 check-in 回路）；看门狗仍事件驱动（`session.shell.started/ended`）。
+   **The plugin→host data channel is the HTTP client surface (2026-10-17 change)**: in-process `ctx.rpc` (the host→plugin registration channel) is unavailable for plugin-side queries on 2.0.32 — the earlier zero-probe / events-only ruling is replaced: the gate queries the shell store (`GET /api/shell`); the progress check (check-in) is delivered as a queued message and cancelled in plugin memory (the inbox endpoints remain in the data-plane contract but are no longer part of the check-in loop); the watchdog remains event-driven (`session.shell.started/ended`).
 3. **唤醒投递的两级语义**：宿主只在会话 idle 时投递 queued inbox 项；模型自己的回合进行中（含阻塞在 `question` 表单）投递被推迟——宿主调度行为，非插件缺陷。
    **Two-level wake delivery**: the host delivers queued inbox items only when the session is idle; delivery is deferred while the model's own turn is in flight (including when blocked on a `question` form) — host scheduling behavior, not a plugin defect.
 4. **宿主重启**（idle 等 shell 时杀 service 重启）：shell 记录消失且宿主不发任何取消通知；插件不做重启对账（2026-10-17 已删），僵尸 waiting shell 保留为持久事实，退化为周期性进展检查的节奏，宿主自身的重启清扫恢复会话、下一个边界重新武装门禁。

@@ -488,3 +488,38 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 
 - **README 修正**（5 处）：机制表"停滞仲裁"行改为"默认直接 stalled，裁判为 opt-in"；`/goal view` 描述改与实际输出一致（状态/目标/预算，不含"停滞与裁判记录"——`viewGoal` 只输出这四段）；`stallLimit` 说明改默认停滞语义；`judgeEnabled` 默认值 `true` → `false`；典型流程"卡住时"句改默认 stalled 路径。
 - **语义**：默认行为 = 停滞上限到达 → `stallGoal`（停滞报告 + 归档，浮出给人）；`judgeEnabled: true` 时行为回到 §8（每 goal 至多 1 次仲裁，输出不可解析 = give up）。代码未变，纯文档对齐。
+
+## 32. 2026-10-16 修订（旁路生成通道：ctx.generate.text + model option，会话模型透传）
+
+主体 §8/§15-7 的"裁判走 `ctx.session.generate`（共享会话身份）"被替换：裁判与压缩摘要统一走**全局生成** `ctx.generate.text`（不挂在会话上，天然零污染）；模型选择三层 = option `model`（`"providerID/modelID"` 严格两段）> **会话自身模型**（`ctx.session.get` 回读，含会话内切换）> 宿主默认。`model` option 主体 §14 未列，属本修订引入。
+- **修改**：`index.ts` 适配器（generate 注入）、`src/options.ts`（`model` 解析 + `selectJudgeModel`）、`src/judge.ts` 通道改全局生成。
+- 主体 §8"通道：ctx.session.generate"、§15 决定 #7 的表述以本条为准（历史保留）。
+
+## 33. 2026-10-17 修订（尾部通道接地簇：context hook 移除 + wakeDetail slim + CJK 证据）
+
+主体 §7 的"双通道注入"（context hook 每轮注入 `[GOAL]` system part + 唤醒消息）与 §10 防线 2 不成立：**context hook 已整体移除**——插件不写任何 system part（防 LLM 前缀缓存失效），goal 接地全量迁到**尾部通道**（唤醒消息 + goal 创建消息 + compaction `[GOAL STATE]` 块）；`start()` 只注册 compaction hook。同簇裁定：
+- **wakeDetail option（`full`/`slim`，默认 `slim`）**：slim = 标题 + 一行自主提醒（唤醒不再重述预算/目标/任务——主体 §7 模板的"完整块"作废）；`full` = 完整 re-grounding。
+- **唤醒 prompt 不再携带 `resume: true`**（仅 `delivery: "queue"` + metadata 归属）；`PromptInput.resume` 字段保留恒 undefined。
+- **证据/clear 门控 CJK 扩展**（主体 §9 锚点清单超集）：锚点层 OR 入 CJK 关键词（测试|通过|完成|验证…）、clear 关键词正则加 CJK、接地分词对 CJK 连字串滑窗 bigram。原拉丁判据全保留。
+- **修改**：`src/wake.ts`（双模板 + slim 默认）、`src/options.ts`（wakeDetail 严格解析）、`src/evidence.ts`（CJK 层）、controller `start()`（hook 注册面收窄）。
+
+## 34. 2026-10-17/18 修订（控制器容错机制：单实例守卫 + CAS 写守卫 + project 归属关闭）
+
+主体无记录的三个 2026-10-17/18 现场事故驱动机制：
+- **单实例守卫**（热重载事故：宿主重跑 `setup()` 不 dispose 旧实例 → N 个消费者重复唤醒、turn 计数膨胀 2–3×）：`globalThis` Symbol 槽，`start()` 第一行（任何 await 之前）认领，接管前先停前任（10s 上限），被顶替者中止武装。
+- **goal 记录 CAS 写守卫**（Task 14 Fix 1）：`saveGoal` 写前探测 storage，`stored.updatedAt` 严格更新于 load 基线 → 丢弃写、返回 false；`finishGoal` 因此跳过归档、抑制终态声明（不 archive、不声称终态，UI 回报 "changed underneath"）。附带 `GoalRecord` 新增 `createdAt/updatedAt`（主体 §5 未列）。
+- **project 归属关闭**（主体 §6 ②"多 location 安全"作废）：适配器 `probe.projectID = undefined` → `sessionBelongs` 恒 true，全 session 可见；正当性 = 单实例前提（一进程一条事件流 + 一份 storage）。
+
+## 35. 2026-10-17/18 修订（仲裁顺序与面：预算前置、细粒度子命令、stallReport 定稿、permission 契约）
+
+- **仲裁顺序**：主体 §6 序列 ②（在飞门禁）与 ④（预算）互换——实际顺序 = 去重/续接窗 → active goal → **预算（isCapReached → budget_limited 终态 + 归档）** → provider 暂停（§20）→ 在飞门禁（hold/check-in）→ 归属。后果：在飞 shell 的边界上预算超顶直接判 budget_limited，而非 hold 住等下一边界。
+- **细粒度子命令**（2026-10-17 用户裁定，主体 §13 只记了单一 `/goal` 面）：`goal-set / goal-view / goal-pause / goal-resume / goal-complete / goal-block / goal-clear` 各注册独立命令（/ 菜单一行一条，逐行参数帮助），路由回同一 dispatchCommand。
+- **stallReport 结构定稿**：四段（objective / 任务快照 / 最后无动作原文 ≤3 轮 / Judge 段），**无"建议的下一步"段**（主体 §8 该句作废）。
+- **permission evaluate 契约**（2.0.32 实证，主体 §4"同旧插件同面"不成立）：宿主回调签名 `(input) => Promise<void>` **无返回通道**，决策靠原地改写 payload（`p.effect` / `p.message`）；代码内 TODO(task13) 标注未做实机终审。
+- **shell 退出唤醒**（主体 §7.2 措辞校准）：实际是**每个**曾入 waitingShells 的 shell 结束各投递一条结果唤醒（逐 shell 的 status/退出词/输出尾部），非"最后一个结束时投递一条"；测试 `test/watchdog.test.ts` 钉 per-shell 行为。
+
+## 36. 2026-10-18 修订（provider 暂停重试 one-shot 守卫：retrySent）
+
+§20 的"每个 deadline 恰发一条 retry wake"在实机有洞：retry 的边界事件丢失（§19 已实证的单条事件丢失模式）且有待存 check-in 阻止 disarm 时，看门狗存活、**每个 tick（30s）对同一过期窗口重复发 retry**——正是 §20 反对的"空转"。本地 2026-10-18 巡检审计发现（RED 测试实证：1 条 vs 实际 6 条）。
+- **修改**（`src/state.ts` / `src/controller.ts`）：`providerPause` 增 `retrySent?` 标志——tick 触发条件加 `retrySent !== true`，发后置位并持久化；暂停 re-arm 构造**全新**记录（新窗口重置 `retrySent`），clean 清除路径不变。
+- **测试**：`test/arbiter.test.ts` test 20（存活 check-in + 过期 pause + 多 tick → 恰 1 条 retry；RED 6→GREEN 1）。

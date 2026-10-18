@@ -12,7 +12,7 @@
 - 涉及"129 上现在是什么版本/什么代码"时：读 129 缓存目录的 package.json 与日志 entrypoint 实证，不得从 registry 状态推断。
 
 ## 命令（bun 工具链）
-- 测试 `bun test`（约 300 用例，秒级）；单文件 `bun test test/harness.test.ts`；单用例 `bun test -t "名称正则"`
+- 测试 `bun test`（311 用例，约 20s）；单文件 `bun test test/harness.test.ts`；单用例 `bun test -t "名称正则"`
 - 类型检查 `bun run typecheck`（tsc --noEmit）
 - 构建发布包 `bun run scripts/publish.mjs pack`（staging + 双硬门：strip 残留、tarball 文件清单；无需 auth）；`publish` 子命令 = npm publish（2026-10-18 起由 CI 代跑）
 - 测试两层：`test/*.test.ts` = 进程内 stub 宿主（`test/harness.ts`，快，可伪造 parentID/shell 等契约数据）；`scripts/host.ts` 的 `startHost()` = 本机隔离真实宿主（慢；lab LLM 需 env `OPENCODE_LAB_PROVIDER_BASE/KEY`）——宿主行为级结论必须出自后者（调用方：`scripts/verify-*.ts`、`probe-*.ts`）
