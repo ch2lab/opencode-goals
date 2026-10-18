@@ -29,7 +29,7 @@ This plugin gives the host a goal state machine + a wake mechanism, so the model
 |---|---|
 | 目标循环 Goal loop | 每个执行边界（回合成功/失败、用户消息、脚本退出）至多唤醒一次；有后台工作在飞时不立即唤醒，静默期后武装一次性进展检查；模型继续推进，直到目标收尾或预算耗尽。 Wakes the model at most once per execution boundary (turn success/failure, user message, script exit); a boundary with background work in flight does not wake immediately — it arms a one-shot progress check after a silence window. |
 | 证据门控 Evidence gate | `complete` 必须给出具体、可核查的证据（≥24 字符、锚定事实、接地于对话），否则视为未完成。 `complete` requires concrete, verifiable evidence (≥24 chars, fact-anchored, grounded in the conversation); otherwise it counts as not done. |
-| 停滞仲裁 Stall arbitration | 连续 N（默认 3）次"无动作"唤醒 → 旁路 LLM 裁判解读停滞原因（每 goal 至多 1 次）→ 继续 / 收尾 / 转人工；裁判输出不可解析 = give up，绝不伪造。 N consecutive no-action wakes (default 3) → a bypass LLM judge interprets the stall (at most once per goal) → continue / wrap up / hand off to a human; unparseable judge output = give up, never fabricated. |
+| 停滞仲裁 Stall arbitration | 连续 N（默认 3）次"无动作"唤醒达到上限 → **默认直接把 goal 标记为 stalled**（停滞报告 + 归档，浮出给人裁决）；旁路 LLM 裁判是**可选**仲裁（`judgeEnabled` 开启时，停滞前每 goal 至多解读 1 次停滞原因：继续 / 收尾 / 转人工；裁判输出不可解析 = give up，绝不伪造）。 Consecutive no-action wakes (default 3) reaching the limit → **by default the goal is marked stalled outright** (stall report + archive, surfaced to the human); the bypass LLM judge is **opt-in** (with `judgeEnabled` on, it interprets the stall cause at most once per goal before stalling: continue / wrap up / hand off; unparseable judge output = give up, never fabricated). |
 | 看门狗 Watchdog | 零主动检查：脚本退出 → 结果唤醒（纯事件驱动）；有后台工作在飞（shell/子任务会话）的边界不立即唤醒，武装一次性进展检查（静默 `checkInDelaySec` 秒后触发），期间任何活动取消它。 No active checking: script exit → result wake (event-driven); a boundary with in-flight background work (shells / subtask sessions) does not wake — it arms a one-shot progress check that fires after `checkInDelaySec` of silence, and any activity cancels it. |
 | 预算 Budget | 默认 10 turns；token 默认**仅统计、不设限**，上限可 opt-in（`--tokens N` / `defaultCapTokens`）。 Default 10 turns; tokens are stats-only by default — a cap is opt-in. |
 | 待办任务 Task list | 每 goal 无上限（2026-10-18 裁定撤销 50 上限；结算历史归项目文档），`todo / doing / done` 三态，`/goal view` 可见。 Tasks per goal are uncapped (the old 50 limit was removed 2026-10-18; settled history belongs in project docs), `todo / doing / done` states, visible via `/goal view`. |
@@ -91,7 +91,7 @@ git clone https://github.com/ch2lab/opencode-goals
 | 命令 Command | 说明 Description |
 |---|---|
 | `/goal set <objective> [--turns N] [--tokens N] [--unbounded]` | 启动目标。turns 未给用 options 默认（10）；tokens 默认仅统计、不限制（`--tokens N` 显式开启上限）；`--unbounded` = 不设 cap。 Start a goal. Omitted turns fall back to the options default (10); tokens are stats-only unless `--tokens N` sets a cap; `--unbounded` = no cap. |
-| `/goal view` | 查看当前 goal（状态 / 预算 / 待办 / 停滞与裁判记录）。 View the current goal (status / budget / tasks / stall & judge records). |
+| `/goal view` | 查看当前 goal（状态 / 目标 / 预算上限与已用）。 View the current goal (status / objective / cap & usage). |
 | `/goal pause` | 暂停当前 goal。 Pause the current goal. |
 | `/goal resume` | 恢复当前 goal。 Resume the current goal. |
 | `/goal complete <evidence>` | 标记完成（证据门控：长度/锚点/接地三层）。 Mark complete (evidence-gated). |
@@ -107,20 +107,20 @@ git clone https://github.com/ch2lab/opencode-goals
 /goal set 完成 auth 模块重构，保持所有测试通过 --turns 15
 ```
 
-模型随后进入目标循环：每个执行边界被唤醒继续推进；`/goal view` 随时查看进度；达成标准时模型自行 `goal_complete` 收尾（证据门控）；卡住时触发停滞仲裁（继续 / 收尾 / 转人工）；预算耗尽自动进入终态。
+模型随后进入目标循环：每个执行边界被唤醒继续推进；`/goal view` 随时查看进度；达成标准时模型自行 `goal_complete` 收尾（证据门控）；卡住时（连续无动作唤醒达 `stallLimit`）默认直接把 goal 标记为 stalled（报告留给人裁决），启用裁判时先仲裁一次（继续 / 收尾 / 转人工）；预算耗尽自动进入终态。
 
-The model then enters the goal loop: it is woken at each execution boundary to keep going; check progress any time with `/goal view`; when the bar is met it completes itself via `goal_complete` (evidence-gated); a stall triggers arbitration (continue / wrap up / hand off); an exhausted budget ends the goal automatically.
+The model then enters the goal loop: it is woken at each execution boundary to keep going; check progress any time with `/goal view`; when the bar is met it completes itself via `goal_complete` (evidence-gated); a stall (no-action wakes reaching `stallLimit`) marks the goal stalled by default (the report is for the human), or runs one judge arbitration first when enabled; an exhausted budget ends the goal automatically.
 
 ### Options（插件 `options` 字段）/ Options (the plugin's `options`)
 
 | option | 类型 Type | 默认 Default | 说明 Description |
 |---|---|---|---|
-| `stallLimit` | number | `3` | 连续无动作唤醒达到该数后进入停滞仲裁（旁路裁判）。 Consecutive no-action wakes before stall arbitration (bypass judge) kicks in. |
+| `stallLimit` | number | `3` | 连续无动作唤醒达到该数后进入停滞：默认直接把 goal 标记为 stalled；`judgeEnabled` 开启时先经一次旁路裁判仲裁再停滞。 Consecutive no-action wakes before the stall: by default the goal is stalled outright; with `judgeEnabled` on, a one-shot bypass-judge arbitration runs first. |
 | `providerFailLimit` | number | `2` | provider 失败暂停：连续 N 个"最后一条 assistant 消息带 provider 错误"的边界触发静默暂停——不唤醒、不烧 turn、不计 stall，每事故一条 synthetic 通知；干净边界自动恢复并清零连击。 Consecutive provider-error boundaries before a silent pause: no wakes, no turns burned, no stall count, one synthetic notice per incident; a clean boundary auto-resumes and resets the streak. |
 | `providerPauseMs` | number | `1800000` | provider 失败暂停时长（毫秒，默认 30 分钟）；到期发一条一次性重试唤醒，失败重试续期不重复通知。 Provider-failure pause duration in ms (default 30 min); a one-shot retry wake fires at expiry, and failed retries extend the pause without re-noticing. |
 | `defaultCapTurns` | number | `10` | 默认预算：turn 数（`/goal set` 未给 `--turns` 时生效）。 Default turn budget when `/goal set` omits `--turns`. |
 | `defaultCapTokens` | number | （无 none） | 默认 token 上限。**不设 = token 仅统计不限制**；设置后，未给 `--tokens` 的 goal 按此值设上限。 Default token cap. **Omitted = tokens are stats-only**; set it to cap goals that omit `--tokens`. |
-| `judgeEnabled` | boolean | `true` | 是否启用旁路裁判（其输出解析失败 = give up，fail-closed）。 Enable the bypass judge (unparseable output = give up, fail-closed). |
+| `judgeEnabled` | boolean | `false` | 是否启用旁路裁判（**默认关**：停滞上限到达时 goal 直接 stalled 并浮出给人；开启后输出解析失败 = give up，fail-closed）。 Enable the bypass judge (**default off**: at the stall limit the goal stalls and surfaces to the human; when on, unparseable output = give up, fail-closed). |
 | `judgeMaxPerGoal` | number | `1` | 每个 goal 裁判至多使用次数。 Max judge invocations per goal. |
 | `watchdogTickMs` | number | `30000` | 看门狗 tick 周期（每个 active goal 一个 timer）。 Watchdog tick period (one timer per active goal). |
 | `checkInDelaySec` | number | `300` | 后台等待门禁：边界上有后台工作（shell/子任务会话）在飞时不立即唤醒，静默达到这么多秒后触发一次进展检查；期间任何活动取消它。以秒为单位。 Background in-flight gate: a boundary with background work in flight (shells / subtask sessions) does not wake immediately; it arms a one-shot progress check after this many SECONDS of silence. Any activity cancels it. |

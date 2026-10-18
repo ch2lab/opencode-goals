@@ -481,3 +481,10 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 - **裁定**：不做日志持久化/轮转；改为 `GoalRecord.decisions = { wake, hold, skip, paused }` 四桶计数，每个边界决策点计数 +1（与决策日志行一一对应，`paused` = provider 暂停事故，日志里是带专属 reason 的 skip），随记录持久化 → **终态归档（`archived/<goalID>`）天生携带**：看一份归档就能回答"这个 goal 活着期间循环是否健康"（skip>0 = 宿主上下文死过；paused>0 = 断供过；wake 量级 = 唤醒节奏）。
 - **修改**：`src/state.ts`（`GoalDecisions` 类型 + `bumpGoalDecision` 懒初始化——旧记录无字段也安全）；`src/controller.ts` 五个决策点各一行（continuationPending skip / provider-pause→paused / host-dead skip / hold / wake）。`/goal view`（模型面）不加此字段——模型上下文不背审计数据。
 - **测试**：`test/goal-decisions.test.ts` 新增（单元：createGoal 零值 / 增量 / 旧记录懒初始化；控制器：四桶各一条路径 + complete 后归档键携带计数）。
+
+## 26. 2026-10-18 修订（补记 2026-10-17 裁定：旁路裁判默认关闭 + README 同步）
+
+§8（停滞阶梯 → 裁判仲裁）在 2026-10-17 已被裁定**默认关闭**（`options.ts` 注释留痕：`judgeEnabled: false`——裁判的唯一排他价值是救回停滞 goal，其失败模式退化为无裁判行为，129 场数据从未触发过（stalls=0）；停滞 goal 浮出给人是**预期的控制点**；`judgeEnabled: true` 可重新开启），但修订附录一直没记，README（npm 包文档）至今按"默认开启"描述。2026-10-18 用户指出后同步：
+
+- **README 修正**（5 处）：机制表"停滞仲裁"行改为"默认直接 stalled，裁判为 opt-in"；`/goal view` 描述改与实际输出一致（状态/目标/预算，不含"停滞与裁判记录"——`viewGoal` 只输出这四段）；`stallLimit` 说明改默认停滞语义；`judgeEnabled` 默认值 `true` → `false`；典型流程"卡住时"句改默认 stalled 路径。
+- **语义**：默认行为 = 停滞上限到达 → `stallGoal`（停滞报告 + 归档，浮出给人）；`judgeEnabled: true` 时行为回到 §8（每 goal 至多 1 次仲裁，输出不可解析 = give up）。代码未变，纯文档对齐。
