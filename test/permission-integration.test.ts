@@ -213,3 +213,25 @@ test("10: hook never throws — a rejecting sessionGet still resolves with undef
     await stop();
   }
 });
+
+test("12: paused goal — control plane self-grants (conversation resume), data plane stays silent (containment is active-only)", async () => {
+  const { h, stop } = await boot();
+  try {
+    h.setSession("s1", { location: { directory: "/proj" } });
+    await setGoal(h, "s1");
+    await h.commandExecutor("s1", "pause");
+    // Control plane: a goal record exists (any status) → goal.control allows,
+    // so goal_resume / goal_view are callable in conversation on a paused goal.
+    expect(
+      await h.permissionHook({ action: "goal.control", resources: [], sessionID: "s1", incoming: "ask" }),
+    ).toEqual({ effect: "allow" });
+    // Data plane: writes are still unopinionated while not active — containment
+    // applies only to an active goal (2026-10-18 ruling: control plane widened,
+    // data plane untouched).
+    expect(
+      await h.permissionHook({ action: "fs.write", resources: ["/etc/passwd"], sessionID: "s1", incoming: "ask" }),
+    ).toBeUndefined();
+  } finally {
+    await stop();
+  }
+});

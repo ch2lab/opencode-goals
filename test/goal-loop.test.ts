@@ -320,6 +320,79 @@ test("18: /goal resume rejects terminal states (completed stays hard-terminal, n
 });
 
 // ---------------------------------------------------------------------------
+// 19-21. conversation surface: goal_pause / goal_resume / goal_view tools
+// (2026-10-18 ruling — every /goal capability gets a tool face so the user
+// can manage the goal in plain conversation; the tools reuse the exact
+// command cores: tool/command equivalence, no behavior fork)
+// ---------------------------------------------------------------------------
+
+test("19: goal_pause tool pauses an active goal (conversation surface)", async () => {
+  const { h, stop } = await boot();
+  expect(await h.toolExecutor("goal_pause", {}, S)).toContain("no active goal");
+  await h.commandExecutor(S, "/goal set Pause via tool");
+  expect(await h.toolExecutor("goal_pause", {}, S)).toContain("paused");
+  expect(goalOf(h)!.status).toBe("paused");
+  expect(await h.toolExecutor("goal_pause", {}, S)).toContain("already paused");
+  await stop();
+});
+
+test("20: goal_resume tool resumes paused/blocked/budget_limited, refuses active and terminal", async () => {
+  const { h, stop } = await boot();
+  expect(await h.toolExecutor("goal_resume", {}, S)).toContain("no active goal");
+  await h.commandExecutor(S, "/goal set Resume via tool");
+  expect(await h.toolExecutor("goal_resume", {}, S)).toContain("already active");
+  // paused: silent restart, no wake
+  await h.toolExecutor("goal_pause", {}, S);
+  const before = h.prompts.length;
+  expect(await h.toolExecutor("goal_resume", {}, S)).toContain("resumed");
+  expect(goalOf(h)!.status).toBe("active");
+  expect(h.prompts.length).toBe(before); // paused keeps its no-wake behavior
+  // blocked: blocker cleared + one wake (same core as the command, §15-9)
+  await h.toolExecutor("goal_block", { reason: "waiting on vendor" }, S);
+  expect(goalOf(h)!.status).toBe("blocked");
+  expect(await h.toolExecutor("goal_resume", {}, S)).toContain("resumed");
+  expect(goalOf(h)!.status).toBe("active");
+  expect(goalOf(h)!.blocker).toBeUndefined();
+  expect(h.prompts.length).toBe(before + 1);
+  expect(h.prompts[h.prompts.length - 1].input.metadata?.goalWake).toBe(true);
+  // budget_limited: active + one wake (spec §11) — the previous goal must be
+  // terminal first (R7: set refuses while a non-terminal goal exists)
+  h.setMessages(S, [EVIDENCE_MESSAGE]);
+  await h.toolExecutor("goal_complete", { evidence: EVIDENCE }, S);
+  expect(goalOf(h)!.status).toBe("completed");
+  await h.commandExecutor(S, "/goal set Budgeted --tokens 100");
+  await h.emit(usage("u2", { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }));
+  await h.emit(started("s1b"));
+  await h.emit(succeeded("e1b"));
+  expect(goalOf(h)!.status).toBe("budget_limited");
+  const before2 = h.prompts.length;
+  expect(await h.toolExecutor("goal_resume", {}, S)).toContain("resumed");
+  expect(goalOf(h)!.status).toBe("active");
+  expect(h.prompts.length).toBe(before2 + 1);
+  // completed: hard terminal, refused, no wake
+  h.setMessages(S, [EVIDENCE_MESSAGE]);
+  await h.toolExecutor("goal_complete", { evidence: EVIDENCE }, S);
+  expect(goalOf(h)!.status).toBe("completed");
+  const before3 = h.prompts.length;
+  expect(await h.toolExecutor("goal_resume", {}, S)).toContain("not resumable");
+  expect(goalOf(h)!.status).toBe("completed");
+  expect(h.prompts.length).toBe(before3);
+  await stop();
+});
+
+test("21: goal_view tool reports status/objective/cap/usage without side effects", async () => {
+  const { h, stop } = await boot();
+  expect(await h.toolExecutor("goal_view", {}, S)).toContain("no active goal");
+  await h.commandExecutor(S, "/goal set View via tool");
+  const reply = await h.toolExecutor("goal_view", {}, S);
+  expect(reply).toContain("active");
+  expect(reply).toContain("View via tool");
+  expect(goalOf(h)!.status).toBe("active"); // read-only
+  expect(h.prompts.length).toBe(0); // no wake
+  await stop();
+});
+
+// ---------------------------------------------------------------------------
 // 8. tool/command equivalence (one example each)
 // ---------------------------------------------------------------------------
 
@@ -368,7 +441,7 @@ test("9: goal_wait writes waitUntil for 1..60 minutes; bad minutes and a missing
 // 10. permission surface
 // ---------------------------------------------------------------------------
 
-test("10: all eight goal_* tools register with permission goal.control", async () => {
+test("10: all eleven goal_* tools register with permission goal.control", async () => {
   const { h, stop } = await boot();
   const names = [
     "goal_set",
@@ -379,6 +452,9 @@ test("10: all eight goal_* tools register with permission goal.control", async (
     "goal_add_task",
     "goal_update_task",
     "goal_wait",
+    "goal_pause",
+    "goal_resume",
+    "goal_view",
   ];
   for (const name of names) {
     const tool = h.tools.get(name);

@@ -11,7 +11,7 @@ function input(over: Partial<PermissionInput> = {}): PermissionInput {
     action: "fs.write",
     resources: ["/root/proj/a.txt"],
     sessionDirectory: "/root/proj",
-    goalActive: true,
+    goalStatus: "active",
     incoming: "ask",
     ...over,
   };
@@ -50,10 +50,32 @@ test("rule 2: goal.control during an active goal passes allow through", () => {
   ).toEqual({ effect: "allow" });
 });
 
-test("rule 2: goal.control without an active goal leaves", () => {
+test("rule 2: goal.control with no goal record leaves", () => {
   expect(
-    decidePermission(input({ action: GOAL_CONTROL_ACTION, goalActive: false })),
+    decidePermission(input({ action: GOAL_CONTROL_ACTION, goalStatus: undefined })),
   ).toEqual({ effect: "leave" });
+});
+
+test("rule 2: goal.control self-grants for a paused goal (conversational resume)", () => {
+  expect(
+    decidePermission(input({ action: GOAL_CONTROL_ACTION, goalStatus: "paused" })),
+  ).toEqual({ effect: "allow" });
+});
+
+test("rule 2: goal.control self-grants for blocked and budget_limited goals", () => {
+  for (const status of ["blocked", "budget_limited"]) {
+    expect(decidePermission(input({ action: GOAL_CONTROL_ACTION, goalStatus: status }))).toEqual({
+      effect: "allow",
+    });
+  }
+});
+
+test("rule 2: goal.control self-grants for a terminal goal (view the final state)", () => {
+  for (const status of ["completed", "stalled", "cleared"]) {
+    expect(decidePermission(input({ action: GOAL_CONTROL_ACTION, goalStatus: status }))).toEqual({
+      effect: "allow",
+    });
+  }
 });
 
 test("rule 2: goal.control is decided before path and sessionDirectory checks", () => {
@@ -232,7 +254,13 @@ test("rule 7: an empty sessionDirectory leaves", () => {
 });
 
 test("path rules are silent when the goal is not active", () => {
-  expect(decidePermission(input({ goalActive: false }))).toEqual({ effect: "leave" });
+  expect(decidePermission(input({ goalStatus: "paused" }))).toEqual({ effect: "leave" });
+});
+
+test("rule 4: containment stays active-only — a paused goal gets no write opinion", () => {
+  expect(
+    decidePermission(input({ goalStatus: "paused", resources: ["/etc/passwd"] })),
+  ).toEqual({ effect: "leave" });
 });
 
 // ── group 8 — windows path rules ─────────────────────────────────────────────

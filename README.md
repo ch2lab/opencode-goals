@@ -113,6 +113,29 @@ git clone https://github.com/ch2lab/opencode-goals
 
 The model then enters the goal loop: it is woken at each execution boundary to keep going; check progress any time with `/goal view`; when the bar is met it completes itself via `goal_complete` (evidence-gated); a stall (no-action wakes reaching `stallLimit`) marks the goal stalled by default (the report is for the human), or runs one judge arbitration first when enabled; an exhausted budget ends the goal automatically.
 
+### 典型对话场景 · Typical dialogue scenarios
+
+目标设定后，全程可以用**对话**管理——模型听到你的话就调用对应 `goal_*` 工具，行为与 `/goal` 命令逐条等价（工具与命令共用同一实现核心）：
+
+Once a goal is set, the whole lifecycle can be managed in plain conversation — the model maps your words to the matching `goal_*` tool; behavior is identical to the `/goal` commands (same implementation core).
+
+| 你说 You say（示例 example） | 模型调用 The model calls |
+|---|---|
+| "盯着这个重构做完，测试全绿再停" "see this refactor through, stop when the tests are green" | `goal_set` |
+| "进度怎么样了？预算还剩多少？" "where are we at on the budget?" | `goal_view` |
+| "先停一下" / "暂停这个目标" "hold on" / "pause this goal" | `goal_pause` |
+| "继续吧" / "把刚才的目标捡起来" "keep going" / "resume that goal" | `goal_resume` |
+| "再加一个待办：…" "add a todo: …" | `goal_add_task` |
+| "第 2 个任务标成完成" "mark task 2 done" | `goal_update_task` |
+| "先卡在这里，等某人拍板"（附原因 with a reason） | `goal_block`（之后任意用户消息或"继续"即恢复 any user message or "keep going" resumes） |
+| "等部署完，20 分钟后再看" "check back in 20 min once the deploy lands" | `goal_wait` |
+| "我确认做完了" / "收尾吧" "I confirm it's done" / "wrap it up" | `goal_complete`（证据门控 evidence-gated） |
+| "这个目标不要了" "drop this goal" | `goal_clear`（须引用你的原话 must quote your own words） |
+
+命令面不受影响：`/goal …` 与细粒度命令（`/goal-pause` 等）照旧可用，两者只是同一能力的两个入口。
+
+The command surface is unaffected: `/goal …` and the fine-grained commands (`/goal-pause`, …) keep working — the two are just two faces of the same capability.
+
 ### Options（插件 `options` 字段）/ Options (the plugin's `options`)
 
 | option | 类型 Type | 默认 Default | 说明 Description |
@@ -141,8 +164,8 @@ Numbers must be positive integers, booleans must be boolean literals; anything e
   **One wake per boundary, and the wake message is a plain state message** — no special audit channel, no state escalation: the model decides how to continue from its own context; the loop never hijacks the host's normal conversation flow.
 - **fail-closed**：在飞事实只靠事件计数，事件丢失至多让进展检查延迟、绝不产生假唤醒；裁判输出不可解析 → give up；证据不达标 → 视为未完成；`clear` 未引用用户原话 → 拒绝。
   **fail-closed**: in-flight facts are event-counted — a lost event can at most delay the progress check, never cause a false wake; unparseable judge output → give up; insufficient evidence → treated as not done; `clear` without the user's own words → refused.
-- **控制面 / 数据面分权**：8 个 `goal_*` 工具统一声明专属权限动作 `goal.control`，插件只在"会话有 active goal 且归属本实例"时自授 allow；数据面的路径沙箱永不放宽用户已配置的 deny。
-  **Control plane / data plane separation**: all 8 `goal_*` tools declare the dedicated permission action `goal.control`; the plugin self-grants allow only when "the session has an active goal and belongs to this instance"; the data-plane path sandbox never relaxes user-configured deny rules.
+- **控制面 / 数据面分权**：11 个 `goal_*` 工具统一声明专属权限动作 `goal.control`，插件只在"会话有 goal 记录（任意状态）且归属本实例"时自授 allow（2026-10-18：控制面扩至"goal 存在"，对话管理全状态可用）；数据面的路径沙箱仅在 goal 为 active 时介入，且永不放宽用户已配置的 deny。
+  **Control plane / data plane separation**: all 11 `goal_*` tools declare the dedicated permission action `goal.control`; the plugin self-grants allow when "the session has a goal record (any status) and belongs to this instance" (2026-10-18: the control plane widened to goal existence so the goal stays manageable in conversation); the data-plane path sandbox engages only while a goal is active, and never relaxes user-configured deny rules.
 - **旁路生成默认跟随会话当前模型**，可用 `model` 钉一个更便宜的模型——裁判与压缩摘要不污染主对话上下文。
   **Bypass generation follows the session's current model by default**; pin a cheaper one via `model` — the judge and compaction summary never pollute the main conversation context.
 - **零运行时依赖**：发布入口是剥离 wrapper 的零 import 变体，对 `@opencode/plugin` 版本漂移免疫。
@@ -150,9 +173,9 @@ Numbers must be positive integers, booleans must be boolean literals; anything e
 
 ## 工具（模型可调用）· Tools (model-facing)
 
-8 个工具统一声明 `goal.control` 权限；每个工具的门控一句话：
+11 个工具统一声明 `goal.control` 权限，且与对应 `/goal` 命令共用同一实现核心（行为等价——每个能力都能在对话中调用）；每个工具的门控一句话：
 
-All 8 tools declare the `goal.control` permission; one-line gating rule per tool:
+All 11 tools declare the `goal.control` permission, and each shares the same implementation core as its `/goal` command (behavioral equivalence — every capability is invokable in conversation). One-line gating rule per tool:
 
 | 工具 Tool | 门控 Gating |
 |---|---|
@@ -164,6 +187,9 @@ All 8 tools declare the `goal.control` permission; one-line gating rule per tool
 | `goal_add_task` | 需非终态 goal；账本无上限。 Requires a non-terminal goal; the task ledger is uncapped. |
 | `goal_update_task` | 需非终态 goal + 有任务；`status ∈ todo\|doing\|done`。 Requires a non-terminal goal with tasks; `status ∈ todo\|doing\|done`. |
 | `goal_wait` | 需 active goal；挂起唤醒 N 分钟（整数 1–60），声明"我在等"、不消耗停滞预算。 Requires an active goal; suspends the wake for N minutes (integer 1–60), declares "I'm waiting", does not consume the stall budget. |
+| `goal_pause` | 需 active goal；暂停循环（不唤醒、不数 stall），经 `goal_resume` / `/goal resume` 恢复。 Requires an active goal; suspends the loop (no wakes, no stall counting); resumed via `goal_resume` / `/goal resume`. |
+| `goal_resume` | 恢复 `paused`（静默）/ `blocked`（清 stale blocker + 重新唤醒）/ `budget_limited`（重新唤醒；cap 未放宽时下一边界再次终态）；`completed` / `stalled` / `cleared` 不可恢复。 Resumes from `paused` (silent) / `blocked` (stale blocker cleared + re-wake) / `budget_limited` (re-wake; without a raised cap it re-terminates at the next boundary); `completed` / `stalled` / `cleared` are hard-terminal. |
+| `goal_view` | 只读、无副作用（不唤醒、不改状态）；无 goal 记录时提示。 Read-only, no side effects (no wake, no state change); a session without a goal record gets a notice. |
 
 ## 无人值守安全 · Unattended Safety
 
@@ -194,8 +220,8 @@ The plugin reads host state over the host's own **HTTP client surface** (in-proc
 
 ## 已知限制（2.0.29 宿主实测）· Known Limitations (measured on host 2.0.29)
 
-1. **CLI serve 形态不向模型暴露插件工具**：插件注册成功，但模型调用任何 `goal_*` 均被宿主拒绝；**桌面端运行时完整可用**（8 个工具全部对模型可见）。影响：CLI 形态下模型侧终态动作（`goal_complete` 等）不可用，无人值守收尾只能靠停滞/预算终态或用户侧 `/goal` 命令。
-   **The CLI serve form does not expose plugin tools to the model**: the plugin registers fine, but the host rejects any `goal_*` call; **the desktop app runtime is fully functional** (all 8 tools visible to the model). Consequence: in the CLI form, model-side terminal actions (`goal_complete`, …) are unavailable — unattended closure relies on stall/budget terminals or the user-side `/goal` commands.
+1. **CLI serve 形态不向模型暴露插件工具**：插件注册成功，但模型调用任何 `goal_*` 均被宿主拒绝；**桌面端运行时完整可用**（11 个工具全部对模型可见）。影响：CLI 形态下模型侧终态动作（`goal_complete` 等）不可用，无人值守收尾只能靠停滞/预算终态或用户侧 `/goal` 命令。
+   **The CLI serve form does not expose plugin tools to the model**: the plugin registers fine, but the host rejects any `goal_*` call; **the desktop app runtime is fully functional** (all 11 tools visible to the model). Consequence: in the CLI form, model-side terminal actions (`goal_complete`, …) are unavailable — unattended closure relies on stall/budget terminals or the user-side `/goal` commands.
 2. **插件→宿主数据通道 = HTTP client 面（2026-10-17 变更）**：进程内 `ctx.rpc`（宿主→插件注册面）在 2.0.32 对插件侧查询不可用——早期的"零探测、纯事件流"裁决已被替换：门禁走 shell store 查询（`GET /api/shell`），进展检查（check-in）走 queued 消息投递、取消是插件内存态（inbox 端点保留在数据面契约上，但不再用于 check-in 回路）；看门狗仍事件驱动（`session.shell.started/ended`）。
    **The plugin→host data channel is the HTTP client surface (2026-10-17 change)**: in-process `ctx.rpc` (the host→plugin registration channel) is unavailable for plugin-side queries on 2.0.32 — the earlier zero-probe / events-only ruling is replaced: the gate queries the shell store (`GET /api/shell`); the progress check (check-in) is delivered as a queued message and cancelled in plugin memory (the inbox endpoints remain in the data-plane contract but are no longer part of the check-in loop); the watchdog remains event-driven (`session.shell.started/ended`).
 3. **唤醒投递的两级语义**：宿主只在会话 idle 时投递 queued inbox 项；模型自己的回合进行中（含阻塞在 `question` 表单）投递被推迟——宿主调度行为，非插件缺陷。

@@ -144,7 +144,7 @@ export interface SessionMessage {
  * Permission hook payload (R9): what the HOST hands in — the action, its
  * resources, the session attribution (`sessionID`) and the host's ALREADY
  * CONFIGURED effect (`incoming` = host Permission.Effect,
- * "allow" | "deny" | "ask"). `goalActive` and `sessionDirectory` are
+ * "allow" | "deny" | "ask"). `goalStatus` and `sessionDirectory` are
  * deliberately NOT here: they are facts the controller looks up itself
  * (storage / sessionGet) — not host input (controller ruling R9).
  */
@@ -202,7 +202,7 @@ export interface WakeProbe {
   onSessionHook(kind: "context" | "compaction", fn: (sessionID: string, payload: Record<string, unknown>) => void): void;
   onShellCreateBefore(fn: (input: { command: string; cwd: string; timeout: number }) => void): void;
   // R9: the callback receives the full PermissionHookInput and RETURNS its
-  // decision (undefined = no stance / leave); goalActive is the controller's
+  // decision (undefined = no stance / leave); goalStatus is the controller's
   // own fact, never an input.
   onPermissionHook(fn: (input: PermissionHookInput) => Promise<PermissionDecision | undefined>): void;
 }

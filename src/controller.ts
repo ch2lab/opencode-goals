@@ -176,7 +176,7 @@ const GOAL_SUBCOMMANDS: Array<{ name: string; sub: string; description: string }
   { name: "goal-clear", sub: "clear", description: "discard the goal" },
 ];
 
-/** All 8 goal_* tools are gated by the goal.control permission (Task 3). */
+/** All 11 goal_* tools are gated by the goal.control permission (Task 3). */
 const GOAL_PERMISSION = GOAL_CONTROL_ACTION;
 
 /** In-memory dedup cap for processed eventIDs (brief: "上限如 1000"). */
@@ -563,6 +563,45 @@ export class GoalController {
         permission: GOAL_PERMISSION,
       },
       (input, sessionID) => this.guarded("goal_wait", () => this.toolWait(sessionID, input)),
+    );
+    this.probe.registerTool(
+      "goal_pause",
+      {
+        description:
+          "Suspend the goal loop (no wake-ups, no stall counting) until the goal is resumed. " +
+          "Gating: goal.control permission; requires an ACTIVE goal. " +
+          "Use when the user asks you to pause or hold the goal in conversation.",
+        input: { type: "object", properties: {} },
+        permission: GOAL_PERMISSION,
+      },
+      (input, sessionID) => this.guarded("goal_pause", () => this.pauseGoal(sessionID)),
+    );
+    this.probe.registerTool(
+      "goal_resume",
+      {
+        description:
+          "Resume a goal in a resumable state: paused (silent restart), blocked (stale blocker " +
+          "cleared, re-wake injected) or budget_limited (cap still enforced — the goal " +
+          "re-terminates at the next boundary unless the cap is raised). " +
+          "Gating: goal.control permission; refused for completed/stalled/cleared (hard terminal) " +
+          "or when no goal exists. " +
+          "Use when the user asks you to continue or resume the goal in conversation.",
+        input: { type: "object", properties: {} },
+        permission: GOAL_PERMISSION,
+      },
+      (input, sessionID) => this.guarded("goal_resume", () => this.resumeGoal(sessionID)),
+    );
+    this.probe.registerTool(
+      "goal_view",
+      {
+        description:
+          "Read-only: show the goal's id, status, objective, cap and usage (no wake, no state change). " +
+          "Gating: goal.control permission; refused when this session has no goal record. " +
+          "Use when the user asks about the goal's state, objective or progress in conversation.",
+        input: { type: "object", properties: {} },
+        permission: GOAL_PERMISSION,
+      },
+      (input, sessionID) => this.guarded("goal_view", () => this.viewGoal(sessionID)),
     );
 
     // Task 10: shell timeout correlation — the host hands { command, cwd,
@@ -1533,7 +1572,7 @@ export class GoalController {
    * ③ attribution: probe.projectID set AND the session's projectID is a
    *    DIFFERENT known value → no stance (multi-location safety; an unknown
    *    projectID is attributed — the host may simply not report it);
-   * ④ goalActive is OUR fact (storage lookup), never host input (R9);
+   * ④ goalStatus is OUR fact (storage lookup), never host input (R9);
    * ⑤ decidePermission (Task 3 pure logic, untouched): sessionDirectory
    *    prefers the per-session location.directory, falls back to the
    *    instance default probe.locationDirectory;
@@ -1553,12 +1592,13 @@ export class GoalController {
         return undefined; // another project's session — no stance
       }
       const goal = await this.loadGoal(sessionID);
-      const goalActive = goal !== undefined && goal.status === "active";
       const decision = decidePermission({
         action: input.action,
         resources: input.resources,
         sessionDirectory: session?.location?.directory ?? this.probe.locationDirectory,
-        goalActive,
+        // Control plane keys off goal existence (any status); the data plane
+        // (path containment) engages only for "active" (2026-10-18 ruling).
+        goalStatus: goal?.status,
         incoming: input.incoming,
       });
       if (decision.effect === "leave") return undefined;

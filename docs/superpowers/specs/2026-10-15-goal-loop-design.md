@@ -535,3 +535,12 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 ## 38. 2026-10-18 修订（goal_wait 静默窗裁定为窄口径：只静默 check-in，L233(b) 措辞修正）
 
 §7.2 的 `waitUntil` 窗三处表述自相矛盾（§5 字段注释与 §7.2 均为"check-in 不注入"窄口径，L233(b) 为"窗内一切静默（不唤醒、不武装、不数 stall）"宽口径）。2026-10-18 用户裁定**窄口径为准、代码零改动**：窗只静默 check-in（不武装、不触发、待存者出窗后触发）；边界唤醒、shell 退出唤醒（`onShellEnded` 逐 shell 结果唤醒本就不受 quiet 门控）与 stall 计数照常。理由：① spec 自身 2:1 偏窄；② 宽口径与 §7.2"纯文本'看着正常'不是有效回应"契约打架（窗内纯文本回应按 L193 语义就该计 stall）；③ 宽口径会让模型在窗内脚本早已结束时白睡到窗满，且窗到期无任何唤醒机制。L233(b) 已改写为窄口径表述。
+
+## 39. 2026-10-18 修订（工具面补全：goal_pause / goal_resume / goal_view —— 所有功能都可对话调用；控制面自授扩至"goal 存在"）
+
+用户裁定（2026-10-18）：**通过对话管理 goal 是更常用的路径，让命令面的每个能力都有工具面**——用户在对话里口头要求时，模型调用对应 `goal_*` 工具（与命令面完全等价）。核代码后缺口为 3（非 2）：`pause` / `resume` 无工具面，`view` 同样只有命令面。
+- **新增 3 个工具**（`src/controller.ts`）：`goal_pause` / `goal_resume` / `goal_view`——全部复用命令侧同一实现核心（`pauseGoal` / `resumeGoal` / `viewGoal`），延续既有"工具/命令等价"模式（test 8），行为零分叉；工具描述写明门控规则 + "用户在对话中要求暂停/恢复/查看时调用"。
+- **`goal.control` 自授条件放宽**（本次唯一的安全边界变化，用户已当轮确认）：控制面自授从"会话有 **active** goal"扩到**"goal 记录存在（任意状态）"**——否则 paused / blocked / budget_limited 的 goal 调不动 `goal_resume`（权限卡死），终态 goal 也调不动 `goal_view`。所有变更类工具的 status 自门控（工具层守卫）不变，放宽无副作用。**数据面不变**：路径沙箱仍仅 active 介入（2026-10-17 裁定保持）。
+- **修改**（`src/permission.ts` / `src/controller.ts` / `src/types.ts`）：`PermissionInput.goalActive: boolean` → `goalStatus?: string`（undefined = 无 goal 记录）；规则 2 = goal 记录存在（任意状态）即 allow，规则 4 = 仅 `"active"` 介入路径包含检查；controller 权限 hook 传 `goal?.status`。
+- **测试**（TDD，322 用例）：`test/goal-loop.test.ts` 19–21（pause 行为 / resume 三可恢复态 + active 与终态拒绝 / view 无副作用；test 10 改 11 工具）；`test/permission.test.ts`（控制面：各状态 allow + 无 goal leave；数据面：paused 对外部路径 write 不表态）；`test/permission-integration.test.ts` 12（paused：控制面 allow + 数据面 silent 同钩子实证）。
+- **README**：工具表 8→11；新增"典型对话场景"节（口头请求 → 工具对应）；控制面/数据面设计 bullet 与已知限制"8 个工具"同步。
