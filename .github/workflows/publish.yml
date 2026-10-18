@@ -1,0 +1,54 @@
+# Publish to npm via trusted publishing (OIDC) — no tokens anywhere.
+#
+# Trigger: pushing a version tag v* — the push itself is the explicit
+# publish command. The npm trusted-publisher connection must point at
+# THIS workflow file (repo ch2lab/opencode-goals, filename publish.yml).
+#
+# Version source: package.json at the tag's commit. CI never bumps
+# versions, tags, or manages dist-tags; the gate below enforces
+# tag == package.json version.
+name: Publish to npm
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  id-token: write # required for OIDC (npm trusted publishing)
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }} # the tag's commit
+
+      - name: version gate — tag must equal package.json version
+        run: |
+          v=$(node -p "require('./package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$v" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $v in package.json"
+            exit 1
+          fi
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          # npm CLI >= 11.5.1 auto-detects the OIDC environment and
+          # authenticates the publish against the trusted connection.
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false # never use caching in release builds
+
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+      # Two hard gates (strip residue + tarball manifest) then
+      # `npm publish --access public`; provenance is attached
+      # automatically by the npm CLI.
+      - run: bun run scripts/publish.mjs publish
