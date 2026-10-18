@@ -1784,10 +1784,19 @@ export class GoalController {
         backgroundCheckInText(due.inFlight, this.options.checkInDelaySec),
       );
     }
-    // Provider pause deadline reached → fire ONE retry wake. The pause record
-    // is NOT cleared here: the retry's boundary is what resolves it (errored
-    // → re-arm, clean → clear), which is also what re-arms this watchdog.
-    if (goal.providerPause !== undefined && now >= goal.providerPause.until) {
+    // Provider pause deadline reached → fire ONE retry wake (retrySent: the
+    // watchdog may stay alive across the deadline — a surviving pending
+    // check-in blocks the disarm — and every tick must not re-fire). The
+    // pause record is NOT cleared here: the retry's boundary is what resolves
+    // it (errored → re-arm with a FRESH record, which resets retrySent for
+    // the new window; clean → clear).
+    if (
+      goal.providerPause !== undefined &&
+      now >= goal.providerPause.until &&
+      goal.providerPause.retrySent !== true
+    ) {
+      goal.providerPause.retrySent = true;
+      await this.saveGoal(goal);
       await this.deliverWatchdogWake(goal, providerPauseRetryText(goal.id));
     }
     // Disarm only when nothing is pending: no shells, no deadline, and no

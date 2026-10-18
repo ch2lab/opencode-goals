@@ -69,8 +69,11 @@ export interface GoalRecord {
    *  error reach `providerFailLimit`. Until `until` the loop is silent (no
    *  wakes, no stall accounting, no check-ins); the watchdog fires ONE retry
    *  wake at the deadline (its boundary re-arms or clears this).
-   *  `noticeSent` = the one-per-incident synthetic notice was delivered. */
-  providerPause?: { until: number; noticeSent: boolean };
+   *  `noticeSent` = the one-per-incident synthetic notice was delivered.
+   *  `retrySent` = this window's one-shot retry wake already fired (the tick
+   *  must not re-fire it on every tick while the watchdog stays alive — e.g.
+   *  a surviving pending check-in — and the window is still unresolved). */
+  providerPause?: { until: number; noticeSent: boolean; retrySent?: boolean };
   lastHandledEventID?: string;
   judgeUsed?: boolean;
   evidence?: string;

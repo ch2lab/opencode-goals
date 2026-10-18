@@ -607,3 +607,28 @@ test("19: in-flight boundary during an active provider pause — quiet: the prog
   expect(h.prompts.length).toBe(1); // only the first wake — no check-in delivery during the pause
   await stop();
 });
+
+test("20: provider pause retry is ONE per deadline — a surviving pending check-in keeps the watchdog alive but must not re-fire the expired pause's retry on every tick", async () => {
+  const h = await createHarness();
+  const ctrl = new GoalController(h.probe, resolveOptions({ providerPauseMs: 40, watchdogTickMs: 5 }), {});
+  const stop = await ctrl.start();
+  await setGoalDirect(h);
+  // A surviving check-in: an in-flight own-shell boundary (clean message) arms it.
+  // (due = now + 300s — it never fires in this test, but its PENDING state
+  // blocks the tick's disarm, keeping the watchdog alive across the deadline.)
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "sh1", status: "running", sessionID: S }]);
+  await h.emit(succeeded("e20a")); // in-flight boundary → hold + check-in armed
+  expect(h.prompts.length).toBe(0);
+  // Provider breaks: the in-flight gate holds the first errored boundary (no wake),
+  // the second arms the 40ms pause. (No `started` event — it would cancel the
+  // pending check-in by design, which is exactly what we need to survive.)
+  h.setMessages(S, [{ id: "u1", type: "user" }, providerErr()]);
+  await h.emit(succeeded("e20b")); // streak 1, in-flight → hold
+  expect(h.prompts.length).toBe(0);
+  await h.emit(succeeded("e20c")); // streak 2 → pause armed, watchdog = retry heartbeat
+  expect(goalOf(h)!.providerPause).toBeDefined();
+  await sleep(120); // past the 40ms deadline; the tick keeps running (check-in pending)
+  expect(h.prompts.length).toBe(1); // exactly ONE retry wake — no per-tick re-fires
+  await stop();
+});
