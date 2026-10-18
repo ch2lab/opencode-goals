@@ -21,6 +21,7 @@
 import {
   addTask,
   archivedGoalKey,
+  bumpGoalDecision,
   createGoal,
   goalStorageKey,
   isCapReached,
@@ -1033,6 +1034,7 @@ export class GoalController {
           if (eventID !== undefined) this.pendingSkipped.set(sessionID, eventID);
           else this.pendingSkipped.set(sessionID, "");
           if (goal !== undefined && goal.status === "active") {
+            bumpGoalDecision(goal, "skip");
             await appendDecision({
               ts: new Date().toISOString(),
               sessionID,
@@ -1106,6 +1108,7 @@ export class GoalController {
         const noticeSent = pause?.noticeSent ?? false;
         const minutes = Math.round(this.options.providerPauseMs / 60000);
         goal.providerPause = { until: Date.now() + this.options.providerPauseMs, noticeSent };
+        bumpGoalDecision(goal, "paused");
         await appendDecision({
           ts: new Date().toISOString(),
           sessionID,
@@ -1170,6 +1173,7 @@ export class GoalController {
       // Query failure = the host context is dead (2026-10-17 ruling): log +
       // skip — no wake, no check-in arm, no stall accounting. Reviving a dead
       // session is not the plugin's job; the human reads the log.
+      bumpGoalDecision(goal, "skip");
       await appendDecision({
         ts: new Date().toISOString(),
         sessionID,
@@ -1202,6 +1206,7 @@ export class GoalController {
           });
           this.ensureWatchdog(sessionID); // the tick is the deadline's heartbeat
         }
+        bumpGoalDecision(goal, "hold");
         await appendDecision({
           ts: new Date().toISOString(),
           sessionID,
@@ -1277,6 +1282,7 @@ export class GoalController {
       return;
     }
     if (wake) {
+      bumpGoalDecision(goal, "wake");
       await appendDecision({
         ts: new Date().toISOString(),
         sessionID,

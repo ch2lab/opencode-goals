@@ -473,3 +473,11 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 - **效果**：用户的交互会话（无父链）对 campaign 完全不可见；模型自己派生的 subtask 会话（parentID 链连到本会话）仍按原设计意图计为在飞背景。
 - **测试**：`test/background-gate.test.ts` 全面改造——test 2 改"外来会话（无 parentID）不门禁→wake"；新增 2c（`setSession(CHILD,{parentID:S})` → 子任务门禁 hold）；新增 22（外来会话 wake 且 other=0）与 22b（子任务 hold 且 other=1）；原 5/6/7/9/11/12/13/21 的 CHILD 代理全部换成 own shell（`setShells`）；test 10 删除（"child 永不下线"前提随 blanket 计数一起消失）；`test/harness.ts` `setSession` 扩展 `parentID` 字段（RED → GREEN）。
 - 教训：探针看 `other` 字段时先假设它是 shell 数是错的——先读计数器实现再下结论；"当年不可得"的宿主能力要拿当前版本 schema 复核。
+
+## 25. 2026-10-18 修订（goal 级决策统计：终态归档自带"机制健康"摘要，不做决策日志长期保留）
+
+129 巡检裁定：决策日志（`/tmp/decisions-<pid>.jsonl`）**不需要长期保留**——健康时段 90%+ 是同一条 `boundary (in-flight 0)`，信息密度低；插件 bug 的发现路径是本地 stub/实宿主测试，不是生产遥测考古。真正缺的是"goal 终态记录里看不到循环机制在它生命周期内干了什么"。
+
+- **裁定**：不做日志持久化/轮转；改为 `GoalRecord.decisions = { wake, hold, skip, paused }` 四桶计数，每个边界决策点计数 +1（与决策日志行一一对应，`paused` = provider 暂停事故，日志里是带专属 reason 的 skip），随记录持久化 → **终态归档（`archived/<goalID>`）天生携带**：看一份归档就能回答"这个 goal 活着期间循环是否健康"（skip>0 = 宿主上下文死过；paused>0 = 断供过；wake 量级 = 唤醒节奏）。
+- **修改**：`src/state.ts`（`GoalDecisions` 类型 + `bumpGoalDecision` 懒初始化——旧记录无字段也安全）；`src/controller.ts` 五个决策点各一行（continuationPending skip / provider-pause→paused / host-dead skip / hold / wake）。`/goal view`（模型面）不加此字段——模型上下文不背审计数据。
+- **测试**：`test/goal-decisions.test.ts` 新增（单元：createGoal 零值 / 增量 / 旧记录懒初始化；控制器：四桶各一条路径 + complete 后归档键携带计数）。

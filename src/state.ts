@@ -19,6 +19,33 @@ export interface GoalTask {
   updatedAt: number;
 }
 
+/**
+ * Per-goal decision telemetry (2026-10-18 audit ruling): the counts of
+ * boundary decisions the controller made for this goal. Persisted with the
+ * record so a TERMINAL ARCHIVE answers "how did the loop behave during this
+ * goal's life" without the volatile /tmp decision log (which a host restart
+ * wipes). One bucket per logged decision; `paused` is the provider-pause
+ * incident (logged as a skip with its own reason) — together the four
+ * buckets partition every decision-log line of the goal.
+ */
+export interface GoalDecisions {
+  wake: number;
+  hold: number;
+  skip: number;
+  paused: number;
+}
+
+export type DecisionKind = keyof GoalDecisions;
+
+/**
+ * Increment one decision bucket, lazily initializing the field so records
+ * persisted before 2026-10-18 (no `decisions` key) keep working.
+ */
+export function bumpGoalDecision(goal: GoalRecord, kind: DecisionKind): void {
+  goal.decisions ??= { wake: 0, hold: 0, skip: 0, paused: 0 };
+  goal.decisions[kind] += 1;
+}
+
 export interface GoalRecord {
   version: 1;
   id: string;
@@ -32,6 +59,9 @@ export interface GoalRecord {
   stalls: number;
   continuations: number;
   tasks: GoalTask[];
+  /** Decision telemetry for this goal's life (2026-10-18); optional — records
+   *  persisted before the field existed lack it until first decision. */
+  decisions?: GoalDecisions;
   waitingShells?: Array<{ id: string; timeoutMs?: number; since: number }>;
   waitUntil?: number;
   /** Provider failure pause (2026-10-17 ruling, 129 quota incident): set when
@@ -108,6 +138,7 @@ export function createGoal(
     stalls: 0,
     continuations: 0,
     tasks: [],
+    decisions: { wake: 0, hold: 0, skip: 0, paused: 0 },
   };
 }
 
