@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
   GOAL_STORAGE_PREFIX,
-  TaskLimitError,
   addTask,
   archivedGoalKey,
   createGoal,
@@ -131,23 +130,13 @@ describe("addTask", () => {
     expect(g.tasks[0]).toBe(t);
   });
 
-  test("allows up to 50 tasks; the 51st add throws TaskLimitError", () => {
+  test("no task cap (2026-10-18 user ruling: the 50 limit is gone) — the 51st and 100th adds succeed", () => {
     const g = createGoal({ sessionID: "s1", objective: "x" }, NOW);
-    for (let i = 1; i <= 50; i++) {
+    for (let i = 1; i <= 100; i++) {
       addTask(g, `task ${i}`, NOW);
     }
-    expect(g.tasks).toHaveLength(50);
-    expect(() => addTask(g, "task 51", NOW)).toThrow(TaskLimitError);
-    expect(g.tasks).toHaveLength(50);
-    const err: unknown = (() => {
-      try {
-        addTask(g, "task 51", NOW);
-      } catch (e) {
-        return e;
-      }
-    })();
-    expect(err instanceof TaskLimitError).toBe(true);
-    expect((err as TaskLimitError).name).toBe("TaskLimitError");
+    expect(g.tasks).toHaveLength(100);
+    expect(g.tasks[50]).toMatchObject({ title: "task 51", status: "todo" });
   });
 });
 

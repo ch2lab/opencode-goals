@@ -208,10 +208,10 @@ test("5b: goal_clear tool with an explicit request; ungrounded request is refuse
 });
 
 // ---------------------------------------------------------------------------
-// 6. task commands + the 50-task limit
+// 6. task commands (2026-10-18 ruling: no task cap — the old 50 limit is gone)
 // ---------------------------------------------------------------------------
 
-test("6: /goal task add + status update; the 51st add is rejected with the 50 limit", async () => {
+test("6: /goal task add + status update; the 51st add succeeds (no cap)", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Task loop");
   await h.commandExecutor(S, "/goal task add t1");
@@ -222,8 +222,8 @@ test("6: /goal task add + status update; the 51st add is rejected with the 50 li
   await h.commandExecutor(S, "/goal task 1 doing");
   expect(goalOf(h)!.tasks[0].status).toBe("doing");
   await h.commandExecutor(S, "/goal task add t51");
-  expect(lastSynthetic(h).text).toContain("50");
-  expect(goalOf(h)!.tasks.length).toBe(50);
+  expect(goalOf(h)!.tasks.length).toBe(51);
+  expect(goalOf(h)!.tasks[50]).toMatchObject({ title: "t51", status: "todo" });
   await stop();
 });
 

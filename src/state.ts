@@ -50,9 +50,6 @@ export interface GoalRecord {
 
 export const GOAL_STORAGE_PREFIX = "goal/";
 
-/** Hard limit on tasks per goal (spec §5). */
-export const GOAL_TASK_LIMIT = 50;
-
 export function goalStorageKey(sessionID: string): string {
   return `${GOAL_STORAGE_PREFIX}${sessionID}`;
 }
@@ -93,13 +90,6 @@ export function nextGoalID(now?: number): string {
   return nextID("g_", now ?? Date.now());
 }
 
-export class TaskLimitError extends Error {
-  constructor() {
-    super(`goal task limit reached (${GOAL_TASK_LIMIT})`);
-    this.name = "TaskLimitError";
-  }
-}
-
 export function createGoal(
   input: { sessionID: string; objective: string; cap?: GoalRecord["cap"] },
   now?: number,
@@ -123,16 +113,16 @@ export function createGoal(
 
 /**
  * Appends a todo task to the goal's task list (mutates `goal.tasks`).
- * Throws TaskLimitError when the goal already holds GOAL_TASK_LIMIT tasks.
+ * No cap (2026-10-18 user ruling: the old 50-task limit is gone — the ledger
+ * is the goal's live index and long campaigns legitimately outgrow 50 lines;
+ * settled history belongs in project docs, enforced by the model, not by a
+ * hard error).
  */
 export function addTask(
   goal: GoalRecord,
   title: string,
   now?: number,
 ): GoalTask {
-  if (goal.tasks.length >= GOAL_TASK_LIMIT) {
-    throw new TaskLimitError();
-  }
   const t = now ?? Date.now();
   const task: GoalTask = {
     id: nextID("t_", t),

@@ -110,7 +110,7 @@ type GoalRecord = {
 
 - 状态机是纯函数模块（`state.ts`），可脱离宿主单测；
 - 终态归档：`completed/blocked/budget_limited/stalled/cleared` 落归档，被新 goal 顶替的非终态记录也归档（历史诚实）；
-- 待办上限 50 条（与先例一致）。
+- 待办**无上限**（2026-10-18 用户裁定撤销原 50 条上限，见 §21）。
 
 ## 6. 核心循环：边界仲裁器
 
@@ -427,4 +427,14 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
   - 暂停期间：in-flight 门按 quiet 处理（不武装 check-in）、tick 不投递 check-in（失败投递 = 又一个 doomed 回合）。
   - **到期**：watchdog tick 发**一条** retry wake（goalControl，watchdog 文案族，`providerPauseRetryText`）；该 retry 的边界解决暂停——errored → 续期（不重复通知）、clean → 清除。disarm 条件放宽：未过期的暂停存在时 tick 保持运行（否则 30min 后无人点火重试）。
 - **测试**：`test/arbiter.test.ts` test 15-19（RED → GREEN）：15 首次 errored 边界唤醒一次且不计数、二连触发暂停（一通知、不计 stall）；16 三犯续期不重复通知、干净边界清除并恢复计数；17 到期看门狗恰好发一条 retry、失败重试续期不重发通知、下个期限再发；18 非 provider 错误（ToolError）不暂停；19 暂停期间 in-flight 边界静默（check-in 不武装不投递）。`test/options.test.ts` 默认值断言同步补两新字段。
-- 129 重播种（含本修复的新构建）待用户 GO，机制同 §18/§19 部署。
+- 129 重播种（含本修复的新构建）已执行（2026-10-17 16:29Z，目录 1792254554427，entrypoint 切换实证 + /api/plugin 报 1.0.7）。
+
+## 21. 2026-10-18 修订（撤销 50 条待办上限）
+
+§5 原设"待办上限 50 条（与先例一致）"。129 现场（10 天 vllm sm70 战役，单 goal 53+ 轮）ledger 打满 50 后模型只能转"用文档管理状态"——长战役的账本天然超过 50 行，硬上限逼模型把活索引外溢到文档，与"ledger = 在飞索引、档案在文档"的定位自相矛盾（上限拦的是活项，不是结算项）。
+
+**用户裁定（2026-10-18）**：不应有这个限制 → **撤销**。
+
+- **修改**：删 `GOAL_TASK_LIMIT` 常量与 `TaskLimitError`（`src/state.ts`）；`addTask` 不再抛错；`goal_add_task` 工具描述去掉"at most 50"；`taskAdd` 的 TaskLimitError 分支删除（`src/controller.ts`）。
+- **定位不变**：ledger 是**在飞索引**，结算历史归项目文档（模型自律，如 `sm70_docs/`）——上限撤了，外溢纪律仍由模型按 objective 里的纪律行执行，不靠硬错误。
+- **测试**：`test/state.test.ts` 原"51st throws TaskLimitError"改为"100 条 add 全成功"；`test/goal-loop.test.ts` test 6 改为"51st add 成功（无上限）"（RED → GREEN）。

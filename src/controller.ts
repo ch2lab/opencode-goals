@@ -19,8 +19,6 @@
 // deps.judge call; its verdict is disposed inline (continue / complete /
 // needs_human / give_up) — see disposeVerdict + stallGoal (spec §8).
 import {
-  GOAL_TASK_LIMIT,
-  TaskLimitError,
   addTask,
   archivedGoalKey,
   createGoal,
@@ -518,7 +516,7 @@ export class GoalController {
       "goal_add_task",
       {
         description:
-          `Add a todo task (title required; at most ${GOAL_TASK_LIMIT} tasks per goal). ` +
+          "Add a todo task (title required; the ledger is uncapped). " +
           "Gating: goal.control permission; requires a non-terminal goal.",
         input: {
           type: "object",
@@ -2307,12 +2305,7 @@ export class GoalController {
     const goal = await this.loadGoal(sessionID);
     if (goal === undefined || isTerminal(goal.status)) return "no active goal for this session";
     if (title.trim() === "") return "a non-empty task title is required";
-    try {
-      addTask(goal, title);
-    } catch (err) {
-      if (err instanceof TaskLimitError) return `${err.message}: no more tasks can be added`;
-      throw err;
-    }
+    addTask(goal, title);
     await this.saveGoal(goal);
     return `task ${goal.tasks.length} added: ${title}`;
   }
