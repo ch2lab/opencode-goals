@@ -409,6 +409,9 @@ test("8: blocked + user inbox resumes (active, stalls 0, wake); same inboxID nev
   expect(after.id).toBe(g.id);
   expect(after.status).toBe("active");
   expect(after.stalls).toBe(0);
+  // 2026-10-18 (129 incident: active goal still carried its stale blocker
+  // text after a user-message resume, reading as "still blocked"):
+  expect(after.blocker).toBeUndefined();
   expect(h.prompts.length).toBe(1);
   expect(h.prompts[0].input.metadata?.goalWake).toBe(true);
   expect(h.prompts[0].input.metadata?.goalID).toBe(g.id);

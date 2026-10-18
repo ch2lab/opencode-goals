@@ -867,6 +867,11 @@ export class GoalController {
         }
         goal.status = "active";
         goal.stalls = 0;
+        // 2026-10-18 (129 incident): a resumed goal must not keep carrying
+        // its stale blocker — the record read as "still blocked" in
+        // /goal view and to the model's own context. The reason lives on
+        // in the transcript (the block synthetic), not in the live record.
+        goal.blocker = undefined;
         // injectWake bumps used.turns / continuations in memory; the save
         // below persists everything (status, stalls, usage) in one write.
         await this.injectWake(goal);

@@ -455,3 +455,10 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
   - `providerPauseRetryText`（断供暂停到期重试）：尾句 "say so and end this turn with a goal tool call" → 报告并停（"If a request still fails, note it in your reply — the loop auto-pauses and retries at the next deadline; a clean turn resumes."）——机制不变（边界解决暂停：errored 重新武装 / clean 清除），模型永不被逼重锤死 provider。
   - 保留不动（各有理由）：`providerPauseNoticeText`（面向人的事故告警，非对模型逼迫）；goal 状态通知（纯事实，零命令）；judge instruction（judge LLM 自产自由文本）；compaction 提示词/摘要（非会话注入，摘要任务的指令式合理）。
   - **测试**：`test/wake.test.ts` check-in 两钉改 + `providerPauseRetryText` 新钉 + `not.toContain("end this turn")`；`test/watchdog.test.ts` shell 退出断言补 "Goal mode:"/"next safe step"/无 "end this turn"（RED ×3 → GREEN）。
+
+## 23. 2026-10-18 修订（blocked resume 清陈 blocker——129 "激活没保持住" 排查副产物）
+
+129 现场：goal `g_mvdan48x_2s` 被模型 `goal_block`（A/B/C/D 决策菜单）后由用户消息 resume 回 active，但记录里 **`blocker` 长文残留**（`/goal view` 与模型上下文里读起来像"仍然 blocked"），用户误判为"激活状态没保持住"。排查同时确认：该 goal 当时实际 active 且健康推进（8+ 回合），"只有我输入才保持"是模型**设计内**的等待行为（block 等决策 + `goal_wait` 声明等待），非循环故障。
+
+- **修改**（`src/controller.ts` §15-9 resume 路径）：resume 时 `goal.blocker = undefined`——blocker 的历史留在线合（block 合成消息）里，活记录不再携带终态字段。
+- **测试**：`test/arbiter.test.ts` test 8 补 `expect(after.blocker).toBeUndefined()`（RED → GREEN）。
