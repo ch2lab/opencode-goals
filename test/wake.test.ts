@@ -129,10 +129,11 @@ test("default (no wakeText) message is byte-identical to the pinned template", (
     "Objective: ship the wake builders",
     "Progress:",
     "  (no tasks)",
-    "Review the progress above, then end this turn with a tool call:",
-    "- completion criteria met → goal_complete(evidence) (evidence must be a concrete verifiable anchor: file/test/output, ≥24 chars);",
-    "- genuinely cannot advance → goal_block(reason), with a concrete reason;",
-    "- otherwise → advance with the next concrete tool: if there are no tasks yet, plan first with goal_add_task(title); sync with goal_update_task(ref, status) as you go.",
+    "Goal mode: you advance this goal unattended — don't stall on questions to the user. Review the progress above, then:",
+    "- done → goal_complete(evidence): completion criteria met (evidence must be a concrete verifiable anchor: file/test/output, ≥24 chars);",
+    "- genuinely blocked → goal_block(reason), with a concrete reason;",
+    "- otherwise → advance with the next concrete tool per the goal's discipline: if there are no tasks yet, plan first with goal_add_task(title); sync with goal_update_task(ref, status) as you go.",
+    "A user message always overrides this reminder.",
   ].join("\n");
   expect(buildWakeMessage(g, "10 turns")).toBe(expected);
   expect(buildWakeMessage(g, "10 turns", undefined, undefined)).toBe(expected);
@@ -146,10 +147,15 @@ test("judge section is absent when no instruction is provided", () => {
 // --- wakeDetail "slim" (2026-10-17, then minimized) ---
 // Minimal ruling: the goal tools are already exposed in the model's system
 // prompt (no per-turn re-teaching) and the objective rides the conversation
-// context — so the slim wake is the header + ONE forced-tool-call line only.
+// context — so the slim wake is the header + ONE body line only.
+// 2026-10-18 ruling (autonomy reframe): the body line is NO LONGER the
+// imperative forced-tool-call menu — it grants goal-mode autonomy (advance
+// unattended per the goal's discipline, don't stall on questions to the user)
+// and names the ONLY two stops: goal_complete (done) and goal_block
+// (genuinely blocked). A live user message always overrides.
 // judge / wakeText channels unchanged.
 
-test("slim detail: header + one forced-trigger line ONLY (minimal ruling)", () => {
+test("slim detail: header + the autonomous goal-mode line ONLY (2026-10-18 reframe)", () => {
   const g = goalWith({
     tasks: [
       makeTask("first task", "done", 1),
@@ -160,16 +166,18 @@ test("slim detail: header + one forced-trigger line ONLY (minimal ruling)", () =
   expect(msg).toBe(
     [
       "[GOAL g_abc | turn 3/10]",
-      "End this turn with a tool call: goal_complete(evidence, a concrete verifiable anchor ≥24 chars) / goal_block(concrete reason) / advance the goal.",
+      "Goal mode: you advance this goal unattended. Don't ask the user questions and wait — follow the goal's discipline and take the next safe step. The only stops are goal_complete(evidence, a concrete verifiable anchor ≥24 chars) when the goal is done and goal_block(concrete reason) when you are genuinely blocked. A user message always overrides this reminder.",
     ].join("\n"),
   );
   // no budget / objective / task detail in slim — context carries the goal
   expect(msg).not.toContain("Budget:");
   expect(msg).not.toContain("Progress:");
   expect(msg).not.toContain("first task");
-  // the forced-tool-call contract survives
+  // the two-stops contract survives
   expect(msg).toContain("goal_complete");
   expect(msg).toContain("goal_block");
+  // autonomy ruling: no imperative forced-tool-call phrasing
+  expect(msg).not.toContain("End this turn");
 });
 
 test("slim detail: judge + wakeText channels still append in the same order", () => {

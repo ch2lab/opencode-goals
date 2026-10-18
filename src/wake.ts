@@ -66,8 +66,17 @@ function taskLines(goal: GoalRecord): string {
  * REMOVED (ruling: the plugin writes NO system part at all — any write, even a
  * byte-stable one, shifts the request prefix at appearance/disappearance and
  * breaks the LLM prefix cache), so the wake message is the per-turn grounding
- * channel (tail-appended — appends never break the prefix). "slim" (2026-10-17
- * minimal ruling) = header + ONE forced terminal tool call line ONLY — no
+ * channel (tail-appended — appends never break the prefix).
+ *
+ * 2026-10-18 autonomy ruling (reframe): the body is NO LONGER an imperative
+ * forced-tool-call menu ("End this turn with a tool call: …"). It grants
+ * goal-mode autonomy — you advance the goal unattended per its discipline,
+ * don't stall on questions to the user — and names the ONLY two stops:
+ * goal_complete (done) and goal_block (genuinely blocked). A live user
+ * message always overrides. Enforcement backstop is unchanged: turns that
+ * neither stop nor advance still tick the stall ladder.
+ *
+ * "slim" (2026-10-17 minimal ruling) = header + ONE body line ONLY — no
  * budget/objective/discipline/task lines: the goal tools are already exposed
  * in the model's system prompt (no per-turn re-teaching), and the objective
  * rides the conversation context. "full" adds the per-task progress block.
@@ -85,7 +94,7 @@ export function buildWakeMessage(
     detail === "slim"
       ? [
           `[GOAL ${goal.id} | turn ${turnsUsage(goal)}]`,
-          "End this turn with a tool call: goal_complete(evidence, a concrete verifiable anchor ≥24 chars) / goal_block(concrete reason) / advance the goal.",
+          "Goal mode: you advance this goal unattended. Don't ask the user questions and wait — follow the goal's discipline and take the next safe step. The only stops are goal_complete(evidence, a concrete verifiable anchor ≥24 chars) when the goal is done and goal_block(concrete reason) when you are genuinely blocked. A user message always overrides this reminder.",
         ]
       : [
           `[GOAL ${goal.id} | turn ${turnsUsage(goal)}]`,
@@ -93,10 +102,11 @@ export function buildWakeMessage(
           `Objective: ${goal.objective}`,
           "Progress:",
           taskLines(goal),
-          "Review the progress above, then end this turn with a tool call:",
-          "- completion criteria met → goal_complete(evidence) (evidence must be a concrete verifiable anchor: file/test/output, ≥24 chars);",
-          "- genuinely cannot advance → goal_block(reason), with a concrete reason;",
-          "- otherwise → advance with the next concrete tool: if there are no tasks yet, plan first with goal_add_task(title); sync with goal_update_task(ref, status) as you go.",
+          "Goal mode: you advance this goal unattended — don't stall on questions to the user. Review the progress above, then:",
+          "- done → goal_complete(evidence): completion criteria met (evidence must be a concrete verifiable anchor: file/test/output, ≥24 chars);",
+          "- genuinely blocked → goal_block(reason), with a concrete reason;",
+          "- otherwise → advance with the next concrete tool per the goal's discipline: if there are no tasks yet, plan first with goal_add_task(title); sync with goal_update_task(ref, status) as you go.",
+          "A user message always overrides this reminder.",
         ];
   if (judgeInstruction !== undefined) {
     lines.push("", `Judge note: ${judgeInstruction}`);

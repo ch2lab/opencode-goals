@@ -438,3 +438,14 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 - **修改**：删 `GOAL_TASK_LIMIT` 常量与 `TaskLimitError`（`src/state.ts`）；`addTask` 不再抛错；`goal_add_task` 工具描述去掉"at most 50"；`taskAdd` 的 TaskLimitError 分支删除（`src/controller.ts`）。
 - **定位不变**：ledger 是**在飞索引**，结算历史归项目文档（模型自律，如 `sm70_docs/`）——上限撤了，外溢纪律仍由模型按 objective 里的纪律行执行，不靠硬错误。
 - **测试**：`test/state.test.ts` 原"51st throws TaskLimitError"改为"100 条 add 全成功"；`test/goal-loop.test.ts` test 6 改为"51st add 成功（无上限）"（RED → GREEN）。
+
+## 22. 2026-10-18 修订（唤醒文案：授权式 goal 模式，非命令式逼迫）
+
+原 slim 唤醒第二行是命令式菜单："End this turn with a tool call: goal_complete / goal_block / advance the goal."。129 现场（模型刚问"推 ② 还是 ④？"后紧跟这条蓝色注入）观感突兀——像是喝令打断，且没有"等待"分支。
+
+**用户裁定（2026-10-18）**：goal 模式要给 LLM 自主权——提醒它"在 goal 模式下工作、按纪律按流程推进、不要问问题"，而不是逼迫它；合法停止只有两个：**goal_complete（完成）与 goal_block（阻止）**。
+
+- **修改**（`src/wake.ts` 两个模板）：第二行改为授权式——"Goal mode: you advance this goal unattended. Don't ask the user questions and wait — follow the goal's discipline and take the next safe step. The only stops are goal_complete(…) / goal_block(…)。A user message always overrides this reminder."；`full` 模式同步改写末段（done / genuinely blocked / otherwise advance 三分支 + 用户消息优先条款）。
+- **语义护栏**：① `goal_block` 保留为"需要用户决策"的合法等待出口（02:01 那次 block 等立项裁决是正确行为，不得误杀）；② "用户消息永远优先"条款防止自主权越过真人。
+- **强制力不变**：文案只是框架——既不 stop（complete/block）也不推进的空转回合仍由 stall 阶梯兜底，机制不动。
+- **测试**：`test/wake.test.ts` 两处模板钉改 + slim 新增 `not.toContain("End this turn")` 断言（RED → GREEN）。
