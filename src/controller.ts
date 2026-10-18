@@ -2350,12 +2350,31 @@ export class GoalController {
     const goal = await this.loadGoal(sessionID);
     if (goal === undefined) return "no active goal for this session";
     if (goal.status === "active") return `goal ${goal.id} is already active`;
-    if (goal.status !== "paused") return `goal ${goal.id} is not active (status: ${goal.status})`;
+    // Resumable: paused (existing), blocked (spec §15-9 — the command entry
+    // beside the user-message resume) and budget_limited (spec §11: 可 resume
+    // 续跑 — the cap is still enforced at the next boundary, so resuming
+    // without raising it re-terminates on the next boundary). completed /
+    // stalled / cleared stay hard-terminal.
+    if (goal.status !== "paused" && goal.status !== "blocked" && goal.status !== "budget_limited") {
+      return `goal ${goal.id} is not resumable (status: ${goal.status})`;
+    }
+    const wasBlocked = goal.status === "blocked";
+    const wasBudgetLimited = goal.status === "budget_limited";
     goal.status = "active";
+    if (wasBlocked || wasBudgetLimited) {
+      goal.stalls = 0;
+      if (wasBlocked) {
+        // 2026-10-18 (129 incident, same ruling as the user-message path): a
+        // resumed goal must not keep carrying its stale blocker.
+        goal.blocker = undefined;
+      }
+      // A fresh phase re-wakes the model (mirrors the §15-9 user-message
+      // resume); paused keeps its historical no-wake behavior.
+      await this.injectWake(goal);
+    }
     await this.saveGoal(goal);
-    // Task 14 Fix 4: a paused goal was disarmed by the tick's ghost rule
-    // (status !== active → disarmWatchdog) — resume must RE-ARM the watchdog
-    // for the still-waiting shells, or they would be checked by nobody.
+    // Task 14 Fix 4: a disarmed goal must RE-ARM the watchdog for the
+    // still-waiting shells, or they would be checked by nobody.
     if ((goal.waitingShells ?? []).length > 0) {
       this.ensureWatchdog(sessionID);
     }

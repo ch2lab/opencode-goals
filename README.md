@@ -93,9 +93,9 @@ git clone https://github.com/ch2lab/opencode-goals
 | `/goal set <objective> [--turns N] [--tokens N] [--unbounded]` | 启动目标。turns 未给用 options 默认（10）；tokens 默认仅统计、不限制（`--tokens N` 显式开启上限）；`--unbounded` = 不设 cap。 Start a goal. Omitted turns fall back to the options default (10); tokens are stats-only unless `--tokens N` sets a cap; `--unbounded` = no cap. |
 | `/goal view` | 查看当前 goal（状态 / 目标 / 预算上限与已用）。 View the current goal (status / objective / cap & usage). |
 | `/goal pause` | 暂停当前 goal。 Pause the current goal. |
-| `/goal resume` | 恢复当前 goal。 Resume the current goal. |
+| `/goal resume` | 恢复当前 goal（可恢复 `paused` / `blocked` / `budget_limited`；`completed` / `stalled` / `cleared` 为硬终态不可恢复）。 Resume the current goal (from `paused` / `blocked` / `budget_limited`; `completed` / `stalled` / `cleared` are hard-terminal and cannot be resumed). |
 | `/goal complete <evidence>` | 标记完成（证据门控：长度/锚点/接地三层）。 Mark complete (evidence-gated). |
-| `/goal block <reason>` | 标记受阻（原因必填；blocked 后任意用户消息即恢复）。 Mark blocked (reason required; any user message resumes it). |
+| `/goal block <reason>` | 标记受阻（原因必填；blocked 后任意用户消息或 `/goal resume` 即恢复）。 Mark blocked (reason required; any user message or `/goal resume` resumes it). |
 | `/goal clear` | 清除当前 goal（请求必须引用用户原话，fail-closed）。 Clear the goal (the request must quote the user's own words; fail-closed). |
 | `/goal history` | 本会话已归档 goal 列表。 List archived goals of this session. |
 | `/goal task add <title>` | 添加待办任务（无上限）。 Add a task (uncapped). |

@@ -523,3 +523,11 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 §20 的"每个 deadline 恰发一条 retry wake"在实机有洞：retry 的边界事件丢失（§19 已实证的单条事件丢失模式）且有待存 check-in 阻止 disarm 时，看门狗存活、**每个 tick（30s）对同一过期窗口重复发 retry**——正是 §20 反对的"空转"。本地 2026-10-18 巡检审计发现（RED 测试实证：1 条 vs 实际 6 条）。
 - **修改**（`src/state.ts` / `src/controller.ts`）：`providerPause` 增 `retrySent?` 标志——tick 触发条件加 `retrySent !== true`，发后置位并持久化；暂停 re-arm 构造**全新**记录（新窗口重置 `retrySent`），clean 清除路径不变。
 - **测试**：`test/arbiter.test.ts` test 20（存活 check-in + 过期 pause + 多 tick → 恰 1 条 retry；RED 6→GREEN 1）。
+
+## 37. 2026-10-18 修订（/goal resume 覆盖扩展：blocked 与 budget_limited 可恢复，按主体 §15-9/§11 裁定）
+
+主体的两条可恢复裁定在实现中缺失：§15 决定 #9（resume 是 blocked 的第二入口）实际只实现了用户消息入口（`resumeGoal` 只认 paused）；§11"budget_limited 可 resume 续跑"未实现（超 cap 立即归档且 resume 拒绝）。2026-10-18 用户裁定：两者改代码对齐 spec。
+- **修改**（`src/controller.ts` `resumeGoal`）：可恢复集 = `paused`（原有，行为不变、不唤醒）/ **`blocked`**（对齐 §15-9 用户消息恢复语义：active + stalls 0 + 清 blocker（2026-10-18 129 stale-blocker 裁定同样适用）+ 注入一条唤醒）/ **`budget_limited`**（active + stalls 0 + 一条唤醒）。`completed` / `stalled` / `cleared` 仍为硬终态（拒绝文案改为 "not resumable"）。
+- **语义备注**：budget_limited resume 后 cap 照常强制——cap 未放宽时（当前无上调既有 goal cap 的命令）下一个边界会再次判 budget_limited（synthetic 通知写明 used/cap，自解释）。
+- **测试**：`test/goal-loop.test.ts` 16–18（blocked 恢复清 stale blocker + 唤醒；budget_limited 恢复唤醒；completed 硬终态不可恢复）。
+- **README**：`/goal resume` 与 `/goal block` 两行同步可恢复集。

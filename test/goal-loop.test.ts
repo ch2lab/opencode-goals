@@ -6,8 +6,27 @@ import { resolveOptions } from "../src/options.ts";
 import { archivedGoalKey, goalStorageKey, type GoalRecord } from "../src/state.ts";
 import { GoalController } from "../src/controller.ts";
 import { createHarness, type Harness } from "./harness.ts";
+import type { HostEvent } from "../src/types.ts";
 
 const S = "s1";
+
+// schema/dist/session-event.d.ts: data = { sessionID } for execution events.
+function ev(type: string, id: string, properties: Record<string, unknown>): HostEvent {
+  return { type, id, properties };
+}
+
+function started(id: string, sessionID = S): HostEvent {
+  return ev("session.execution.started", id, { sessionID });
+}
+
+function succeeded(id: string, sessionID = S): HostEvent {
+  return ev("session.execution.succeeded", id, { sessionID });
+}
+
+// schema/dist/session-event.d.ts (UsageUpdated): data = { cost, tokens, sessionID }.
+function usage(id: string, tokens: Record<string, unknown>, sessionID = S): HostEvent {
+  return ev("session.usage.updated", id, { tokens, sessionID });
+}
 
 async function boot(): Promise<{ h: Harness; ctrl: GoalController; stop: () => Promise<void> }> {
   const h = await createHarness();
@@ -241,6 +260,62 @@ test("7: pause rejects goal_complete (not active); resume restores active", asyn
   expect(goalOf(h)!.status).toBe("paused");
   await h.commandExecutor(S, "/goal resume");
   expect(goalOf(h)!.status).toBe("active");
+  await stop();
+});
+
+// ---------------------------------------------------------------------------
+// 16-18. /goal resume coverage (spec §15-9 / §11: blocked and budget_limited are resumable)
+// ---------------------------------------------------------------------------
+
+test("16: /goal resume on a blocked goal → active, blocker cleared, stalls 0, one wake (spec §15-9 command entry)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Blocked via command");
+  const reply = await h.toolExecutor("goal_block", { reason: "waiting for external decision" }, S);
+  expect(reply).toContain("blocked");
+  const g = goalOf(h)!;
+  expect(goalOf(h)!.blocker).toBe("waiting for external decision");
+  await h.commandExecutor(S, "/goal resume");
+  const after = goalOf(h)!;
+  expect(after.id).toBe(g.id);
+  expect(after.status).toBe("active");
+  expect(after.stalls).toBe(0);
+  expect(after.blocker).toBeUndefined(); // the stale blocker must not survive the resume (129 incident)
+  expect(h.prompts.length).toBe(1);
+  expect(h.prompts[0].input.metadata?.goalWake).toBe(true);
+  expect(after.used.turns).toBe(1);
+  expect(after.continuations).toBe(1);
+  await stop();
+});
+
+test("17: /goal resume on a budget_limited goal → active + one wake (spec §11: resumable continuation)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Budgeted --tokens 100");
+  await h.emit(usage("u1", { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }));
+  await h.emit(started("s1"));
+  await h.emit(succeeded("e1")); // budget check precedes attribution → budget_limited
+  const id = goalOf(h)!.id;
+  expect(goalOf(h)!.status).toBe("budget_limited");
+  const before = h.prompts.length;
+  await h.commandExecutor(S, "/goal resume");
+  const after = goalOf(h)!;
+  expect(after.id).toBe(id);
+  expect(after.status).toBe("active");
+  expect(after.stalls).toBe(0);
+  expect(h.prompts.length).toBe(before + 1);
+  expect(h.prompts[before].input.metadata?.goalWake).toBe(true);
+  await stop();
+});
+
+test("18: /goal resume rejects terminal states (completed stays hard-terminal, no wake)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Sealed");
+  h.setMessages(S, [EVIDENCE_MESSAGE]);
+  await h.toolExecutor("goal_complete", { evidence: EVIDENCE }, S);
+  expect(goalOf(h)!.status).toBe("completed");
+  const before = h.prompts.length;
+  await h.commandExecutor(S, "/goal resume");
+  expect(goalOf(h)!.status).toBe("completed"); // untouched
+  expect(h.prompts.length).toBe(before); // no wake
   await stop();
 });
 
