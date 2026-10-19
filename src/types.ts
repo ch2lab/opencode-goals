@@ -178,6 +178,19 @@ export interface ShellEntry {
  * The probe the controller codes against. The real host (adapter, Task 7)
  * and the deterministic test harness (test/harness.ts) both implement it.
  */
+/** Host session record (GET /api/session list item) — the fields the in-flight
+ * gate reads: `parentID` (subtask attribution) and `time` (in-flight = no idle
+ * yet, or a turn started after the last idle). Same source the host UI reads —
+ * the in-process `ctx.session.get` does NOT return `parentID`. */
+export interface HostSession {
+  id: string;
+  projectID?: string;
+  parentID?: string;
+  outcome?: string;
+  time?: { created?: number; updated?: number; idle?: number; viewed?: number };
+  [key: string]: unknown;
+}
+
 export interface WakeProbe {
   eventSubscribe(): AsyncIterable<HostEvent>; // ctx.event.subscribe()
   prompt(input: PromptInput): Promise<InboxRef>; // ctx.session.prompt()（delivery/metadata/resume）
@@ -192,6 +205,7 @@ export interface WakeProbe {
   inboxList(sessionID: string): Promise<InboxItem[]>; // hostapi GET /api/session/:id/inbox
   inboxCancel(inboxID: string): Promise<void>; // hostapi DELETE /api/session/:id/inbox/:inboxID
   shellList(locationDirectory: string): Promise<ShellEntry[]>; // hostapi GET /api/shell（宿主 shell store）
+  sessionList(locationDirectory: string): Promise<HostSession[]>; // hostapi GET /api/session（按目录限定，同 shellList；parentID + time，子任务在飞发现源）
   projectID?: string;
   locationDirectory?: string;
   // —— 注册面（adapter 转真实 ctx；harness 记录供断言；hook 载荷字段以 2.0.29 .d.ts 为准）——

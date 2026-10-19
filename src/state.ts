@@ -62,7 +62,6 @@ export interface GoalRecord {
   /** Decision telemetry for this goal's life (2026-10-18); optional — records
    *  persisted before the field existed lack it until first decision. */
   decisions?: GoalDecisions;
-  waitingShells?: Array<{ id: string; timeoutMs?: number; since: number }>;
   waitUntil?: number;
   /** Provider failure pause (2026-10-17 ruling, 129 quota incident): set when
    *  consecutive boundaries whose last assistant message carries a provider.*

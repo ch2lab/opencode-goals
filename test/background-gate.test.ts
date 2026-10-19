@@ -117,7 +117,7 @@ test("1: regression — boundary with a waiting shell does not wake immediately 
 test("2: 2026-10-18 ruling — an active FOREIGN session (no parent link to us) does NOT gate → immediate wake", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set ChildGate");
-  await h.emit(started("c1", CHILD)); // another session, NO parentID → a different task
+  h.setSession(CHILD, { projectID: "other" }); // a real session, but no parent link to us
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight = 0 (own shells 0, subtasks 0) → ordinary wake
   expect(h.prompts.length).toBe(1);
@@ -127,8 +127,8 @@ test("2: 2026-10-18 ruling — an active FOREIGN session (no parent link to us) 
 test("2c: a SUBTASK session (parentID = us) IS counted → gate holds, like the original intent", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set SubtaskGate");
-  h.setSession(CHILD, { parentID: S }); // host record: CHILD is OUR subtask
-  await h.emit(started("c1", CHILD));
+  h.setSession(S, { location: { directory: "/w" } }); // the subtask query is location-scoped
+  h.setSession(CHILD, { parentID: S }); // host session list: CHILD is OUR in-flight subtask (no idle yet)
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight = 1 (our subtask) → no wake
   expect(h.prompts.length).toBe(0);
@@ -441,7 +441,7 @@ test("22: 2026-10-18 ruling — a foreign session is not counted at all: wake wi
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Ruling22");
   h.setSession(S, { location: { directory: "/w" } });
-  await h.emit(started("c1", CHILD)); // different session, no parent link → invisible
+  h.setSession(CHILD, { projectID: "other" }); // a real session, no parent link → not counted
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight = 0 → wake (not hold)
   expect(h.prompts.length).toBe(1);
@@ -457,7 +457,6 @@ test("22b: a subtask session (parentID = us) IS logged as other=1 and gates: hol
   await h.commandExecutor(S, "/goal set SubtaskLog22b");
   h.setSession(S, { location: { directory: "/w" } });
   h.setSession(CHILD, { parentID: S });
-  await h.emit(started("c1", CHILD));
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight = 1 (our subtask) → hold
   expect(h.prompts.length).toBe(0);
@@ -465,6 +464,33 @@ test("22b: a subtask session (parentID = us) IS logged as other=1 and gates: hol
   expect(line?.decision).toBe("hold");
   expect(line?.own).toBe(0);
   expect(line?.other).toBe(1); // attributed subtask
+  await stop();
+});
+
+test("23: a COMPLETED subtask (idle after its last activity) is NOT in flight → wake", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set DoneSubtask23");
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setSession(CHILD, { parentID: S, time: { updated: 100, idle: 200 } }); // idle after updated → done
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // in-flight = 0 (subtask is idle) → wake
+  expect(h.prompts.length).toBe(1);
+  const line = lastDecision(S);
+  expect(line?.other).toBe(0); // completed subtask not counted
+  await stop();
+});
+
+test("24: an in-flight subtask (turn started after its last idle) IS counted → hold", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set InFlightSubtask24");
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setSession(CHILD, { parentID: S, time: { updated: 200, idle: 100 } }); // updated after idle → in flight
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // in-flight = 1 → hold
+  expect(h.prompts.length).toBe(0);
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("hold");
+  expect(line?.other).toBe(1);
   await stop();
 });
 

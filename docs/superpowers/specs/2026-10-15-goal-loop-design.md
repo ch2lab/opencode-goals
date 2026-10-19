@@ -544,3 +544,23 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 - **修改**（`src/permission.ts` / `src/controller.ts` / `src/types.ts`）：`PermissionInput.goalActive: boolean` → `goalStatus?: string`（undefined = 无 goal 记录）；规则 2 = goal 记录存在（任意状态）即 allow，规则 4 = 仅 `"active"` 介入路径包含检查；controller 权限 hook 传 `goal?.status`。
 - **测试**（TDD，322 用例）：`test/goal-loop.test.ts` 19–21（pause 行为 / resume 三可恢复态 + active 与终态拒绝 / view 无副作用；test 10 改 11 工具）；`test/permission.test.ts`（控制面：各状态 allow + 无 goal leave；数据面：paused 对外部路径 write 不表态）；`test/permission-integration.test.ts` 12（paused：控制面 allow + 数据面 silent 同钩子实证）。
 - **README**：工具表 8→11；新增"典型对话场景"节（口头请求 → 工具对应）；控制面/数据面设计 bullet 与已知限制"8 个工具"同步。
+
+## 40. 2026-10-19 修订（在飞门改查询式发现：子任务经宿主会话列表 parentID + time 发现；删除事件缓存 + shell 退出快路径 —— 化繁为简）
+
+**现场**：ch2.AI 129 现场 56 条 `other:0` 无限唤醒——运行中的子任务从未被计入在飞（门禁误判 `in-flight = own + other = 0` → 立即唤醒 → `toolCalled` 清零 stalls → 再唤醒……无界）。
+
+**根因（叠加）**：① `other`（子任务）靠 `activeSessions` 事件缓存发现，跨宿主/子任务事件到不了本宿主 → 恒 0；② 即便命中缓存，`isSubtaskOf` 走宿主 `ctx.session.get`，而该接口**不返回 `parentID`**（只映射 location/projectID）→ 真机永不命中。`other` 的"发现"与"归属"两半都是事件驱动，`own`（shell）早已是查询式——不对称即 bug。
+
+**裁定（用户 2026-10-19）**：化繁为简，不要实时在飞跟踪、不要事件快路径——**只在会话 idle 边界查一次接口**（shell + 子任务在飞）：没有在飞 → 正常唤醒；有 → 武装一次性延时检查（`checkInDelaySec`）；后台完成 → goal 自动恢复（新回合 `execution.started`）→ 取消计时，不重复提醒；到点仍在飞 → nudge（防卡死）。
+
+**在飞信号（沙箱实证，真实宿主 `/api/session` 列表项）**：`time.idle` 缺失，或 `time.idle < time.updated` = 在飞；`time.idle >= time.updated`（+ 终态 `outcome`）= 完成。`updated > idle` 比较（而非"idle 缺失"）对多回合稳健、无阈值。
+
+**改动**：
+- **数据面**（`src/hostapi.ts` + `src/types.ts`）：新增 `GET /api/session` 查询 `sessionList()`（返回每会话 `parentID` + `time`，同源 UI 读的那份；`ctx.session.get` 不返回 parentID）；`WakeProbe` 加 `sessionList()`；新增 `HostSession` 类型。
+- **`controller.ts`**：`inFlightSignal` 的 `other` 改为 `countSubtasksInFlight`（会话列表建 id→parentID 映射，8 跳内上溯到本会话即子任务，按在飞信号计数；查询失败 fail-open 计 0）。
+- **删除（"多余的存在"）**：`activeSessions` 事件缓存、`isSubtaskOf`（per-candidate sessionGet 上溯，真机因无 parentID 恒 false）、`onShellStarted`/`onShellEnded`/`shellExitText` + shell 事件 case（事件驱动的 shell 退出快路径——#12138：模型发起的后台 shell 根本不发 `session.shell.*` 事件，快路径对主场景是死代码）、`waitingShells` 持久字段（state.ts）、`rememberShellTimeout`/`shellTimeouts`/`shellTimeoutOrder`（快路径 arm 的超时关联，失去唯一读者）。shell 完成现由"一次性延时检查 nudge"或"goal 恢复"承担，不再有即时"结果唤醒"。
+- **不变**：一次性 `checkinDue` 武装/触发/取消骨架、看门狗 tick、stall 阶梯、provider pause、预算、归因；shell `own` 计数本就是查询式（不动）；`timeoutWrap`（create.before 改写 input.timeout）保留。
+
+**测试**（323 用例，全绿）：`test/harness.ts`（probe 加 `sessionList`；`setSession` 扩展 `time`/`outcome`）；`test/background-gate.test.ts`（子任务用例 2c/22/22b 改靠会话列表发现、不再靠 `emit(started)`；新增 23/24 钉在飞信号：`idle >= updated` 完成不计 / `updated > idle` 在飞计数）；`test/watchdog.test.ts`（test 1 改写：shell 在飞 → 边界武装检查、`shell.ended` **不再**快路径唤醒、检查到点 nudge；test 2〔快路径去重守卫〕删除；test 5 去 `shellTimeouts` 断言、留 `timeoutWrap` 改写断言）。
+
+**129 边界**：本机沙箱实证（mock LLM，无外网凭据）；发布须用户当轮版本号 + GO。

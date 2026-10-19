@@ -10,6 +10,7 @@
 - 宿主契约问题：只读离线取证（grep 宿主二进制），禁止对生产 129 做探针 surgery。
 - 实机行为验证：本机一次性测试宿主（隔离 config + 端口 + 空白目录）；129 只在用户下令更新后做播种 + 日志观察。
 - 涉及"129 上现在是什么版本/什么代码"时：读 129 缓存目录的 package.json 与日志 entrypoint 实证，不得从 registry 状态推断。
+- **汇报纪律（用户 2026-10-20 裁定）**：改动未通过真实宿主（本机隔离 real host，非 `bun test` 的进程内 stub）验证，不得汇报"完成/已验证"；`bun test` + typecheck 只算 stub 层，不算实机。汇报完成前必须先有真机证据，否则只能标注"未真机验证"。
 
 ## 命令（bun 工具链）
 - 测试 `bun test`（322 用例，约 20s）；单文件 `bun test test/harness.test.ts`；单用例 `bun test -t "名称正则"`
@@ -26,7 +27,7 @@
 
 ## 架构速览
 - `index.ts` 宿主入口；**发布物是 stripped 变体**（纯 `{id, setup}` 导出，零运行时依赖）——由 publish.mjs 的变换生成，宿主以该形态加载
-- `src/` 11 模块：`controller.ts`（goal 循环主体：在飞门禁、`isSubtaskOf` parentID 归属、wake 决策）、`wake.ts`（全部注入文案 builder）、`judge`/`evidence`（判官/证据）、`state`/`options`/`permission`/`types`/`compact`/`decisionlog`/`hostapi`
+- `src/` 11 模块：`controller.ts`（goal 循环主体：在飞门禁〔shell store 查询 + `countSubtasksInFlight` 会话列表 parentID 归属，2026-10-19 起纯查询式、无事件缓存/无 shell 退出快路径〕、wake 决策）、`wake.ts`（全部注入文案 builder）、`judge`/`evidence`（判官/证据）、`state`/`options`/`permission`/`types`/`compact`/`decisionlog`/`hostapi`
 - 设计规格 `docs/superpowers/specs/2026-10-15-goal-loop-design.md`（含修订附录 §17+）——改 goal 循环语义前先读
 - `README.md` 即 npm 包文档（随 tarball 发布，改动随下个版本进包）
 

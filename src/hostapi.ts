@@ -27,7 +27,7 @@
 //   | timeout | network | http-<status>
 // A failure means the host context is dead (ruling 2026-10-17): the caller
 // logs and skips — no retries, no revival.
-import type { InboxItem, ShellEntry } from "./types";
+import type { HostSession, InboxItem, ShellEntry } from "./types";
 
 export type HostApiState = "ok" | "unavailable";
 
@@ -47,6 +47,7 @@ interface Registration {
 
 export interface HostApi {
   shellList(locationDirectory: string): Promise<HostApiResult<ShellEntry[]>>;
+  sessionList(locationDirectory: string): Promise<HostApiResult<HostSession[]>>;
   inboxList(sessionID: string): Promise<HostApiResult<InboxItem[]>>;
   inboxCancel(sessionID: string, inboxID: string): Promise<HostApiResult<undefined>>;
 }
@@ -190,6 +191,42 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
     return { state: "ok", value: normalizeShells(data) };
   }
 
+  /** Session list (2026-10-19 in-flight query): GET /api/session, location-
+   * scoped like shellList (x-opencode-directory header) — the goal's project's
+   * sessions, each with `parentID` + `time` (the in-flight subtask source; the
+   * in-process `ctx.session.get` does not return `parentID`). The caller
+   * filters by parentID chain. */
+  async function sessionList(locationDirectory: string): Promise<HostApiResult<HostSession[]>> {
+    const r = await doFetch("/api/session", "GET", locationHeader(locationDirectory));
+    if ("reason" in r) return { state: "unavailable", reason: r.reason };
+    if (!r.ok) return { state: "unavailable", reason: `http-${r.status}` };
+    const body = await safeJson(r);
+    const data =
+      typeof body === "object" && body !== null && Array.isArray((body as Record<string, unknown>).data)
+        ? ((body as Record<string, unknown>).data as unknown[])
+        : [];
+    const out: HostSession[] = [];
+    for (const raw of data) {
+      if (typeof raw !== "object" || raw === null) continue;
+      const o = raw as Record<string, unknown>;
+      if (typeof o.id !== "string") continue;
+      const t = (typeof o.time === "object" && o.time !== null ? o.time : {}) as Record<string, unknown>;
+      out.push({
+        id: o.id,
+        projectID: typeof o.projectID === "string" ? o.projectID : undefined,
+        parentID: typeof o.parentID === "string" ? o.parentID : undefined,
+        outcome: typeof o.outcome === "string" ? o.outcome : undefined,
+        time: {
+          created: typeof t.created === "number" ? t.created : undefined,
+          updated: typeof t.updated === "number" ? t.updated : undefined,
+          idle: typeof t.idle === "number" ? t.idle : undefined,
+          viewed: typeof t.viewed === "number" ? t.viewed : undefined,
+        },
+      });
+    }
+    return { state: "ok", value: out };
+  }
+
   async function inboxList(sessionID: string): Promise<HostApiResult<InboxItem[]>> {
     const r = await doFetch(`/api/session/${encodeURIComponent(sessionID)}/inbox`);
     if ("reason" in r) return { state: "unavailable", reason: r.reason };
@@ -218,7 +255,7 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
     return { state: "ok" };
   }
 
-  return { shellList, inboxList, inboxCancel };
+  return { shellList, sessionList, inboxList, inboxCancel };
 }
 
 /**

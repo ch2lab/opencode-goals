@@ -77,7 +77,7 @@ try {
   console.log(`    shellGet(old id) → status=${gone?.status} data=${JSON.stringify(gone?.data)}`);
   console.log(`[2] cancellation notice in context: ${/cancelled because the server restarted/i.test(ctx)}`);
   console.log(`    context notice lines: ${ctx.includes("restarted") ? ctx.slice(Math.max(0, ctx.indexOf("restart") - 200), ctx.indexOf("restart") + 200).replace(/"/g, "'") : "(none)"}`);
-  console.log(`[3] goal after reconciliation: status=${g.output?.status} waitingShells=${JSON.stringify(g.output?.waitingShells)} continuations=${g.output?.continuations}`);
+  console.log(`[3] goal after reconciliation: status=${g.output?.status} continuations=${g.output?.continuations}`);
   console.log(`    reconciliation wake injected (goalWake in context): ${ctx.includes("goalWake")}`);
   console.log(`\nVERDICT: ${shell && gone?.status === 404 && /cancelled/i.test(ctx)
     ? "shell record dropped + host cancellation notice delivered (host took the idle case as documented)"

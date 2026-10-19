@@ -1,16 +1,17 @@
-// Task 10 (rewritten 2026-10-17): the shell-wait surface is now PURELY
-// EVENT-DRIVEN (ruling: zero active checks — the plugin does no shell
-// liveness probing, no restart reconciliation, no dual-signal check-in):
+// Task 10 (rewritten 2026-10-19): the shell-wait surface is UNIFIED under the
+// in-flight gate + one-shot progress check (ruling: 化繁为简 — the event-driven
+// shell-exit fast path and the event-cache in-flight count are REMOVED):
 //
-//   - `session.shell.started`  → waitingShells +1
-//   - `session.shell.ended`     → waitingShells −1 + result wake (exit
-//                                  wording per status, output tail carried)
-//   - a terminal boundary with in-flight background work does NOT wake;
-//     it arms the one-shot progress check (test/background-gate.test.ts
-//     owns the arming/cancel/fire semantics).
+//   - in-flight shells are DISCOVERED by query from the host shell store
+//     (the harness mirrors the host: emit(started) adds, emit(ended) removes);
+//   - a terminal boundary with in-flight background work does NOT wake; it
+//     arms the one-shot progress check (test/background-gate.test.ts owns the
+//     arming/cancel/fire semantics);
+//   - a shell ending no longer fast-paths a result wake — the completion
+//     rides the one-shot progress check (the nudge) or a goal resume.
 //
-// What this file pins: the event-driven exit wake, its wording, the fast
-// path, cleanup, timeoutWrap, and the stall attribution of a plain-text
+// What this file pins: the no-fast-path completion behavior, the watchdog tick
+// lifecycle, the timeoutWrap rewrite, and the stall attribution of a plain-text
 // reply to a progress check.
 //
 // Controller ruling (rulings.md): REAL timers with small option values
@@ -139,58 +140,27 @@ function toolCalled(id: string, sessionID = S): HostEvent {
 // 1. fast path (boundary while waiting) + event-driven exit wake wording
 // ---------------------------------------------------------------------------
 
-test("1: boundary with a waiting shell does not wake; shell.ended delivers the result wake (timeout / killed wording)", async () => {
-  const { h, stop } = await boot();
+test("1: shell in flight — the boundary arms the check (no wake); shell.ended no longer fast-paths a wake (completion rides the check)", async () => {
+  const { h, stop } = await boot(resolveOptions({ watchdogTickMs: 1, checkInDelaySec: 1 }));
   await h.commandExecutor(S, "/goal set Fast");
   h.setSession(S, { location: { directory: "/w" } }); // the shell-store query needs the session's location
   await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }));
-  await h.emit(succeeded("b1")); // boundary while waiting → no wake
+  await h.emit(succeeded("b1")); // in-flight boundary → arm the check, no wake
   expect(h.prompts.length).toBe(0);
   expect(goalOf(h)!.lastHandledEventID).toBe("b1");
-
+  // The shell ends (leaves the store): the event-driven fast path is GONE — no
+  // immediate result wake; the completion rides the one-shot progress check.
   await h.emit(shellEnded("x1", "sh1", "timeout"));
-  expect(h.prompts.length).toBe(1);
-  const t = h.prompts[0].input.text;
-  expect(t).toContain("timed out");
-  expect(t).toContain("timeout");
-  expect(t).not.toContain("killed");
-  expect(t).toContain("last output line"); // output tail carried
-  // 2026-10-18 autonomy ruling: reframed tail — no imperative forced-tool-call phrasing
-  expect(t).toContain("Goal mode:");
-  expect(t).toContain("next safe step");
-  expect(t).not.toContain("end this turn");
-  expect(h.prompts[0].input.metadata?.goalControl).toBe(true);
-  expect(h.prompts[0].input.delivery).toBe("queue");
-  expect((goalOf(h)!.waitingShells ?? []).length).toBe(0);
-
-  // second shell: killed
-  await h.emit(shellStarted("e2", { id: "sh2", command: "cmdA", cwd: "/w" }));
-  await h.emit(succeeded("b2"));
-  expect(h.prompts.length).toBe(1); // boundary still no-wake
-  await h.emit(shellEnded("x2", "sh2", "killed"));
-  expect(h.prompts.length).toBe(2);
-  const k = h.prompts[1].input.text;
-  expect(k).toContain("killed");
-  expect(k).not.toContain("timed out");
+  expect(h.prompts.length).toBe(0); // no fast-path wake
+  // ...until the check fires: the progress-check-in nudge lands.
+  await waitFor(() => h.prompts.length === 1, 3000, "progress check-in");
+  expect(h.prompts[0].input.text).toContain("Background check-in");
   await stop();
 });
 
-// ---------------------------------------------------------------------------
-// 2. no ghost exit wake: an already-ended shell is not re-woken by a
-//    duplicate/late shell.ended (the waitingShells membership is the guard)
-// ---------------------------------------------------------------------------
-
-test("2: late/duplicate shell.ended after the entry was dropped does not re-wake", async () => {
-  const { h, stop } = await boot();
-  await h.commandExecutor(S, "/goal set Late");
-  h.setSession(S, { location: { directory: "/w" } });
-  await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }));
-  await h.emit(shellEnded("x1", "sh1", "exited"));
-  expect(h.prompts.length).toBe(1); // the one result wake
-  await h.emit(shellEnded("x2", "sh1", "exited")); // duplicate delivery
-  expect(h.prompts.length).toBe(1); // no second wake
-  await stop();
-});
+// (The event-driven shell-exit fast path and its ghost/duplicate guard were
+// removed 2026-10-19 — a shell ending no longer wakes; completion rides the
+// one-shot progress check, covered by test 1 and background-gate.test.ts.)
 
 // ---------------------------------------------------------------------------
 // 3. a progress check replied with pure text (no tool) → stall counts
@@ -248,34 +218,28 @@ test("5: timeoutWrap — no-timeout spawns get checkInDelaySec*1000 while an act
   );
   const stop = await ctrl.start();
   const before = h.shellCreateBefore[0];
-  const timeouts = (ctrl as unknown as { shellTimeouts: Map<string, number> }).shellTimeouts;
-  // 0. default options (timeoutWrap false) + timeout 0 → untouched, not
-  //    recorded (current behavior must not regress)
+  // 0. default options (timeoutWrap false) + timeout 0 → untouched
   const h0 = await createHarness();
   const ctrl0 = new GoalController(h0.probe, resolveOptions({}), {});
   const stop0 = await ctrl0.start();
   const input0 = { command: "cmd0", cwd: "/w", timeout: 0 };
   h0.shellCreateBefore[0](input0);
   expect(input0.timeout).toBe(0);
-  expect((ctrl0 as unknown as { shellTimeouts: Map<string, number> }).shellTimeouts.size).toBe(0);
   await stop0();
   // 1. no active goal + timeout 0 → untouched, not recorded
   let input = { command: "cmd", cwd: "/w", timeout: 0 };
   before(input);
   expect(input.timeout).toBe(0);
-  expect(timeouts.size).toBe(0);
   // 2. active goal + timeout 0 → rewritten in place to checkInDelaySec*1000
   await h.commandExecutor(S, "/goal set Wrap");
   expect(goalOf(h)!.status).toBe("active");
   input = { command: "cmd", cwd: "/w", timeout: 0 };
   before(input);
   expect(input.timeout).toBe(1234000); // SAME object was rewritten (payload is mutable)
-  expect(timeouts.get("cmd\u0000/w")).toBe(1234000); // rememberShellTimeout recorded the effective value
   // 3. active goal + host timeout present → host value is never overwritten
   input = { command: "cmd2", cwd: "/w", timeout: 5000 };
   before(input);
   expect(input.timeout).toBe(5000);
-  expect(timeouts.get("cmd2\u0000/w")).toBe(5000);
   // 4. after /goal clear the active-goal set is empty → no more rewrites
   h.setMessages(S, [{ id: "m1", type: "user", text: "please discard the branch and stop the work" }]);
   await h.commandExecutor(S, "/goal clear");
@@ -283,6 +247,5 @@ test("5: timeoutWrap — no-timeout spawns get checkInDelaySec*1000 while an act
   input = { command: "cmd3", cwd: "/w", timeout: 0 };
   before(input);
   expect(input.timeout).toBe(0);
-  expect(timeouts.get("cmd3\u0000/w")).toBeUndefined();
   await stop();
 });

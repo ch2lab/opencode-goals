@@ -245,6 +245,19 @@ export default Plugin.define({
         return r.value ?? [];
       },
 
+      // Host session list (hostapi): GET /api/session, location-scoped like
+      // shellList — the goal's project's sessions, each with parentID + time
+      // (the in-flight subtask-discovery source; the in-process ctx.session.get
+      // above does not return parentID). A query failure throws here
+      // (countSubtasksInFlight catches and fails open).
+      sessionList: async (locationDirectory) => {
+        const r = await hostApi.sessionList(locationDirectory);
+        if (r.state !== "ok") {
+          throw new Error(`session list query failed (${r.reason})`);
+        }
+        return r.value ?? [];
+      },
+
       // ctx.command.transform(e => e.add(CommandDefinition { name,
       // description?, execute(input: CommandInvocation { sessionID,
       // prompt: { text }, delivery }) })) (plugin/dist/promise/command.d.ts).

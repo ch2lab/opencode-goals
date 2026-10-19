@@ -234,68 +234,6 @@ function buildStallReport(goal: GoalRecord, noActionTexts: string[], judgeReason
   ].join("\n");
 }
 
-// ---------------------------------------------------------------------------
-// Task 10: watchdog text builders + shell-event payload normalization
-// ---------------------------------------------------------------------------
-
-/**
- * ShellInfo from either shell event family (schema-verified, 2.0.29):
- * - `session.shell.started` / `session.shell.ended` (durable, session-scoped —
- *   the mechanically attributable family): data = { shell: ShellInfo,
- *   sessionID }, and `output: { output, cursor, size, truncated }` on ended
- *   (schema/dist/session-event.d.ts Shell.Started/Ended).
- * - `shell.created`: data = { info: ShellInfo }; `shell.exited`:
- *   data = { id, exit?, status } (schema/dist/shell.d.ts — EPHEMERAL, no
- *   sessionID in 2.0.29 → they never pass the session gate above; handled for
- *   a future host that adds attribution. TODO(task13) live-smoke).
- * ShellInfo.status ∈ "running" | "exited" | "timeout" | "killed" (Shell.Status
- * — there is no "completed" value; "exited" is the plain exit).
- */
-function shellInfoFrom(props: Record<string, unknown>): {
-  id: string;
-  status?: string;
-  command?: string;
-  cwd?: string;
-  exit?: number;
-} | undefined {
-  const src = (isPlainObject(props.shell) ? props.shell : isPlainObject(props.info) ? props.info : undefined) as
-    | Record<string, unknown>
-    | undefined;
-  if (src !== undefined) {
-    const id = typeof src.id === "string" ? src.id : undefined;
-    if (id === undefined) return undefined;
-    return {
-      id,
-      status: typeof src.status === "string" ? src.status : undefined,
-      command: typeof src.command === "string" ? src.command : undefined,
-      cwd: typeof src.cwd === "string" ? src.cwd : undefined,
-      exit: typeof src.exit === "number" ? src.exit : undefined,
-    };
-  }
-  // shell.exited shape: data = { id, exit?, status } (schema/dist/shell.d.ts)
-  const id = typeof props.id === "string" ? props.id : undefined;
-  if (id === undefined) return undefined;
-  return {
-    id,
-    status: typeof props.status === "string" ? props.status : undefined,
-    exit: typeof props.exit === "number" ? props.exit : undefined,
-  };
-}
-
-/** Result wake (fast path): status wording. */
-function shellExitText(shellID: string, status: "exited" | "timeout" | "killed", exitCode?: number, tail?: string): string {
-  const head =
-    status === "timeout"
-      ? `The shell you were waiting for, ${shellID}, timed out (timeout, terminated by the host)`
-      : status === "killed"
-        ? `The shell you were waiting for, ${shellID}, was killed (killed, terminated externally)`
-        : `The shell you were waiting for, ${shellID}, exited (exit${exitCode !== undefined ? `, code ${exitCode}` : ""})`;
-  // 2026-10-18 autonomy ruling: reframed tail (was "Decide the next step; end
-  // this turn with a tool call.") — grant goal-mode autonomy instead of an
-  // imperative forced-tool-call; user-message-overrides clause for consistency.
-  return `${head} — latest output tail:\n${tail ?? "(none)"}\nGoal mode: take the next safe step per the goal's discipline (act on this result, or make independent progress). A user message always overrides this reminder.`;
-}
-
 export class GoalController {
   // deps.judge feeds the stall ladder (Task 9); deps.tickMs drives the
   // watchdog tick (the one-shot background check-in heartbeat).
@@ -319,14 +257,6 @@ export class GoalController {
    * next attribution, overwritten by the next started).
    */
   private turns = new Map<string, { active: boolean; toolCalled: boolean }>();
-  /**
-   * In-flight session registry (2026-10-17 ruling): EVERY session of this
-   * project currently mid-turn — goal-independent (the in-flight gate counts
-   * sessions, not goals). `session.execution.started` → add; terminal
-   * boundary → delete. Feeds inFlightCount(); a lost terminal event leaves a
-   * stale entry (degrades to a slower gate, never a false wake).
-   */
-  private activeSessions = new Map<string, number>();
   /**
    * One-shot progress-check deadline per session (2026-10-17 ruling): armed at
    * in-flight boundaries, cancelled by any session activity, fired by the
@@ -381,21 +311,13 @@ export class GoalController {
   // ------------------------------------------------------------------
   // Task 10: watchdog (spec §7.1) — per-goal tick timers + per-shell
   // in-memory watch state (tail / lastTailAt / checkedIn live ONLY here,
-  // never in storage; waitingShells itself is the persisted fact anchor).
+  // never in storage).
   // ------------------------------------------------------------------
 
   /** One tick timer per armed goal (sessionID key — one active goal per session). */
   private wdTimers = new Map<string, ReturnType<typeof setInterval>>();
   /** Per-goal in-flight tick guard (a tick never overlaps itself). */
   private wdBusy = new Set<string>();
-  /**
-   * (command, cwd) → host timeout (ms) captured on create.before (timeout > 0
-   * only; timeout 0 = no timeout → not recorded). Correlated onto shell
-   * events by command+cwd; correlation failure = no timeout (conservative:
-   * earlier check-in — direction safe). Bounded FIFO at 200 entries.
-   */
-  private shellTimeouts = new Map<string, number>();
-  private shellTimeoutOrder: string[] = [];
 
   /**
    * Registers the /goal command and the 8 goal_* tools on the probe and
@@ -620,7 +542,6 @@ export class GoalController {
       if (this.options.timeoutWrap && input.timeout === 0 && this.activeGoalSessions.size > 0) {
         input.timeout = this.options.checkInDelaySec * 1000;
       }
-      this.rememberShellTimeout(input.command, input.cwd, input.timeout);
     });
 
     // Task 11: compaction-proof goal state (spec §10).
@@ -675,7 +596,6 @@ export class GoalController {
       this.wdTimers.clear();
       this.wdBusy.clear();
       this.checkinDue.clear();
-      this.activeSessions.clear();
       const iter = this.loopIter;
       this.loopIter = undefined;
       try {
@@ -728,17 +648,6 @@ export class GoalController {
     const sessionID = event.properties?.sessionID;
     if (typeof sessionID !== "string" || sessionID === "") return; // 无归属：无 sessionID
     if (!(await this.sessionBelongs(sessionID))) return; // 无归属：非本实例 project
-    // 2026-10-17 in-flight gate: per-session mid-turn tracking (every project
-    // session, goal-independent — the gate counts in-flight sessions).
-    if (event.type === "session.execution.started") {
-      this.activeSessions.set(sessionID, Date.now());
-    } else if (
-      event.type === "session.execution.succeeded" ||
-      event.type === "session.execution.failed" ||
-      event.type === "session.idle"
-    ) {
-      this.activeSessions.delete(sessionID);
-    }
     switch (event.type) {
       case "session.execution.started":
         await this.onExecutionStarted(sessionID);
@@ -763,26 +672,10 @@ export class GoalController {
       case "session.execution.interrupted":
         await this.onInterrupted(sessionID, event);
         return;
-      case "session.shell.started":
-        // Task 10 watchdog: arm — the durable, session-scoped family carries
-        // sessionID + full ShellInfo (schema/dist/session-event.d.ts).
-        await this.onShellStarted(sessionID, event.properties);
-        return;
-      case "session.shell.ended":
-        // Task 10 watchdog fast path: status ∈ running|exited|timeout|killed
-        // (+ data.output tail) — a normal wake carrying the exit wording.
-        await this.onShellEnded(sessionID, event.properties);
-        return;
-      case "shell.created":
-        // TODO(task13): the ephemeral family (data = { info }, no sessionID in
-        // 2.0.29 — schema/dist/shell.d.ts) never passes the session gate above;
-        // handled here for a future host that adds session attribution.
-        await this.onShellStarted(sessionID, event.properties);
-        return;
-      case "shell.exited":
-        // TODO(task13): same as shell.created — data = { id, exit?, status }.
-        await this.onShellEnded(sessionID, event.properties);
-        return;
+      // session.shell.* / shell.* are no longer consumed (2026-10-19): in-flight
+      // shells are discovered by the gate's shell-store query, not by events
+      // (model-originated shells emit none); completion is the one-shot
+      // progress check or a goal resume. They fall through to default.
       default:
         // session.compaction.* (Task 11), session.inbox.delivered — not
         // consumed by this task.
@@ -964,25 +857,26 @@ export class GoalController {
    *    the verdict is disposed inline (continue re-wakes with the optional
    *    instruction; complete / needs_human / give_up end the goal).
    */
-  /** In-flight signal for the gate (2026-10-17 shell-store ruling, HTTP data
-   * plane): the goal session's OWN running shells, queried live from the
-   * host shell store (location-scoped, running-only), plus every OTHER
-   * in-flight session of this project (subtask sessions: names and parent
-   * links are neither known nor needed — count only).
-   * Why the store and not the session.shell.* events: the host does not emit
-   * those events for MODEL-ORIGINATED background shells (root cause #12138) —
-   * the event-driven waitingShells count is blind to exactly the case that
-   * motivated the gate. The store is the host's own truth: stateless
-   * (self-heals across plugin reloads) and self-pruning (exited shells vanish).
-   * Query failure = the host context is dead (2026-10-17 ruling): ownKnown
-   * false, NO fake count — the caller logs and skips; reviving a dead
-   * session is not the plugin's job. warn-once per session. */
+  /** In-flight signal for the gate (2026-10-17 shell-store ruling, 2026-10-19
+   * query-based discovery): the goal session's OWN running shells, queried
+   * live from the host shell store (location-scoped, running-only), plus its
+   * in-flight SUBTASK sessions, discovered by query from the host session
+   * list (GET /api/session — parentID + time, the same source the UI reads;
+   * a subtask's execution events never reach this host, so the event cache
+   * was blind to cross-host subtasks). Why the store/list and not the
+   * session.shell.* / session.execution.* events: the host emits no shell
+   * events for MODEL-ORIGINATED background shells (#12138), and subtask
+   * events are cross-host — both are discovered by query. Query failure =
+   * host context dead (2026-10-17 ruling): ownKnown false, NO fake count —
+   * the caller logs and skips; reviving a dead session is not the plugin's
+   * job. warn-once per session. */
   private async inFlightSignal(sessionID: string): Promise<{ own: number; other: number; ownKnown: boolean }> {
     let own = 0;
     let ownKnown = true;
+    let directory: string | undefined;
     try {
       const info = await this.probe.sessionGet(sessionID);
-      const directory = info?.location?.directory;
+      directory = info?.location?.directory;
       if (directory !== undefined) {
         own = (await this.probe.shellList(directory)).filter(
           (e) => e.sessionID === sessionID && e.status === "running",
@@ -999,42 +893,50 @@ export class GoalController {
         );
       }
     }
+    // Subtask discovery (2026-10-19: query-based, not the event cache): a
+    // subtask is a session in this project whose parentID chain walks back to
+    // THIS session (the query is location-scoped, like the shell store); a
+    // foreign session (a different task — e.g. the user's interactive session)
+    // has no such link and is invisible to the gate.
     let other = 0;
-    if (ownKnown) {
-      for (const sid of this.activeSessions.keys()) {
-        // 2026-10-18 (amended ruling, 129 incident): count ONLY sessions
-        // whose host parentID chain leads back to THIS session — its
-        // subtasks. A foreign session (a different task — e.g. the user's
-        // interactive session) is invisible to the gate.
-        if (sid !== sessionID && (await this.isSubtaskOf(sid, sessionID))) other += 1;
+    if (ownKnown && directory !== undefined) {
+      try {
+        other = await this.countSubtasksInFlight(sessionID, directory);
+      } catch {
+        // host is alive (the shell query above succeeded) but the list query
+        // failed: fail open (0 subtasks) — at worst this re-arms the check.
       }
     }
     return { own, other, ownKnown };
   }
 
-  /**
-   * 2026-10-18 (amended): does `sid` belong to `root`'s subtask tree — i.e.
-   * does its host session record's parentID chain (Session.Info.parentID)
-   * walk back to `root`? Different sessions are different tasks; only this
-   * session's own subtasks count as its in-flight background work.
-   * Fail-OPEN: a dead/unreadable session record is NOT a subtask (a
-   * stranger must never hold the loop). Bounded walk (subagent depth is
-   * small; 8 hops far exceeds any nesting).
-   */
-  private async isSubtaskOf(sid: string, root: string): Promise<boolean> {
-    let cur = sid;
-    for (let hop = 0; hop < 8; hop++) {
-      let info: { parentID?: string } | undefined;
-      try {
-        info = (await this.probe.sessionGet(cur)) as { parentID?: string } | undefined;
-      } catch {
-        return false;
+  /** Count this session's in-flight subtasks (2026-10-19): a subtask is a
+   * session in this project whose `parentID` chain walks back to `root`; it is
+   * in-flight while it has not gone idle since its last activity (`time.idle`
+   * absent, or `< time.updated`). The session list is location-scoped to the
+   * project (like the shell store). Bounded 8-hop walk — subagent depth is
+   * small. */
+  private async countSubtasksInFlight(root: string, directory: string): Promise<number> {
+    const all = await this.probe.sessionList(directory);
+    const parentOf = new Map<string, string | undefined>();
+    for (const s of all) parentOf.set(s.id, s.parentID);
+    const isSubtask = (id: string): boolean => {
+      let cur = parentOf.get(id);
+      for (let hop = 0; cur !== undefined && hop < 8; hop++) {
+        if (cur === root) return true;
+        cur = parentOf.get(cur);
       }
-      if (info?.parentID === root) return true;
-      if (info?.parentID === undefined) return false;
-      cur = info.parentID;
+      return false;
+    };
+    let n = 0;
+    for (const s of all) {
+      if (s.id === root) continue;
+      if (!isSubtask(s.id)) continue;
+      const updated = s.time?.updated;
+      const idle = s.time?.idle;
+      if (idle === undefined || (updated !== undefined && idle < updated)) n += 1;
     }
-    return false;
+    return n;
   }
 
   private async arbitrateBoundary(sessionID: string, event: HostEvent): Promise<void> {
@@ -1196,7 +1098,7 @@ export class GoalController {
     //
     // 2026-10-18 amended ruling (129 incident): in-flight = this session's
     // OWN running shells + its SUBTASK sessions (attributed via the host's
-    // parentID chain, see inFlightSignal/isSubtaskOf). Foreign sessions —
+    // parentID chain, see inFlightSignal/countSubtasksInFlight). Foreign sessions —
     // different tasks (the user's interactive session, a separate campaign)
     // — NEVER gate this goal's loop, and never appear in the check-in
     // count (no more fake "background items in flight"). Two exceptions keep normal
@@ -1745,21 +1647,6 @@ export class GoalController {
     return this.deps.contWindowMs ?? 10_000;
   }
 
-  /**
-   * (command, cwd) → host timeout from create.before (timeout > 0 only;
-   * payload is mutable — we snapshot the value, we never read it back later).
-   */
-  private rememberShellTimeout(command: string, cwd: string, timeout: number): void {
-    if (!(timeout > 0)) return;
-    const key = `${command}\u0000${cwd}`;
-    if (!this.shellTimeouts.has(key)) this.shellTimeoutOrder.push(key);
-    this.shellTimeouts.set(key, timeout);
-    while (this.shellTimeoutOrder.length > 200) {
-      const old = this.shellTimeoutOrder.shift();
-      if (old !== undefined) this.shellTimeouts.delete(old);
-    }
-  }
-
   /** Arm the per-goal tick timer (idempotent; refuses after cleanup). */
   private ensureWatchdog(sessionID: string): void {
     if (this.stopped || this.wdTimers.has(sessionID)) return;
@@ -1839,10 +1726,9 @@ export class GoalController {
       await this.saveGoal(goal);
       await this.deliverWatchdogWake(goal, providerPauseRetryText(goal.id));
     }
-    // Disarm only when nothing is pending: no shells, no deadline, and no
-    // UNEXPIRED provider pause (while armed, this tick IS the retry heartbeat).
+    // Disarm only when nothing is pending: no deadline, and no UNEXPIRED
+    // provider pause (while armed, this tick IS the retry heartbeat).
     if (
-      (goal.waitingShells?.length ?? 0) === 0 &&
       this.checkinDue.get(sessionID) === undefined &&
       (goal.providerPause === undefined || now >= goal.providerPause.until)
     ) {
@@ -1882,54 +1768,6 @@ export class GoalController {
       console.warn(`opencode-goal: failed to deliver watchdog wake for goal ${goal.id}:`, err);
       this.contPending.delete(sessionID);
     }
-  }
-
-  /**
-   * Arm on shell creation (spec §7.1): write the waitingShells entry
-   * (timeoutMs correlated via command+cwd; since = segment start). Active
-   * goal only (a terminal/paused goal is never armed — the ghost rule).
-   * Pure event-driven: no tick — the exit arrives as a shell.ended event.
-   */
-  private async onShellStarted(sessionID: string, props: Record<string, unknown>): Promise<void> {
-    this.checkinDue.delete(sessionID); // a background shell event is activity: cancel the progress check
-    const shell = shellInfoFrom(props);
-    if (shell === undefined) return;
-    const goal = await this.loadGoal(sessionID);
-    if (goal === undefined || goal.status !== "active") return;
-    if ((goal.waitingShells ?? []).some((w) => w.id === shell.id)) return; // already armed (dedup)
-    const timeoutMs =
-      shell.command !== undefined && shell.cwd !== undefined
-        ? this.shellTimeouts.get(`${shell.command}\u0000${shell.cwd}`)
-        : undefined;
-    const entry: NonNullable<GoalRecord["waitingShells"]>[number] = { id: shell.id, since: Date.now() };
-    if (timeoutMs !== undefined) entry.timeoutMs = timeoutMs;
-    goal.waitingShells = [...(goal.waitingShells ?? []), entry];
-    await this.saveGoal(goal);
-  }
-
-  /**
-   * Fast path exit (spec §7.1): the shell ended (event) →
-   * 止表 + result wake carrying the status wording (timeout = "超时",
-   * killed = "被杀", else "退出 (exit)") and the output tail. No-op when the
-   * goal is not active (ghost) or the shell was never armed / already
-   * processed (the waitingShells membership IS the once-only guard).
-   */
-  private async onShellEnded(sessionID: string, props: Record<string, unknown>): Promise<void> {
-    this.checkinDue.delete(sessionID); // a background shell event is activity: cancel the progress check
-    const shell = shellInfoFrom(props);
-    if (shell === undefined) return;
-    const goal = await this.loadGoal(sessionID);
-    if (goal === undefined || goal.status !== "active") return; // ghost: no wake after terminal/paused
-    const waiting = goal.waitingShells ?? [];
-    if (!waiting.some((w) => w.id === shell.id)) return;
-    goal.waitingShells = waiting.filter((w) => w.id !== shell.id);
-    const out = isPlainObject(props.output) ? props.output : undefined;
-    const tail = out !== undefined && typeof out.output === "string" ? out.output : undefined;
-    const status: "exited" | "timeout" | "killed" =
-      shell.status === "timeout" ? "timeout" : shell.status === "killed" ? "killed" : "exited";
-    await this.saveGoal(goal);
-    if (goal.waitingShells.length === 0) this.disarmWatchdog(sessionID);
-    await this.deliverWatchdogWake(goal, shellExitText(shell.id, status, shell.exit, tail));
   }
 
   /** Bounded in-memory eventID dedup (FIFO at HANDLED_ID_LIMIT). */
@@ -2413,11 +2251,6 @@ export class GoalController {
       await this.injectWake(goal);
     }
     await this.saveGoal(goal);
-    // Task 14 Fix 4: a disarmed goal must RE-ARM the watchdog for the
-    // still-waiting shells, or they would be checked by nobody.
-    if ((goal.waitingShells ?? []).length > 0) {
-      this.ensureWatchdog(sessionID);
-    }
     return `goal ${goal.id} resumed (active)`;
   }
 
