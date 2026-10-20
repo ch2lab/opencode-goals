@@ -67,7 +67,7 @@ test("1: set creates an active goal; view reports objective + cap; view without 
   expect(g!.id).toMatch(/^g_/);
   expect(g!.objective).toBe("Ship it");
   expect(g!.sessionID).toBe(S);
-  expect(g!.cap).toEqual({ turns: 10 }); // 2026-10-16: tokens are statistics only, no default cap
+  expect(g!.cap).toEqual({}); // 2026-10-20: goals are unbounded by default (no default cap at all)
   // every synthetic carries the goalControl marker (Task 8 arbiter dependency)
   expect(h.synthetics.every((c) => c.input.metadata?.goalControl === true)).toBe(true);
   expect(lastSynthetic(h).text).toContain("Ship it");
@@ -75,7 +75,7 @@ test("1: set creates an active goal; view reports objective + cap; view without 
   await h.commandExecutor(S, "/goal view");
   const view = lastSynthetic(h).text;
   expect(view).toContain("Ship it");
-  expect(view).toContain("10 turns / unbounded tokens");
+  expect(view).toContain("unbounded turns / unbounded tokens");
 
   // a session without a goal gets the "no active goal" phrasing
   await h.commandExecutor("s2", "/goal view");
@@ -401,11 +401,126 @@ test("8: goal_set / goal_add_task / goal_update_task are command-equivalent", as
   const reply = await h.toolExecutor("goal_set", { objective: "Build it" }, S);
   expect(reply).toContain("created");
   expect(goalOf(h)!.objective).toBe("Build it");
-  expect(goalOf(h)!.cap).toEqual({ turns: 10 }); // same default cap as the command (turns-only; tokens = statistics)
+  expect(goalOf(h)!.cap).toEqual({}); // unbounded by default (2026-10-20 ruling)
   expect(await h.toolExecutor("goal_add_task", { title: "a1" }, S)).toContain("a1");
   expect(goalOf(h)!.tasks[0]).toMatchObject({ title: "a1", status: "todo" });
   expect(await h.toolExecutor("goal_update_task", { ref: "1", status: "done" }, S)).toContain("done");
   expect(goalOf(h)!.tasks[0].status).toBe("done");
+  await stop();
+});
+
+// ---------------------------------------------------------------------------
+// 8b. goal_next_step (2026-10-20 ruling — the model's next-step plan, replayed
+// by the next boundary wake — the dispatch-brief structure for the goal loop)
+// ---------------------------------------------------------------------------
+
+test("8b: goal_next_step records the model's next-step plan (turn + ts stamped); bad input, missing and terminal goals are refused", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Next step probe");
+  const reply = await h.toolExecutor("goal_next_step", { text: "re-test, judge: n>=9" }, S);
+  expect(reply).toContain("recorded");
+  const ns = goalOf(h)!.nextStep;
+  expect(ns).toMatchObject({ text: "re-test, judge: n>=9" });
+  expect(ns!.turn).toBe(goalOf(h)!.used.turns);
+  expect(ns!.ts).toBeGreaterThan(0);
+  // latest write wins
+  await h.toolExecutor("goal_next_step", { text: "second plan" }, S);
+  expect(goalOf(h)!.nextStep!.text).toBe("second plan");
+  // bad input
+  expect(await h.toolExecutor("goal_next_step", {}, S)).toMatch(/text/);
+  expect(await h.toolExecutor("goal_next_step", { text: "   " }, S)).toMatch(/text/);
+  // cleared goal refuses the write (the user's explicit discard is never
+  // overridden by a model call — 2026-10-20 reactivation ruling)
+  h.setMessages(S, [{ id: "m2", type: "user", text: "discard the probe goal and stop the work" }]);
+  await h.toolExecutor("goal_clear", { request: "discard the probe goal and stop the work" }, S);
+  expect(goalOf(h)!.status).toBe("cleared");
+  expect(await h.toolExecutor("goal_next_step", { text: "late" }, S)).toContain("cleared");
+  expect(goalOf(h)!.nextStep!.text).toBe("second plan");
+  await stop();
+  // no active goal
+  const { h: h2, stop: stop2 } = await boot();
+  expect(await h2.toolExecutor("goal_next_step", { text: "x" }, S)).toContain("no active goal");
+  await stop2();
+});
+
+// ---------------------------------------------------------------------------
+// 8c-8d. goal_next_step reactivation (2026-10-20 ruling — 129 incident: a
+// call on an ended goal used to be a dead end; now it re-activates the goal
+// as a fresh phase. cleared and budget_limited stay terminal: the user's
+// explicit discard and an explicit cap are never overridden by the model)
+// ---------------------------------------------------------------------------
+
+test("8c: goal_next_step reactivates completed/paused/blocked/stalled goals as a fresh phase (counters reset, evidence preserved, step recorded)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Reactivate probe");
+  // phase 1: completed with grounded evidence
+  h.setMessages(S, [EVIDENCE_MESSAGE]);
+  expect(await h.toolExecutor("goal_complete", { evidence: EVIDENCE }, S)).toContain("completed");
+  // the persisted phase-1 record consumed budget — reactivation must reset it
+  // (and drop the stale goal_wait window — the "waiting" belonged to phase 1,
+  // a reactivated phase must not inherit its silence)
+  const phase1 = goalOf(h)!;
+  phase1.used = { turns: 7, tokens: 12345 };
+  phase1.stalls = 2;
+  phase1.waitUntil = Date.now() + 60 * 60 * 1000;
+  h.storage.set(goalStorageKey(S), phase1);
+  const reply = await h.toolExecutor("goal_next_step", { text: "phase-2: verify, then archive" }, S);
+  expect(reply).toContain("reactivated");
+  expect(reply).toContain("completed");
+  const g = goalOf(h)!;
+  expect(g.status).toBe("active");
+  expect(g.used).toEqual({ turns: 0, tokens: 0 }); // fresh phase budget (cap unchanged)
+  expect(g.stalls).toBe(0);
+  expect(g.waitUntil).toBeUndefined(); // the stale wait window must not ride the new phase
+  expect(g.evidence).toBeUndefined();
+  expect(g.evidenceHistory!.length).toBe(1);
+  expect(g.evidenceHistory![0].evidence).toBe(EVIDENCE);
+  expect(g.reactivation).toMatchObject({ from: "completed" });
+  expect(g.nextStep).toMatchObject({ text: "phase-2: verify, then archive", turn: 0 });
+  // paused -> reactivated (no evidence to archive — history stays at 1)
+  await h.toolExecutor("goal_pause", {}, S);
+  expect(await h.toolExecutor("goal_next_step", { text: "from pause" }, S)).toContain("reactivated");
+  expect(goalOf(h)!.status).toBe("active");
+  expect(goalOf(h)!.reactivation).toMatchObject({ from: "paused" });
+  expect(goalOf(h)!.evidenceHistory!.length).toBe(1);
+  // blocked -> reactivated, the stale blocker is dropped (same discipline as resume)
+  await h.toolExecutor("goal_block", { reason: "vendor silent" }, S);
+  expect(await h.toolExecutor("goal_next_step", { text: "from block" }, S)).toContain("reactivated");
+  expect(goalOf(h)!.status).toBe("active");
+  expect(goalOf(h)!.blocker).toBeUndefined();
+  // stalled -> reactivated (a persisted terminal record; the stall ladder
+  // itself is covered in judge-integration.test.ts)
+  const stalled = goalOf(h)!;
+  stalled.status = "stalled";
+  stalled.stallReport = "stalling hard (no action tails)";
+  h.storage.set(goalStorageKey(S), stalled);
+  expect(await h.toolExecutor("goal_next_step", { text: "from stall" }, S)).toContain("reactivated");
+  expect(goalOf(h)!.status).toBe("active");
+  expect(goalOf(h)!.reactivation).toMatchObject({ from: "stalled" });
+  await stop();
+});
+
+test("8d: goal_next_step refuses cleared and budget_limited goals — the records stay untouched", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Closed loop");
+  h.setMessages(S, [{ id: "m1", type: "user", text: "discard this goal and stop the work" }]);
+  expect(await h.toolExecutor("goal_clear", { request: "discard this goal and stop the work" }, S)).toContain("cleared");
+  const clearedReply = await h.toolExecutor("goal_next_step", { text: "x" }, S);
+  expect(clearedReply).toContain("cleared");
+  expect(clearedReply).toContain("goal_set");
+  expect(goalOf(h)!.status).toBe("cleared");
+  expect(goalOf(h)!.nextStep).toBeUndefined();
+  // budget_limited (an explicit cap hit): stays terminal, points to goal_set
+  await h.commandExecutor(S, "/goal set Budgeted --tokens 100");
+  await h.emit(usage("u1", { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }));
+  await h.emit(started("s1"));
+  await h.emit(succeeded("e1")); // budget check precedes attribution -> budget_limited
+  expect(goalOf(h)!.status).toBe("budget_limited");
+  const budgetReply = await h.toolExecutor("goal_next_step", { text: "y" }, S);
+  expect(budgetReply).toContain("budget_limited");
+  expect(budgetReply).toContain("goal_set");
+  expect(goalOf(h)!.status).toBe("budget_limited");
+  expect(goalOf(h)!.nextStep).toBeUndefined();
   await stop();
 });
 
@@ -441,7 +556,7 @@ test("9: goal_wait writes waitUntil for 1..60 minutes; bad minutes and a missing
 // 10. permission surface
 // ---------------------------------------------------------------------------
 
-test("10: all eleven goal_* tools register with permission goal.control", async () => {
+test("10: all twelve goal_* tools register with permission goal.control", async () => {
   const { h, stop } = await boot();
   const names = [
     "goal_set",
@@ -451,6 +566,7 @@ test("10: all eleven goal_* tools register with permission goal.control", async 
     "goal_history",
     "goal_add_task",
     "goal_update_task",
+    "goal_next_step",
     "goal_wait",
     "goal_pause",
     "goal_resume",
@@ -463,6 +579,15 @@ test("10: all eleven goal_* tools register with permission goal.control", async 
     expect(typeof tool!.spec.description).toBe("string");
     expect(tool!.spec.description.length).toBeGreaterThan(10);
   }
+  // 2026-10-20 ruling: ALL twelve goal_* tools are natively exposed
+  // (codemode:false) and grouped under the `goal` namespace (MCP-server
+  // style) — registration names are prefix-free; the host flattens to
+  // goal_<name>, so the model-visible names (the map keys above) are unchanged.
+  for (const name of names) {
+    expect(h.tools.get(name)!.spec.codemode, `${name} must be native`).toBe(false);
+    expect(h.tools.get(name)!.spec.namespace, `${name} must sit in the goal namespace`).toBe("goal");
+  }
+  expect(h.namespaces.get("goal"), "the goal namespace must be declared").toBeDefined();
   await stop();
 });
 
@@ -484,6 +609,7 @@ test("11: every tool returns a human-readable error string on bad input (never t
     ["goal_history", null, /archived/],
     ["goal_add_task", {}, /title/],
     ["goal_update_task", {}, /ref/],
+    ["goal_next_step", {}, /text/],
     ["goal_update_task", { ref: "1", status: "bogus" }, /todo\|doing\|done/],
     ["goal_wait", { minutes: "abc" }, /minutes/],
   ];
@@ -526,6 +652,36 @@ test("14a: saveGoal drops a stale write — a newer /goal clear wins (compare-an
   expect(stored.status).toBe("cleared"); // NOT resurrected by the stale write
   expect(stored.updatedAt).toBe(cleared.updatedAt); // clear's bump, not A's
   expect(recA!.updatedAt).toBe(baseUpdatedAt - 1000); // not bumped on drop
+  await stop();
+});
+
+test("14c: goal_next_step whose save is dropped by a concurrent write reports the change, not success", async () => {
+  // Review finding I1: both nextStepUpdate branches discarded saveGoal's
+  // compare-and-set result — a dropped reactivation still answered "the loop
+  // resumes". A concurrent writer (e.g. a /goal clear from another surface)
+  // landing between load and save must surface as "changed underneath".
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set CAS nextstep");
+  // Simulate the concurrent writer: the storage record is rewritten with a
+  // newer updatedAt between the tool's own load (first get) and saveGoal's
+  // staleness probe (second get).
+  const realGet = (h.probe as unknown as { storageGet(key: string): Promise<unknown> }).storageGet.bind(h.probe);
+  let gets = 0;
+  (h.probe as unknown as Record<string, unknown>).storageGet = async (key: string) => {
+    gets += 1;
+    if (gets === 2 && key === goalStorageKey(S)) {
+      const cur = h.storage.get(key) as GoalRecord;
+      cur.status = "cleared";
+      cur.updatedAt = Date.now() + 1000;
+      h.storage.set(key, cur);
+    }
+    return realGet(key);
+  };
+  const out = await h.toolExecutor("goal_next_step", { text: "stale write probe" }, S);
+  expect(out).toContain("changed underneath");
+  const stored = goalOf(h)!;
+  expect(stored.status).toBe("cleared"); // the dropped write did not resurrect/reactivate
+  expect(stored.nextStep).toBeUndefined();
   await stop();
 });
 

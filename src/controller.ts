@@ -127,7 +127,7 @@ const TASK_STATUSES: readonly GoalTaskStatus[] = ["todo", "doing", "done"];
  * command, so newlines there do not display; the full usage lives HERE.
  */
 const USAGE = [
-  "Goal loop: the model advances the goal autonomously; completion is evidence-gated, budget exhaustion ends the run.",
+  "Goal loop: the model advances the goal autonomously; completion is evidence-gated. Goals are unbounded by default — an explicit cap, when set, ends the run on budget exhaustion.",
   "",
   "Usage:",
   "  /goal set <objective> [--turns N] [--tokens N] [--unbounded]   start a goal",
@@ -176,8 +176,26 @@ const GOAL_SUBCOMMANDS: Array<{ name: string; sub: string; description: string }
   { name: "goal-clear", sub: "clear", description: "discard the goal" },
 ];
 
-/** All 11 goal_* tools are gated by the goal.control permission (Task 3). */
+/** All goal_* tools are gated by the goal.control permission (Task 3). */
 const GOAL_PERMISSION = GOAL_CONTROL_ACTION;
+
+/**
+ * 2026-10-20 ruling: the twelve goal_* tools register as ONE group — the
+ * `goal` namespace (MCP-server style, declared once via registerNamespace)
+ * with prefix-free registration names; the host flattens to `goal_<name>`
+ * (effectiveName, host tool/runtime.ts), so the model-visible names
+ * (goal_set, goal_next_step, ...) are UNCHANGED — session records, wake text
+ * and live data need no migration. One shared options object: single gate +
+ * native tools-array exposure (codemode:false, host subagent precedent).
+ * Older hosts ignore unknown option fields (in-process editor, no codec
+ * boundary): the tools degrade to Code Mode-only, never lost.
+ */
+const GOAL_NAMESPACE = "goal";
+const GOAL_TOOL_OPTIONS = {
+  permission: GOAL_PERMISSION,
+  codemode: false,
+  namespace: GOAL_NAMESPACE,
+} as const;
 
 /** In-memory dedup cap for processed eventIDs (brief: "上限如 1000"). */
 const HANDLED_ID_LIMIT = 1000;
@@ -359,12 +377,23 @@ export class GoalController {
       );
     }
 
-    this.probe.registerTool(
-      "goal_set",
+    // One namespace declaration (MCP-server style): the catalog groups the
+    // twelve tools under `goal`; each tool carries the same name in options.
+    this.probe.registerNamespace(
+      GOAL_NAMESPACE,
+      "Goal loop management: set/complete/block/clear the active goal, manage its task list, record the next step, wait/pause/resume, and view state. All tools gate on goal.control. Most require an active goal — goal_view/goal_history are read-only and work without one; goal_next_step records at any time and reactivates an ended goal.",
+    );
+
+    // 2026-10-20 ruling: the twelve tools register as ONE group — a single
+    // host transform (MCP-server style): one Registration, atomic teardown,
+    // one catalog commit; a malformed entry only lands in the host's
+    // registration errors, siblings unaffected.
+    this.probe.registerToolGroup([
       {
+        name: "set",
         description:
           "Use only when the user explicitly asks you to set a goal. Start a new goal " +
-          "(objective required; optional turns/tokens cap, unbounded for no cap). " +
+          "(objective required; goals are unbounded by default — an optional turns/tokens cap when the user wants one). " +
           "Gating: goal.control permission; refused while a goal is still non-terminal — the old " +
           "goal is left untouched (complete, block or clear it first, then set again).",
         input: {
@@ -377,13 +406,11 @@ export class GoalController {
           },
           required: ["objective"],
         },
-        permission: GOAL_PERMISSION,
+        ...GOAL_TOOL_OPTIONS,
+        run: (input, sessionID) => this.guarded("goal_set", () => this.toolSet(sessionID, input)),
       },
-      (input, sessionID) => this.guarded("goal_set", () => this.toolSet(sessionID, input)),
-    );
-    this.probe.registerTool(
-      "goal_complete",
       {
+        name: "complete",
         description:
           "Terminal: mark the ACTIVE goal completed with concrete, checkable evidence " +
           "(\u226524 chars, anchored, grounded in the transcript). Gating: goal.control permission; " +
@@ -393,13 +420,11 @@ export class GoalController {
           properties: { evidence: { type: "string" } },
           required: ["evidence"],
         },
-        permission: GOAL_PERMISSION,
+        ...GOAL_TOOL_OPTIONS,
+        run: (input, sessionID) => this.guarded("goal_complete", () => this.toolComplete(sessionID, input)),
       },
-      (input, sessionID) => this.guarded("goal_complete", () => this.toolComplete(sessionID, input)),
-    );
-    this.probe.registerTool(
-      "goal_block",
       {
+        name: "block",
         description:
           "Terminal: mark the ACTIVE goal blocked with a concrete reason. " +
           "Gating: goal.control permission; refused when no goal is active or the reason is missing.",
@@ -408,13 +433,11 @@ export class GoalController {
           properties: { reason: { type: "string" } },
           required: ["reason"],
         },
-        permission: GOAL_PERMISSION,
+        ...GOAL_TOOL_OPTIONS,
+        run: (input, sessionID) => this.guarded("goal_block", () => this.toolBlock(sessionID, input)),
       },
-      (input, sessionID) => this.guarded("goal_block", () => this.toolBlock(sessionID, input)),
-    );
-    this.probe.registerTool(
-      "goal_clear",
       {
+        name: "clear",
         description:
           "Terminal: clear the ACTIVE goal. The request must quote the user's own words " +
           "(grounded in non-assistant transcript messages; fail-closed). " +
@@ -424,23 +447,19 @@ export class GoalController {
           properties: { request: { type: "string" } },
           required: ["request"],
         },
-        permission: GOAL_PERMISSION,
+        ...GOAL_TOOL_OPTIONS,
+        run: (input, sessionID) => this.guarded("goal_clear", () => this.toolClear(sessionID, input)),
       },
-      (input, sessionID) => this.guarded("goal_clear", () => this.toolClear(sessionID, input)),
-    );
-    this.probe.registerTool(
-      "goal_history",
       {
+        name: "history",
         description:
           "Read-only: list the archived goals of this session. Gating: goal.control permission; no goal required.",
         input: { type: "object", properties: {} },
-        permission: GOAL_PERMISSION,
+        ...GOAL_TOOL_OPTIONS,
+        run: (input, sessionID) => this.guarded("goal_history", () => this.toolHistory(sessionID, input)),
       },
-      (input, sessionID) => this.guarded("goal_history", () => this.toolHistory(sessionID, input)),
-    );
-    this.probe.registerTool(
-      "goal_add_task",
       {
+        name: "add_task",
         description:
           "Add a todo task (title required; the ledger is uncapped). " +
           "Gating: goal.control permission; requires a non-terminal goal.",
@@ -449,13 +468,11 @@ export class GoalController {
           properties: { title: { type: "string" } },
           required: ["title"],
         },
-        permission: GOAL_PERMISSION,
+        ...GOAL_TOOL_OPTIONS,
+        run: (input, sessionID) => this.guarded("goal_add_task", () => this.toolAddTask(sessionID, input)),
       },
-      (input, sessionID) => this.guarded("goal_add_task", () => this.toolAddTask(sessionID, input)),
-    );
-    this.probe.registerTool(
-      "goal_update_task",
       {
+        name: "update_task",
         description:
           "Set a task's status (todo|doing|done); ref is the 1-based index or the task id. " +
           "Gating: goal.control permission; requires a non-terminal goal with tasks.",
@@ -467,13 +484,32 @@ export class GoalController {
           },
           required: ["ref", "status"],
         },
-        permission: GOAL_PERMISSION,
+        ...GOAL_TOOL_OPTIONS,
+        run: (input, sessionID) => this.guarded("goal_update_task", () => this.toolUpdateTask(sessionID, input)),
       },
-      (input, sessionID) => this.guarded("goal_update_task", () => this.toolUpdateTask(sessionID, input)),
-    );
-    this.probe.registerTool(
-      "goal_wait",
       {
+        name: "next_step",
+        description:
+          "Record your next-step plan (what is done -> the ONE next concrete step -> how you will judge it) " +
+          "so the goal loop can resume you on the next wake. The note persists through compaction and " +
+          "restarts and is replayed in your next wake. If the session's goal has ended (completed/paused/" +
+          "blocked/stalled), this call re-activates it as a fresh phase (counters reset, same cap). " +
+          "cleared and budget_limited stay terminal — use goal_set for a new objective or a larger budget. " +
+          "Gating: goal.control permission.",
+        input: {
+          type: "object",
+          properties: { text: { type: "string" } },
+          required: ["text"],
+        },
+        // goal_next_step = the model's mid-work recorder (the only tool the
+        // model is expected to call spontaneously during work); the other
+        // eleven are lifecycle/management — all twelve share
+        // GOAL_TOOL_OPTIONS (gate + native exposure + goal namespace).
+        ...GOAL_TOOL_OPTIONS,
+        run: (input, sessionID) => this.guarded("goal_next_step", () => this.toolNextStep(sessionID, input)),
+      },
+      {
+        name: "wait",
         description:
           "Suspend wake-ups for N minutes (integer 1..60) while waiting on something. " +
           "Gating: goal.control permission; requires an ACTIVE goal.",
@@ -482,25 +518,21 @@ export class GoalController {
           properties: { minutes: { type: "number" } },
           required: ["minutes"],
         },
-        permission: GOAL_PERMISSION,
+        ...GOAL_TOOL_OPTIONS,
+        run: (input, sessionID) => this.guarded("goal_wait", () => this.toolWait(sessionID, input)),
       },
-      (input, sessionID) => this.guarded("goal_wait", () => this.toolWait(sessionID, input)),
-    );
-    this.probe.registerTool(
-      "goal_pause",
       {
+        name: "pause",
         description:
           "Suspend the goal loop (no wake-ups, no stall counting) until the goal is resumed. " +
           "Gating: goal.control permission; requires an ACTIVE goal. " +
           "Use when the user asks you to pause or hold the goal in conversation.",
         input: { type: "object", properties: {} },
-        permission: GOAL_PERMISSION,
+        ...GOAL_TOOL_OPTIONS,
+        run: (input, sessionID) => this.guarded("goal_pause", () => this.pauseGoal(sessionID)),
       },
-      (input, sessionID) => this.guarded("goal_pause", () => this.pauseGoal(sessionID)),
-    );
-    this.probe.registerTool(
-      "goal_resume",
       {
+        name: "resume",
         description:
           "Resume a goal in a resumable state: paused (silent restart), blocked (stale blocker " +
           "cleared, re-wake injected) or budget_limited (cap still enforced — the goal " +
@@ -509,22 +541,20 @@ export class GoalController {
           "or when no goal exists. " +
           "Use when the user asks you to continue or resume the goal in conversation.",
         input: { type: "object", properties: {} },
-        permission: GOAL_PERMISSION,
+        ...GOAL_TOOL_OPTIONS,
+        run: (input, sessionID) => this.guarded("goal_resume", () => this.resumeGoal(sessionID)),
       },
-      (input, sessionID) => this.guarded("goal_resume", () => this.resumeGoal(sessionID)),
-    );
-    this.probe.registerTool(
-      "goal_view",
       {
+        name: "view",
         description:
           "Read-only: show the goal's id, status, objective, cap and usage (no wake, no state change). " +
-          "Gating: goal.control permission; refused when this session has no goal record. " +
+          "Gating: goal.control permission; a session without a goal record gets a notice. " +
           "Use when the user asks about the goal's state, objective or progress in conversation.",
         input: { type: "object", properties: {} },
-        permission: GOAL_PERMISSION,
+        ...GOAL_TOOL_OPTIONS,
+        run: (input, sessionID) => this.guarded("goal_view", () => this.viewGoal(sessionID)),
       },
-      (input, sessionID) => this.guarded("goal_view", () => this.viewGoal(sessionID)),
-    );
+    ]);
 
     // Task 10: shell timeout correlation — the host hands { command, cwd,
     // timeout } to create.before BEFORE spawn (timeout 0 = no timeout; payload
@@ -783,8 +813,9 @@ export class GoalController {
         entry = { id: inboxID, kind: "user" };
       }
     } else {
-      // compaction / move / unmarked synthetic — TODO(task13): pinned in
-      // test/arbiter.test.ts (counts toward the stall ladder via "other").
+      // compaction / move / unmarked synthetic — counts toward the stall
+      // ladder via "other" (pinned in test/arbiter.test.ts; task13 closed
+      // 2026-10-20).
       entry = { id: inboxID, kind: "other" };
     }
     this.lastInbox.set(sessionID, entry);
@@ -820,7 +851,8 @@ export class GoalController {
    * - user (人工喊停) → record the eventID only (save), no wake;
    * - shutdown → record only (lastHandledEventID, no other state change).
    * - "superseded" is a 4th .d.ts value the brief does not cover → treated
-   *   record-only like "user". TODO(task13).
+   *   record-only like "user" (pinned in test/arbiter.test.ts; task13 closed
+   *   2026-10-20).
    */
   private async onInterrupted(sessionID: string, event: HostEvent): Promise<void> {
     const props = event.properties;
@@ -858,20 +890,25 @@ export class GoalController {
    *    instruction; complete / needs_human / give_up end the goal).
    */
   /** In-flight signal for the gate (2026-10-17 shell-store ruling, 2026-10-19
-   * query-based discovery): the goal session's OWN running shells, queried
-   * live from the host shell store (location-scoped, running-only), plus its
-   * in-flight SUBTASK sessions, discovered by query from the host session
-   * list (GET /api/session — parentID + time, the same source the UI reads;
-   * a subtask's execution events never reach this host, so the event cache
-   * was blind to cross-host subtasks). Why the store/list and not the
-   * session.shell.* / session.execution.* events: the host emits no shell
-   * events for MODEL-ORIGINATED background shells (#12138), and subtask
-   * events are cross-host — both are discovered by query. Query failure =
+   * query-based discovery, 2026-10-20 reference-UI criterion): the goal
+   * session's OWN running shells, queried live from the host shell store
+   * (location-scoped, running-only), plus its in-flight SUBTASK sessions —
+   * attributed by query from the host session list (GET /api/session —
+   * parentID chain; a subtask's execution events never reach this host, so
+   * the event cache was blind to cross-host subtasks) and live while the
+   * host's ACTIVE MAP (GET /api/session/active — the same sessionID→status
+   * signal the host UI reads) says "running". The 1.1.3 time-field guess
+   * (time.idle absent / idle < updated) is gone: dead sessions' time fields
+   * go stale and counted them in-flight forever (the 129 zombie lock — 16
+   * subtasks held the gate, every boundary held, no wakes). Query failure =
    * host context dead (2026-10-17 ruling): ownKnown false, NO fake count —
    * the caller logs and skips; reviving a dead session is not the plugin's
    * job. warn-once per session. */
-  private async inFlightSignal(sessionID: string): Promise<{ own: number; other: number; ownKnown: boolean }> {
+  private async inFlightSignal(
+    sessionID: string,
+  ): Promise<{ own: number; other: number; queued: number; ownKnown: boolean }> {
     let own = 0;
+    let queued = 0;
     let ownKnown = true;
     let directory: string | undefined;
     try {
@@ -882,13 +919,26 @@ export class GoalController {
           (e) => e.sessionID === sessionID && e.status === "running",
         ).length;
       }
+      // 2026-10-20 queued-input ruling: undelivered inbox items (queued user
+      // messages, synthetic results, compaction/move control items — all
+      // kinds, per the host contract "not yet delivered") gate the wake the
+      // same way in-flight work does. A wake injected now would land IN THE
+      // QUEUE behind the pending input (the 129 incident: a [GOAL] wake
+      // observed queued behind the user's own message — violating the
+      // invariant that a wake never appears in the queue). Every pending item
+      // is delivered as the next execution, so the next boundary is
+      // guaranteed: holding here can never silence the loop. The query lives
+      // in the same try as the shell store: a failure means the host context
+      // is dead → ownKnown=false → skip (fail-closed: an invisible queue must
+      // not open the wake path).
+      queued = (await this.probe.inboxList(sessionID)).length;
       this.shellQueryWarned.delete(sessionID); // a success re-arms the warn
     } catch (err) {
       ownKnown = false;
       if (!this.shellQueryWarned.has(sessionID)) {
         this.shellQueryWarned.add(sessionID);
         console.warn(
-          `opencode-goal: shell store query failed for ${sessionID}; the host context is dead — skipping this boundary:`,
+          `opencode-goal: in-flight signal query failed for ${sessionID} (session / shell store / inbox); the host context is dead — skipping this boundary:`,
           err,
         );
       }
@@ -898,26 +948,37 @@ export class GoalController {
     // THIS session (the query is location-scoped, like the shell store); a
     // foreign session (a different task — e.g. the user's interactive session)
     // has no such link and is invisible to the gate.
+    // 2026-10-20 reference-UI ruling: a subtask is in-flight while the host's
+    // active map says "running" (the UI's own liveness signal — a zombie
+    // session has no active entry); the time.idle/updated guess no longer
+    // counts.
     let other = 0;
     if (ownKnown && directory !== undefined) {
       try {
         other = await this.countSubtasksInFlight(sessionID, directory);
       } catch {
-        // host is alive (the shell query above succeeded) but the list query
-        // failed: fail open (0 subtasks) — at worst this re-arms the check.
+        // host is alive (the shell query above succeeded) but the list/active
+        // query failed: fail open (0 subtasks) — at worst this re-arms the check.
       }
     }
-    return { own, other, ownKnown };
+    return { own, other, queued, ownKnown };
   }
 
-  /** Count this session's in-flight subtasks (2026-10-19): a subtask is a
-   * session in this project whose `parentID` chain walks back to `root`; it is
-   * in-flight while it has not gone idle since its last activity (`time.idle`
-   * absent, or `< time.updated`). The session list is location-scoped to the
-   * project (like the shell store). Bounded 8-hop walk — subagent depth is
-   * small. */
+  /** Count this session's in-flight subtasks (2026-10-20 reference-UI ruling):
+   * a subtask is a session in this project whose `parentID` chain walks back
+   * to `root`; it is in-flight while the host's ACTIVE MAP (GET
+   * /api/session/active — the same sessionID→status signal the host UI reads
+   * for its running badge) says "running" (a turn is executing right now —
+   * including a turn waiting on a long shell/tool). An absent entry is
+   * "idle" = NOT in flight: dead sessions have no active entry, so the 1.1.3
+   * zombie lock (stale time fields counted them forever) is gone. Both
+   * queries are location-scoped (like the shell store). Bounded 8-hop walk —
+   * subagent depth is small. */
   private async countSubtasksInFlight(root: string, directory: string): Promise<number> {
-    const all = await this.probe.sessionList(directory);
+    const [all, active] = await Promise.all([
+      this.probe.sessionList(directory),
+      this.probe.activeSessions(directory),
+    ]);
     const parentOf = new Map<string, string | undefined>();
     for (const s of all) parentOf.set(s.id, s.parentID);
     const isSubtask = (id: string): boolean => {
@@ -932,9 +993,7 @@ export class GoalController {
     for (const s of all) {
       if (s.id === root) continue;
       if (!isSubtask(s.id)) continue;
-      const updated = s.time?.updated;
-      const idle = s.time?.idle;
-      if (idle === undefined || (updated !== undefined && idle < updated)) n += 1;
+      if (active[s.id] === "running") n += 1;
     }
     return n;
   }
@@ -960,9 +1019,13 @@ export class GoalController {
         this.pendingSkipped.delete(sessionID);
       } else {
         // continuationPending window (fresh): the wake has not landed (no
-        // execution.started yet). Within the window the first boundary is a
-        // same-turn-end sibling (execution.succeeded → session.idle, ms
-        // apart). Bounded fallback (controller ruling I1): skip at most ONE,
+        // execution.started yet). Within the window the first boundary is
+        // expected to be a same-turn-end sibling (field-observed as
+        // execution.succeeded → session.idle, ms apart — but the 2026-10-20
+        // probe on an isolated 2.0.32 host captured a normal turn end with
+        // ONLY execution.succeeded: no session.idle within 30s, so the
+        // session.idle path is defensive). Bounded fallback (controller
+        // ruling I1): skip at most ONE,
         // a second DISTINCT boundary closes the window. Bounded skip is
         // preferred over permanent silence; the residual double-wake risk is
         // acceptable because wakes are ordinary state-carrying messages.
@@ -1098,18 +1161,28 @@ export class GoalController {
     //
     // 2026-10-18 amended ruling (129 incident): in-flight = this session's
     // OWN running shells + its SUBTASK sessions (attributed via the host's
-    // parentID chain, see inFlightSignal/countSubtasksInFlight). Foreign sessions —
-    // different tasks (the user's interactive session, a separate campaign)
-    // — NEVER gate this goal's loop, and never appear in the check-in
-    // count (no more fake "background items in flight"). Two exceptions keep normal
-    // arbitration: (a) the last inbox item is one of OUR watchdog wakes —
-    // spec §7.1: a check-in replied with pure text counts per the stall
-    // ladder; (b) goal_wait's waitUntil window silences EVERYTHING
+    // parentID chain, see inFlightSignal/countSubtasksInFlight).
+    // 2026-10-20 reference-UI ruling: a subtask is in-flight while the host's
+    // active map (the UI's own signal) says "running" — dead sessions have no
+    // active entry, so zombies can no longer hold the gate.
+    // Foreign sessions — different tasks (the user's interactive session, a
+    // separate campaign) — NEVER gate this goal's loop, and never appear in
+    // the check-in count (no more fake "background items in flight"). Two
+    // exceptions keep normal
+    // arbitration: (a) the last inbox item is one of OUR watchdog wakes AND
+    // nothing is queued — spec §7.1: a check-in replied with pure text counts
+    // per the stall ladder; a QUEUED user message always wins over (a) (the
+    // wake would land in the queue behind it — 2026-10-20 re-review, C1);
+    // (b) goal_wait's waitUntil window silences EVERYTHING
     // (record only: no wake, no arm, no stall accounting — "不消耗 stall 预算").
-    const { own, other, ownKnown } = await this.inFlightSignal(sessionID);
+    const { own, other, queued, ownKnown } = await this.inFlightSignal(sessionID);
     // Gate = own running shells + attributed subtask sessions (2026-10-18
-    // amended ruling); `other` in the decision log carries the same value.
+    // amended ruling) + queued undelivered inbox input (2026-10-20 ruling: a
+    // wake would land IN THE QUEUE behind the pending input). The decision
+    // log carries `other` (subtasks) and `queued` as separate fields; the
+    // check-in count/text stays background-only (`inFlight`).
     const inFlight = own + other;
+    const gate = inFlight + queued;
     if (!ownKnown) {
       // Query failure = the host context is dead (2026-10-17 ruling): log +
       // skip — no wake, no check-in arm, no stall accounting. Reviving a dead
@@ -1129,14 +1202,19 @@ export class GoalController {
       await this.recordHandled(sessionID, eventID, goal);
       return;
     }
-    if (inFlight > 0) {
+    if (gate > 0) {
       // An ACTIVE provider pause silences the progress check like goal_wait's
       // waitUntil window (a check-in wake during either is a doomed turn).
       const pauseActive = goal.providerPause !== undefined && Date.now() < goal.providerPause.until;
       const quiet = (goal.waitUntil !== undefined && Date.now() < goal.waitUntil) || pauseActive;
       const last = this.lastInbox.get(sessionID);
       const lastWatchdog = last !== undefined && last.kind === "wake" && last.watchdog === true;
-      if (quiet || !lastWatchdog) {
+      // 2026-10-20 re-review (finding C1): the (a) exception also yields to a
+      // QUEUED input — with undelivered inbox items the reply must HOLD (the
+      // wake would land in the queue behind the user's own message — the 129
+      // invariant). The check-in re-arms below: it stays the §42 escape valve
+      // for parked input.
+      if (quiet || !lastWatchdog || queued > 0) {
         if (!quiet) {
           // Not quiet: arm the one-shot progress check. The clock only runs
           // while the session is quiet — any activity cancels it, and the next
@@ -1154,15 +1232,21 @@ export class GoalController {
           goalID: goal.id,
           own,
           other,
+          queued,
           ownKnown: true,
           decision: "hold",
-          reason: quiet ? "in-flight, quiet window" : "in-flight (check-in armed)",
+          reason: quiet
+            ? "in-flight, quiet window"
+            : queued > 0 && inFlight === 0
+              ? "queued input (check-in armed)"
+              : "in-flight (check-in armed)",
         });
         this.markTurnInactive(sessionID);
         await this.recordHandled(sessionID, eventID, goal);
         return;
       }
-      // (a) reply to OUR watchdog wake: normal arbitration (stall ladder).
+      // (a) reply to OUR watchdog wake with NOTHING queued: normal arbitration
+      // (stall ladder). With queued > 0 the hold above already returned.
     }
     // ⑤ attribution (lastInbox) → stall ladder.
     const toolCalled = this.turns.get(sessionID)?.toolCalled === true;
@@ -1230,6 +1314,7 @@ export class GoalController {
         goalID: goal.id,
         own,
         other,
+        queued,
         ownKnown: true,
         decision: "wake",
         reason: `boundary (in-flight ${own + other})`,
@@ -1278,15 +1363,9 @@ export class GoalController {
         // (runWatchdogTick, backgroundCheckInText) is an INDEPENDENT text
         // family and does NOT carry wakeText (ruling: wakeText does not
         // apply to check-ins).
-        // options.wakeDetail selects the transcript footprint (2026-10-17:
-        // default "slim" — objective/budget ride the per-turn system part).
-        text: buildWakeMessage(
-          goal,
-          this.capText(goal),
-          judgeInstruction,
-          this.options.wakeText,
-          this.options.wakeDetail,
-        ),
+        // 2026-10-20: the wake has ONE format (the objective/progress
+        // re-statement is gone — it is the model's own tool-generated data).
+        text: buildWakeMessage(goal, judgeInstruction, this.options.wakeText),
         delivery: "queue",
         metadata: { goalWake: true, goalID: goal.id, goalTurn: goal.used.turns },
       });
@@ -2003,6 +2082,14 @@ export class GoalController {
     return this.taskUpdate(sessionID, String(ref), rec.status as GoalTaskStatus);
   }
 
+  private async toolNextStep(sessionID: string, input: unknown): Promise<string> {
+    const rec = isPlainObject(input) ? input : {};
+    if (typeof rec.text !== "string" || rec.text.trim() === "") {
+      return 'goal_next_step: "text" is required and must be a non-empty string';
+    }
+    return this.nextStepUpdate(sessionID, rec.text);
+  }
+
   private async toolWait(sessionID: string, input: unknown): Promise<string> {
     const rec = isPlainObject(input) ? input : {};
     const minutes = rec.minutes;
@@ -2274,6 +2361,53 @@ export class GoalController {
     task.updatedAt = Date.now();
     await this.saveGoal(goal);
     return `task ${index} -> ${status}`;
+  }
+
+  /**
+   * Records the model's next-step plan (2026-10-20 ruling — goal_next_step):
+   * the woken turn's first act (commanded by the wake text) writes it; the
+   * next boundary wake replays it (see buildWakeMessage). `turn` = the goal's
+   * used-turn count at write time (coarse recency label for the replay line).
+   */
+  private async nextStepUpdate(sessionID: string, text: string): Promise<string> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined) {
+      return "no active goal for this session — call goal_set first (only when the user explicitly asks for a goal)";
+    }
+    if (goal.status === "active") {
+      goal.nextStep = { text, turn: goal.used.turns, ts: Date.now() };
+      if (!(await this.saveGoal(goal))) return this.changedUnderneath(goal);
+      return `next step recorded for goal ${goal.id} (turn ${goal.used.turns})`;
+    }
+    if (goal.status === "cleared") {
+      // The user's explicit discard is never overridden by a model call.
+      return `goal ${goal.id} was explicitly cleared — it stays terminal; if the user wants goal-managed work, ` +
+        `call goal_set with a new objective`;
+    }
+    if (goal.status === "budget_limited") {
+      // An explicit cap was hit — raising the budget is a user decision.
+      return `goal ${goal.id} is budget_limited (used ${goal.used.turns} turns / ${goal.used.tokens} tokens; ` +
+        `cap: ${this.capText(goal)}) — it stays terminal; if the user wants to continue, call goal_set with a larger budget`;
+    }
+    // completed / paused / blocked / stalled → REACTIVATION (2026-10-20 ruling):
+    // a fresh phase of the SAME goal. Terminal goals are never woken, so this
+    // branch is only reachable on a user-driven turn — each reactivation is
+    // gated by an external event, and the fresh phase runs under the same cap.
+    const from = goal.status;
+    if (goal.evidence !== undefined) {
+      goal.evidenceHistory = [...(goal.evidenceHistory ?? []), { evidence: goal.evidence, at: goal.updatedAt }];
+      goal.evidence = undefined;
+    }
+    goal.status = "active";
+    goal.used = { turns: 0, tokens: 0 }; // fresh phase: full budget again (cap unchanged)
+    goal.stalls = 0;
+    goal.waitUntil = undefined; // a stale goal_wait window belonged to the old phase — the new
+    // phase must not inherit its silence (or the "loop resumes" lie lasts up to 60 min)
+    goal.blocker = undefined; // a stale blocker must not ride the new phase (same discipline as resume)
+    goal.reactivation = { from, at: Date.now() };
+    goal.nextStep = { text, turn: 0, ts: Date.now() };
+    if (!(await this.saveGoal(goal))) return this.changedUnderneath(goal);
+    return `goal ${goal.id} reactivated (was ${from}); next step recorded (turn 0) — the loop resumes`;
   }
 
   private async historyGoal(sessionID: string): Promise<string> {

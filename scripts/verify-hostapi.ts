@@ -98,7 +98,7 @@ async function main(): Promise<void> {
     plugins: [
       {
         package: LOCAL_PLUGIN,
-        options: { checkInDelaySec: 15, wakeDetail: "slim", judgeEnabled: false, defaultCapTurns: 20 },
+        options: { checkInDelaySec: 15, judgeEnabled: false, defaultCapTurns: 20 },
       },
     ],
     permission: { "fs.read": "allow", "fs.write": "allow" },

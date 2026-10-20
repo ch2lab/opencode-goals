@@ -20,6 +20,23 @@ export interface GoalTask {
 }
 
 /**
+ * The model's recorded next step (2026-10-20 ruling — goal_next_step): the
+ * model's own synthesis of "what is done -> the ONE next concrete step -> how
+ * it will judge it". Written while the model is awake (the woken turn's first
+ * act, commanded by the wake itself — the dispatch-brief structure: the
+ * content rides a GUARANTEED moment, not the model's spontaneous discipline)
+ * and replayed by the next boundary wake. Persists with the record (kv) —
+ * survives compaction and host restart. Optional: records persisted before
+ * the field lacked it; terminal goals keep their last value (the tool
+ * refuses on terminal goals, so the value only moves while the goal is live).
+ */
+export interface GoalNextStep {
+  text: string;
+  turn: number;
+  ts: number;
+}
+
+/**
  * Per-goal decision telemetry (2026-10-18 audit ruling): the counts of
  * boundary decisions the controller made for this goal. Persisted with the
  * record so a TERMINAL ARCHIVE answers "how did the loop behave during this
@@ -59,6 +76,9 @@ export interface GoalRecord {
   stalls: number;
   continuations: number;
   tasks: GoalTask[];
+  /** The model's recorded next-step plan (2026-10-20 ruling, goal_next_step);
+   *  optional — replayed by the next boundary wake (see GoalNextStep). */
+  nextStep?: GoalNextStep;
   /** Decision telemetry for this goal's life (2026-10-18); optional — records
    *  persisted before the field existed lack it until first decision. */
   decisions?: GoalDecisions;
@@ -78,6 +98,15 @@ export interface GoalRecord {
   evidence?: string;
   blocker?: string;
   stallReport?: string;
+  /** Reactivation (2026-10-20 ruling — goal_next_step on an ended goal): the
+   *  evidence of each reactivated phase, in completion order. The live
+   *  `evidence` belongs to the CURRENT phase; on reactivation it is archived
+   *  here so a later completion does not erase the earlier phase's proof. */
+  evidenceHistory?: Array<{ evidence: string; at: number }>;
+  /** Set when this goal was reactivated via goal_next_step: the prior status
+   *  and the moment of reactivation. The next boundary wake carries a
+   *  reactivation context line from this (buildWakeMessage). */
+  reactivation?: { from: GoalStatus; at: number };
 }
 
 export const GOAL_STORAGE_PREFIX = "goal/";

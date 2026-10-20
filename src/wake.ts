@@ -48,38 +48,21 @@ export function providerPauseRetryText(goalID: string): string {
   return `Provider pause retry: model requests were failing with a provider error (quota/funds) — retrying goal ${goalID}. If a request still fails, note it in your reply — the loop auto-pauses and retries at the next deadline; a clean turn resumes. A user message always overrides this reminder.`;
 }
 
-/** Turns usage text: `used/cap`, or `used/(unbounded)` when cap is open. */
-function turnsUsage(goal: GoalRecord): string {
-  const { used, cap } = goal;
-  return cap.turns !== undefined
-    ? `${used.turns}/${cap.turns}`
-    : `${used.turns}/(unbounded)`;
-}
-
-/** One indented line per task: `N. [status] title`; marker when no tasks. */
-function taskLines(goal: GoalRecord): string {
-  if (goal.tasks.length === 0) return "  (no tasks)";
-  return goal.tasks
-    .map((t, i) => `  ${i + 1}. [${t.status}] ${t.title}`)
-    .join("\n");
-}
+// (2026-10-20 de-cap ruling: the header shows the bare wake counter only —
+// `turn N`, no cap denominator. See buildWakeMessage's doc.)
 
 /**
- * Builds the stall-wake message: re-grounds the goal and forces a terminal
- * tool call (goal_complete / goal_block / advance). `caps` is the
- * caller-provided budget description (e.g. "10 turns / 100k tokens",
- * "unbounded"), embedded verbatim. `wakeText` (Task 14 Fix 3a): when
- * non-empty, appends ONE final line `Extra instruction: <wakeText>` —
- * after the judge section when one is present, directly after the main body
- * otherwise. Absent/empty = byte-identical to the template without it.
+ * builds the WAKE message — the per-turn grounding channel (tail-appended —
+ * appends never break the LLM prefix cache; the plugin writes NO system part).
  *
- * `detail` (2026-10-17, amended same day): the context-hook system part was
- * REMOVED (ruling: the plugin writes NO system part at all — any write, even a
- * byte-stable one, shifts the request prefix at appearance/disappearance and
- * breaks the LLM prefix cache), so the wake message is the per-turn grounding
- * channel (tail-appended — appends never break the prefix).
+ * 2026-10-20 ruling (single wake format — wakeDetail removed): the goal's own
+ * data (objective / per-task progress) is NOT re-stated in the wake — it is
+ * the model's OWN tool-generated data (goal_set / goal_add_task), already in
+ * the conversation context, and after compaction the summary's mandatory
+ * [GOAL STATE] block carries it. The wake = speaker tag + ONE autonomy line +
+ * the next-step section (goal_next_step) only.
  *
- * 2026-10-18 autonomy ruling (reframe): the body is NO LONGER an imperative
+ * Autonomy framing (2026-10-18): the body is NO LONGER an imperative
  * forced-tool-call menu ("End this turn with a tool call: …"). It grants
  * goal-mode autonomy — you advance the goal unattended per its discipline,
  * don't stall on questions to the user — and names the ONLY two stops:
@@ -87,38 +70,68 @@ function taskLines(goal: GoalRecord): string {
  * message always overrides. Enforcement backstop is unchanged: turns that
  * neither stop nor advance still tick the stall ladder.
  *
- * "slim" (2026-10-17 minimal ruling) = header + ONE body line ONLY — no
- * budget/objective/discipline/task lines: the goal tools are already exposed
- * in the model's system prompt (no per-turn re-teaching), and the objective
- * rides the conversation context. "full" adds the per-task progress block.
- * Default "full" (this builder's pre-existing contract; the OPTION default
- * is "slim" — see options.ts).
+ * Header ruling (2026-10-20, user ruling chain): the header is the speaker tag
+ * `[goal] turn-N:` — the goal ID is GONE (the model's goal tools are
+ * session-bound — the controller resolves the goal per session, the ID is
+ * not an input; attribution rides message metadata `goalID` + the decision
+ * log + goal_view output), and the cap denominator is GONE (a visible usage
+ * FRACTION + the growing 1/M..N/M sequence in the wake history reads as
+ * "nearly out of budget" → end-game behavior; the plugin is the budget
+ * authority). Only the bare wake counter survives. The judge/compaction
+ * channels keep their budget context (separate model calls — ruling scope).
+ *
+ * Next-step resume (2026-10-20 ruling — goal_next_step, the dispatch-brief
+ * structure): every boundary wake carries a next-step section, in TWO branches
+ * (both details). Recorded (goal.nextStep set — the session ended its turn
+ * per the rules) → REPLAY the model's own last synthesis and command
+ * verify-then-execute. Absent (the session stopped without recording — the
+ * rules don't force turn-end ritual, so this is the common case) → the wake
+ * commands the model to record one FIRST (the woken turn's guaranteed first
+ * act — the synthesis rides the wake, not the model's spontaneous discipline),
+ * then execute it. The recorded text is user content: verbatim, any language.
+ */
+/**
+ * `wakeText` (Task 14 Fix 3a): when non-empty, appends ONE final line
+ * `Extra instruction: <wakeText>` — after the judge section when one is
+ * present, directly after the next-step section otherwise. Absent/empty =
+ * byte-identical to the template without it.
  */
 export function buildWakeMessage(
   goal: GoalRecord,
-  caps: string,
   judgeInstruction?: string,
   wakeText?: string,
-  detail: "full" | "slim" = "full",
 ): string {
-  const lines =
-    detail === "slim"
-      ? [
-          `[GOAL ${goal.id} | turn ${turnsUsage(goal)}]`,
-          "Goal mode: you advance this goal unattended. Don't ask the user questions and wait — follow the goal's discipline and take the next safe step. The only stops are goal_complete(evidence, a concrete verifiable anchor ≥24 chars) when the goal is done and goal_block(concrete reason) when you are genuinely blocked. A user message always overrides this reminder.",
-        ]
-      : [
-          `[GOAL ${goal.id} | turn ${turnsUsage(goal)}]`,
-          `Budget: ${caps}`,
-          `Objective: ${goal.objective}`,
-          "Progress:",
-          taskLines(goal),
-          "Goal mode: you advance this goal unattended — don't stall on questions to the user. Review the progress above, then:",
-          "- done → goal_complete(evidence): completion criteria met (evidence must be a concrete verifiable anchor: file/test/output, ≥24 chars);",
-          "- genuinely blocked → goal_block(reason), with a concrete reason;",
-          "- otherwise → advance with the next concrete tool per the goal's discipline: if there are no tasks yet, plan first with goal_add_task(title); sync with goal_update_task(ref, status) as you go.",
-          "A user message always overrides this reminder.",
-        ];
+  const lines = [
+    `[goal] turn-${goal.used.turns}: You advance this goal unattended. Don't ask the user questions and wait — follow the goal's discipline and take the next safe step. The only stops are goal_complete(evidence, a concrete verifiable anchor ≥24 chars) when the goal is done and goal_block(concrete reason) when you are genuinely blocked. A user message always overrides this reminder.`,
+  ];
+  // Reactivation context (2026-10-20 ruling): a reactivated goal's first
+  // wakes carry ONE line — the prior status and (if the previous phase
+  // completed) its evidence — so the model picks up where the goal left
+  // off instead of redoing finished work.
+  if (goal.reactivation !== undefined) {
+    const prior = goal.evidenceHistory?.[goal.evidenceHistory.length - 1];
+    lines.push(
+      prior
+        ? `Reactivated from ${goal.reactivation.from} — last completed phase: "${prior.evidence}". That work is already done; pick up where it left off, don't redo it.`
+        : `Reactivated from ${goal.reactivation.from} — pick up where the goal left off.`,
+    );
+  }
+  // Staleness guard: a record more than one turn behind the current usage
+  // means the LAST turn never updated it (the model stopped without
+  // re-recording — e.g. a mid-run restart lost the wake) — an old plan is
+  // not trusted: the record-first line forces a FRESH synthesis.
+  const fresh =
+    goal.nextStep !== undefined && goal.used.turns - goal.nextStep.turn < 2;
+  if (goal.nextStep !== undefined && fresh) {
+    lines.push(
+      `Resume — your last recorded next step (turn ${goal.nextStep.turn}): ${goal.nextStep.text}`,
+      "Verify it is still valid (update it with goal_next_step if the situation changed), then execute it.",
+    );
+  } else {
+    lines.push(
+      "No recorded next step yet — first record one: goal_next_step(<what is done, the ONE next concrete step, how you will judge it>), then execute it.",
+    );
+  }
   if (judgeInstruction !== undefined) {
     lines.push("", `Judge note: ${judgeInstruction}`);
   }

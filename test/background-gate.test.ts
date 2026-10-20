@@ -12,6 +12,15 @@
 // THIS session (its ancestors include this sessionID) is counted. A foreign
 // session (no parent link to us) is invisible to the gate.
 //
+// 2026-10-20 reference-UI ruling (the 1.1.3 zombie-lock fix): an attributed
+// subtask is in-flight only while the host's ACTIVE MAP (GET
+// /api/session/active — the same sessionID→status signal the host UI reads)
+// says "running". The 1.1.3 time-field guess (time.idle absent /
+// idle < updated) is gone: dead sessions' time fields go stale and counted
+// them in-flight forever (16 zombies on 129 held the gate, no wakes).
+// Absent entry = idle = not in flight; "question" (waiting on the user) is
+// not "running" and does not count (the host's own subagent-counter parity).
+//
 // A terminal boundary with in-flight (own shells + attributed subtask
 // sessions) > 0 does NOT wake immediately (the session is already "waiting");
 // its entire action is arming the one-shot progress check (fires in Task 3).
@@ -118,6 +127,7 @@ test("2: 2026-10-18 ruling — an active FOREIGN session (no parent link to us) 
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set ChildGate");
   h.setSession(CHILD, { projectID: "other" }); // a real session, but no parent link to us
+  h.setActiveSessions({ [CHILD]: "running" }); // even a RUNNING foreign session never gates
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight = 0 (own shells 0, subtasks 0) → ordinary wake
   expect(h.prompts.length).toBe(1);
@@ -128,7 +138,8 @@ test("2c: a SUBTASK session (parentID = us) IS counted → gate holds, like the 
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set SubtaskGate");
   h.setSession(S, { location: { directory: "/w" } }); // the subtask query is location-scoped
-  h.setSession(CHILD, { parentID: S }); // host session list: CHILD is OUR in-flight subtask (no idle yet)
+  h.setSession(CHILD, { parentID: S }); // host session list: CHILD is OUR subtask
+  h.setActiveSessions({ [CHILD]: "running" }); // active map: executing now → in flight
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight = 1 (our subtask) → no wake
   expect(h.prompts.length).toBe(0);
@@ -408,7 +419,7 @@ test("19: skipped boundary logs skip (ownKnown false) and warns once per session
     const line = lastDecision(S);
     expect(line?.decision).toBe("skip");
     expect(line?.ownKnown).toBe(false);
-    const shellWarns = warns.filter((w) => String(w[0] ?? "").includes("shell store query failed"));
+    const shellWarns = warns.filter((w) => String(w[0] ?? "").includes("in-flight signal query failed"));
     expect(shellWarns).toHaveLength(1);
   } finally {
     console.warn = origWarn;
@@ -457,6 +468,7 @@ test("22b: a subtask session (parentID = us) IS logged as other=1 and gates: hol
   await h.commandExecutor(S, "/goal set SubtaskLog22b");
   h.setSession(S, { location: { directory: "/w" } });
   h.setSession(CHILD, { parentID: S });
+  h.setActiveSessions({ [CHILD]: "running" });
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight = 1 (our subtask) → hold
   expect(h.prompts.length).toBe(0);
@@ -467,30 +479,66 @@ test("22b: a subtask session (parentID = us) IS logged as other=1 and gates: hol
   await stop();
 });
 
-test("23: a COMPLETED subtask (idle after its last activity) is NOT in flight → wake", async () => {
+test("23: a ZOMBIE subtask (1.1.3 lock case — parent link + stale time, no active entry) is NOT in flight → wake", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set DoneSubtask23");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setSession(CHILD, { parentID: S, time: { updated: 100, idle: 200 } }); // idle after updated → done
+  // 1.1.3's in-flight pattern (updated after idle) — but the host's active map
+  // has NO entry: the session is dead (129's 16 zombies). Not counted.
+  h.setSession(CHILD, { parentID: S, time: { updated: 200, idle: 100 } });
   await modelWorked(h, "a");
-  await h.emit(succeeded("b1", S)); // in-flight = 0 (subtask is idle) → wake
+  await h.emit(succeeded("b1", S)); // in-flight = 0 (subtask not running) → wake
   expect(h.prompts.length).toBe(1);
   const line = lastDecision(S);
-  expect(line?.other).toBe(0); // completed subtask not counted
+  expect(line?.decision).toBe("wake");
+  expect(line?.other).toBe(0); // zombie subtask not counted (the 1.1.3 bug, pinned)
   await stop();
 });
 
-test("24: an in-flight subtask (turn started after its last idle) IS counted → hold", async () => {
+test("24: a RUNNING subtask (active map says running) IS counted → hold", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set InFlightSubtask24");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setSession(CHILD, { parentID: S, time: { updated: 200, idle: 100 } }); // updated after idle → in flight
+  h.setSession(CHILD, { parentID: S });
+  h.setActiveSessions({ [CHILD]: "running" }); // executing now (LLM turn or long tool wait)
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight = 1 → hold
   expect(h.prompts.length).toBe(0);
   const line = lastDecision(S);
   expect(line?.decision).toBe("hold");
   expect(line?.other).toBe(1);
+  await stop();
+});
+
+test("25: a subtask in \"question\" state (waiting on the user, not executing) is NOT counted → wake", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Question25");
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setSession(CHILD, { parentID: S });
+  h.setActiveSessions({ [CHILD]: "question" });
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // only "running" counts (the host's own subagent-counter parity)
+  expect(h.prompts.length).toBe(1);
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("wake");
+  expect(line?.other).toBe(0);
+  await stop();
+});
+
+test("26: active-map query failure fails OPEN (wake with other=0 — not skip: the shell query succeeded)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Fail26");
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setSession(CHILD, { parentID: S });
+  h.setActiveSessions({ [CHILD]: "running" });
+  h.failActiveSessions(true);
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // list ok + active map failed → fail open (0 subtasks) → wake
+  expect(h.prompts.length).toBe(1);
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("wake");
+  expect(line?.other).toBe(0);
+  expect(line?.ownKnown).toBe(true);
   await stop();
 });
 
@@ -504,5 +552,104 @@ test("20: an ordinary wake boundary logs wake (ownKnown, in-flight 0)", async ()
   const line = lastDecision(S);
   expect(line?.decision).toBe("wake");
   expect(line?.ownKnown).toBe(true);
+  await stop();
+});
+
+// ── 2026-10-20 queued-input ruling (129 incident: a [GOAL] wake observed
+// queued behind the user's own message — a wake must NEVER appear in the
+// queue; undelivered inbox items gate the wake like in-flight work). ──
+
+test("27: queued undelivered user input at the boundary → HOLD (no wake — a wake would land in the queue)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Queued27");
+  h.setSession(S, { location: { directory: "/w" } });
+  // The user's message was sent while the turn below was running → the host
+  // parked it in the inbox (undelivered). The boundary must not wake: the
+  // queued turn is guaranteed to run next and produce its own boundary.
+  h.inbox.set(S, [{ id: "inb_q1", sessionID: S, type: "user", delivery: "queue" }]);
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // queued = 1 → hold
+  expect(h.prompts.length).toBe(0);
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("hold");
+  expect(line?.queued).toBe(1);
+  expect(line?.own).toBe(0);
+  expect(line?.other).toBe(0);
+  await stop();
+});
+
+test("28: queued input is DELIVERED (inbox empty) at the boundary → wake as usual", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Queued28");
+  h.setSession(S, { location: { directory: "/w" } });
+  h.inbox.set(S, []); // nothing pending
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // queued = 0 → wake
+  expect(h.prompts.length).toBe(1);
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("wake");
+  expect(line?.queued).toBe(0);
+  await stop();
+});
+
+test("29: a pending NON-user item (synthetic shell result) also gates → hold", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Queued29");
+  h.setSession(S, { location: { directory: "/w" } });
+  // Any undelivered kind (user/synthetic/compaction/move) means the next
+  // execution is coming — the wake would queue behind it either way.
+  h.inbox.set(S, [{ id: "inb_q2", sessionID: S, type: "synthetic", delivery: "queue" }]);
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S));
+  expect(h.prompts.length).toBe(0);
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("hold");
+  expect(line?.queued).toBe(1);
+  await stop();
+});
+
+test("30: inbox query failure fails CLOSED (skip — an invisible queue must not open the wake path)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Fail30");
+  h.setSession(S, { location: { directory: "/w" } });
+  h.failInboxList(true);
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // gate signal unavailable → skip
+  expect(h.prompts.length).toBe(0);
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("skip");
+  expect(line?.ownKnown).toBe(false);
+  await stop();
+});
+
+test("31: reply to OUR check-in wake while user input is queued → HOLD (the §7.1 (a) exception yields to the queued gate)", async () => {
+  // Review finding C1 (2026-10-20): the (a) exception sent a reply to our own
+  // watchdog wake straight to normal arbitration — ignoring `queued`. When
+  // the user's message had landed in the final window (parked in the inbox,
+  // its enqueued ECHO lost → lastInbox still our check-in wake), the boundary
+  // injected a WAKE with queued > 0 — the wake queued behind the user's own
+  // message (the 129 invariant this release exists to fix).
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Queued31");
+  h.setSession(S, { location: { directory: "/w" } });
+  // Arm the check-in (in-flight boundary) and let the 1ms tick fire it —
+  // lastInbox is now our watchdog wake.
+  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // in-flight → hold, check-in armed (1s)
+  await sleep(1500); // past due: the tick fires the check-in
+  expect(h.prompts.length).toBe(1);
+  // The user's message landed in the final window (after the last model call)
+  // → parked in the inbox, and its enqueued ECHO was lost — lastInbox still
+  // points at our check-in wake (the exact 129 shape, spec §42).
+  h.setShells([]);
+  h.inbox.set(S, [{ id: "inb_q31", sessionID: S, type: "user", delivery: "queue" }]);
+  await modelWorked(h, "b");
+  await h.emit(succeeded("b2", S)); // boundary: queued=1, last=our watchdog wake
+  expect(h.prompts.length).toBe(1); // NO new wake — it would queue behind the user's message
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("hold");
+  expect(line?.queued).toBe(1);
+  expect(line?.own).toBe(0);
   await stop();
 });

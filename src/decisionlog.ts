@@ -13,6 +13,8 @@ export interface DecisionEntry {
   goalID?: string;
   own?: number;
   other?: number;
+  /** Queued undelivered inbox items at the boundary (2026-10-20 queued-input ruling). */
+  queued?: number;
   ownKnown: boolean;
   decision: "wake" | "hold" | "skip";
   reason: string;

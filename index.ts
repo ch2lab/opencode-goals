@@ -18,6 +18,42 @@ import type { HostEvent, InboxRef, SessionMessage, WakeProbe } from "./src/types
 
 type PendingRegistration = Promise<Registration | undefined>;
 
+// Host Tool.Info builder, shared by single (registerTool) and group
+// (registerToolGroup) registration. 2.0.32 Options carries `codemode`
+// (subagent precedent: codemode:false = native tools-array exposure) and
+// `namespace` (the model sees `namespace_name`); older hosts ignore unknown
+// option fields — in-process editor, no codec boundary.
+function hostToolInfo(
+  name: string,
+  spec: { description: string; input: unknown; permission?: string; codemode?: boolean; namespace?: string },
+  run: (input: unknown, sessionID: string) => Promise<string>,
+) {
+  const hasOptions =
+    spec.permission !== undefined || spec.codemode !== undefined || spec.namespace !== undefined;
+  return {
+    name,
+    input: spec.input as never, // our specs are plain JSON Schema objects
+    description: spec.description,
+    options: hasOptions
+      ? {
+          ...(spec.namespace !== undefined ? { namespace: spec.namespace } : {}),
+          ...(spec.permission !== undefined ? { permission: spec.permission } : {}),
+          ...(spec.codemode !== undefined ? { codemode: spec.codemode } : {}),
+        }
+      : undefined,
+    execute: async (input: unknown, context: { sessionID: string }) => {
+      // Host Tool.Result (schema/tool.d.ts): `output` is only legal when the
+      // tool declares an `output` schema; ours declares none →
+      // OutputValue<undefined> = never. Return `content` (string) instead —
+      // the reference plugin's shape. Live A/B (2026-10-16) proved the old
+      // `{ output: ... }` made the host mark every call "declared output
+      // without an output schema" (status error) and hide the real result
+      // text from the model.
+      return { content: await run(input, context.sessionID) };
+    },
+  };
+}
+
 export default Plugin.define({
   id: "opencode-goal",
   setup: async (ctx) => {
@@ -258,6 +294,19 @@ export default Plugin.define({
         return r.value ?? [];
       },
 
+      // Host active map (hostapi): GET /api/session/active, location-scoped —
+      // {data: Map<sessionID, status>}, the host's in-memory liveness state
+      // (the signal the UI reads; 2026-10-20 reference-UI ruling: the
+      // in-flight subtask criterion is status === "running"). A query failure
+      // throws here (countSubtasksInFlight catches and fails open).
+      activeSessions: async (locationDirectory) => {
+        const r = await hostApi.activeSessions(locationDirectory);
+        if (r.state !== "ok") {
+          throw new Error(`active map query failed (${r.reason})`);
+        }
+        return r.value ?? {};
+      },
+
       // ctx.command.transform(e => e.add(CommandDefinition { name,
       // description?, execute(input: CommandInvocation { sessionID,
       // prompt: { text }, delivery }) })) (plugin/dist/promise/command.d.ts).
@@ -280,6 +329,21 @@ export default Plugin.define({
         );
       },
 
+      // ctx.tool.transform(e => e.namespace({ name, description })) — declares
+      // the namespace the tools group under (host editor.namespace,
+      // MCP-server style). The host's catalog groups by it; the model sees
+      // flattened `namespace_name` tools.
+      registerNamespace: (name, description) => {
+        remember(
+          ctx.tool.transform((e) => {
+            e.namespace({ name, description });
+          }).catch((err) => {
+            console.warn(`opencode-goal: namespace "${name}" declaration failed:`, err);
+            return undefined;
+          }),
+        );
+      },
+
       // ctx.tool.transform(e => e.add(Info)) (plugin/dist/promise/tool.d.ts;
       // Info extends schema/tool.d.ts Tool.Info: { name, input: ValueSchema,
       // description, options?: { namespace?, permission? }, execute(input,
@@ -288,24 +352,22 @@ export default Plugin.define({
       registerTool: (name, spec, run) => {
         remember(
           ctx.tool.transform((e) => {
-            e.add({
-              name,
-              input: spec.input as never, // our specs are plain JSON Schema objects
-              description: spec.description,
-              options: spec.permission !== undefined ? { permission: spec.permission } : undefined,
-              execute: async (input, context) => {
-                // Host Tool.Result (schema/tool.d.ts): `output` is only legal when the tool
-                 // declares an `output` schema; ours declares none →
-                 // OutputValue<undefined> = never. Return `content` (string)
-                 // instead — the reference plugin's shape. Live A/B (2026-10-16)
-                 // proved the old `{ output: ... }` made the host mark every
-                 // call "declared output without an output schema" (status
-                 // error) and hide the real result text from the model.
-                 return { content: await run(input, context.sessionID) };
-              },
-            });
+            e.add(hostToolInfo(name, spec, run));
           }).catch((err) => {
             console.warn(`opencode-goal: tool "${name}" registration failed:`, err);
+            return undefined;
+          }),
+        );
+      },
+      // ONE transform for the whole group (MCP-server style): one commit, one
+      // Registration — atomic teardown, one catalog rebuild; a malformed
+      // entry only lands in the host's registration errors (siblings safe).
+      registerToolGroup: (tools) => {
+        remember(
+          ctx.tool.transform((e) => {
+            for (const t of tools) e.add(hostToolInfo(t.name, t, t.run));
+          }).catch((err) => {
+            console.warn("opencode-goal: tool group registration failed:", err);
             return undefined;
           }),
         );
@@ -363,11 +425,13 @@ export default Plugin.define({
       //   ours → host:    undefined (leave) → leave the payload untouched;
       //                    { effect, message? } → p.effect = effect,
       //                    p.message = message when present.
-      // TODO(task13): confirm in live smoke that mutating p.effect/p.message
-      // in place is the host's real decision channel for "evaluate" hooks
-      // (and that p.effect on entry is the configured effect). If the
-      // mechanism differs, only this adapter changes — the controller
-      // contract (PermissionHookInput / PermissionDecision) does not.
+      // task13 closed 2026-10-20 (live smoke): mutating p.effect/p.message in
+      // place IS the host's real decision channel for "evaluate" hooks —
+      // proven end-to-end on a 2.0.32 production host and the isolated serve
+      // host (model goal_* calls passed this hook's self-grant and reached
+      // the plugin). If the mechanism ever differs, only this adapter
+      // changes — the controller contract (PermissionHookInput /
+      // PermissionDecision) does not.
       onPermissionHook: (fn) => {
         remember(
           ctx.permission.hook("evaluate", (p) => {

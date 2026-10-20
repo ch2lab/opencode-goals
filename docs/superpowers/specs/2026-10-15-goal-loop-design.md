@@ -515,7 +515,7 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 - **仲裁顺序**：主体 §6 序列 ②（在飞门禁）与 ④（预算）互换——实际顺序 = 去重/续接窗 → active goal → **预算（isCapReached → budget_limited 终态 + 归档）** → provider 暂停（§20）→ 在飞门禁（hold/check-in）→ 归属。后果：在飞 shell 的边界上预算超顶直接判 budget_limited，而非 hold 住等下一边界。
 - **细粒度子命令**（2026-10-17 用户裁定，主体 §13 只记了单一 `/goal` 面）：`goal-set / goal-view / goal-pause / goal-resume / goal-complete / goal-block / goal-clear` 各注册独立命令（/ 菜单一行一条，逐行参数帮助），路由回同一 dispatchCommand。
 - **stallReport 结构定稿**：四段（objective / 任务快照 / 最后无动作原文 ≤3 轮 / Judge 段），**无"建议的下一步"段**（主体 §8 该句作废）。
-- **permission evaluate 契约**（2.0.32 实证，主体 §4"同旧插件同面"不成立）：宿主回调签名 `(input) => Promise<void>` **无返回通道**，决策靠原地改写 payload（`p.effect` / `p.message`）；代码内 TODO(task13) 标注未做实机终审。
+- **permission evaluate 契约**（2.0.32 实证，主体 §4"同旧插件同面"不成立）：宿主回调签名 `(input) => Promise<void>` **无返回通道**，决策靠原地改写 payload（`p.effect` / `p.message`）；task13 实机终审 2026-10-20 完成（生产 2.0.32 桌面 + 隔离 serve 宿主端到端：模型的 `goal_*` 调用经此钩子自授权后派发进插件）。
 - **shell 退出唤醒**（主体 §7.2 措辞校准）：实际是**每个**曾入 waitingShells 的 shell 结束各投递一条结果唤醒（逐 shell 的 status/退出词/输出尾部），非"最后一个结束时投递一条"；测试 `test/watchdog.test.ts` 钉 per-shell 行为。
 
 ## 36. 2026-10-18 修订（provider 暂停重试 one-shot 守卫：retrySent）
@@ -564,3 +564,110 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 **测试**（323 用例，全绿）：`test/harness.ts`（probe 加 `sessionList`；`setSession` 扩展 `time`/`outcome`）；`test/background-gate.test.ts`（子任务用例 2c/22/22b 改靠会话列表发现、不再靠 `emit(started)`；新增 23/24 钉在飞信号：`idle >= updated` 完成不计 / `updated > idle` 在飞计数）；`test/watchdog.test.ts`（test 1 改写：shell 在飞 → 边界武装检查、`shell.ended` **不再**快路径唤醒、检查到点 nudge；test 2〔快路径去重守卫〕删除；test 5 去 `shellTimeouts` 断言、留 `timeoutWrap` 改写断言）。
 
 **129 边界**：本机沙箱实证（mock LLM，无外网凭据）；发布须用户当轮版本号 + GO。
+
+## 41. 2026-10-20 修订（参考UI 在飞判据：子任务在飞 = 宿主 active map 的 "running"；修 1.1.3 僵尸锁死）
+
+**现场**：1.1.3 上 129 生产——vllm sm70 dev goal 的门禁永久锁死：每个边界 `other:16` 全 hold（"in-flight (check-in armed)"），无边界唤醒，check-in 文案谎报 16 个后台项。16 = 该会话名下的僵尸 subagent 会话（数天前结束；/data/src/vllm-v2 + /data/vllm-origin 各 8，宿主 API + DB + shell store 三源核对无一生还）。
+
+**根因（1.1.3 回归）**：在飞 = `time.idle` 缺失或 `time.idle < time.updated`（§40 信号）。僵尸会话的 time 字段陈旧 / 有迟到写入（updated 08:01 > idle 04:59，根会话同型）→ 谓词恒真 → 门禁永不开。§40 选该信号基于"idle >= updated + 终态 outcome = 完成"的假设；真机数据上完成侧会被迟到写打破，失效方向 = 永久锁死（§7.2 禁止的方向）。
+
+**裁定（用户 2026-10-20）**：插件侧一切"时间窗 / 事件流猜活性"方案不接受（那是猜）——判据**参考 UI**：用 opencode UI 判定会话 active 的同一信号。
+
+**宿主合同（2.0.32，二进制取证 + 129 活探 + 本机隔离宿主实证）**：宿主内存维护 `sessionID→status` 映射（`session.status(sid) = map[sid] ?? "idle"`；取值 idle/running/question）；UI 的 busy = `status === "running"` ∨ pending 非空；宿主自带 "N subagents running" 计数 = 其他会话中 `status === "running"` 的个数；HTTP 面 `GET /api/session/active`（location-scoped，x-opencode-directory 同 /api/session）→ `{data: Map<sessionID,{type:status}>}`——条目值是**对象**（隔离宿主实证 2026-10-20：回合中值 = `{type:"running"}`，回合后无条目；129 活探：僵尸子任务无条目，UI 正因此不显示它们 running）。
+
+**改动**：
+- **数据面**（`src/hostapi.ts` + `src/types.ts`）：新增 `activeSessions(locationDirectory)` → GET /api/session/active（sessionID→status；查询失败 = unavailable，同数据面其余）。
+- **`controller.ts`**：`countSubtasksInFlight` = parentID 链归属（保留）∧ active map `status === "running"`（唯一活性判据：活 subagent——LLM 回合中或等长 shell/工具——其回合在执行中 = running；僵尸无条目 = idle 不计）。删除 time.idle/updated 推断。查询失败：sessionList/activeSessions 任一失败 = fail-open(0)（不变）。
+- **口径（裁定）**：只数 "running"——"question"（等用户回答）/排队不计：子任务卡等用户不是后台进展，不锁门禁；与宿主自带 subagent 计数一致。
+- **失效方向**：宿主真卡死 running → UI 同显，恢复 = 用户 UI 中断会话（宿主有 session.interrupt）→ 门禁与 UI 完全一致；无时间窗、无静默自动过期（那又是猜）。
+- **不变**：own 侧（本会话 shell store 运行中 shell）、check-in 武装/触发/取消骨架、看门狗 tick、stall 阶梯、provider pause、预算、归属；`HostSession.time` 字段保留（兼容，不再做门禁判据）。
+
+**测试**：`test/harness.ts`（probe 加 `activeSessions`；`setActiveSessions` / `failActiveSessions` 后端）；`test/background-gate.test.ts`（2c/22b 改 active running；23 改写为僵尸用例——parent 链 + `updated>idle`（1.1.3 在飞形态）+ 无 active 条目 → wake other=0，直接钉死 1.1.3 回归；24 改 running → hold other=1；新增 25 question 不计 / 26 active 查询失败 fail-open 是 wake 不是 skip；test 2 补 running 外部会话不门禁）。
+
+**验证边界**：stub 套件 + typecheck = stub 层；实机 = `scripts/verify-active.ts`（本机隔离宿主，mock LLM）：/api/session/active 真实数据——idle 空 map、回合中 `{type:"running"}`、回合后无条目（钉非空形态——129 只活探过空 map）；**宿主杀进程重启**（同 env dir 二次拉起）——goal 记录 kv 存活、插件重载、新进程 active map 为空（僵尸锁跨重启不可能存活——1.1.3 数 DB time 字段则相反）、重启后第一个真实边界在**新 pid 决策日志**里真 wake（ownKnown:true、in-flight 0）。环境缺口（本次实测钉住）：隔离框架起的是 plain `serve`，**不写** service.json 注册文件（生产 `serve --service` 才写）→ 插件数据面 no-registry skip；verify 脚本 boot 后补写 `{url,pid,password}` 对齐生产（hostapi 按查询重读）。整循环实机证明（真子任务）= 发布后 129/208 重播 + nudge 日志观察。**边界（2026-10-20 复查确认）**：子任务发现与 active map 均 location-scoped（`x-opencode-directory` = goal 会话目录）——不同目录（如 worktree）的子 agent 会话对门禁不可见（归属语义 = 同 location，不变）。
+
+## §42 队列输入门禁（2026-10-20 裁定；129 现场 incident 驱动）
+
+**Incident（129 现场）**：用户消息在回合执行中发出 → 宿主把它排队（未投递）→ 回合结束的边界到达 → 门禁 in-flight 0（shell/子任务都不看 inbox）→ 注入 wake → **wake 排到用户消息后面进了队列**（UI 里 [GOAL] 出现在排队区，模型还没回用户的话）。违反不变式：**wake 绝不可能出现在排队中**（wake 只在空闲且无后台任务时注入）。根因：归因 ⑤ 把"回合中入队、尚未投递"的 user 条目当作 `last.kind === "user"` → "人在" → 立即 wake；门禁三查询（shell store / sessionList / active map）没有任何一个看 inbox。
+
+**裁定（用户 2026-10-20）**：边界时还有排队的待发送消息 → 不唤醒（和在飞同方向）。
+
+**宿主合同（v2.0.32 源码 + 实宿主 field 实证）**：`GET /api/session/:sessionID/inbox` → `{data: Item[]}`——全部 "durable enqueued session work **not yet delivered**"（user/synthetic/compaction/move 任意 kind，按 enqueue 序；投递后移除，空 = 无排队）。数据面 `hostapi.inboxList` 本就存在（原为 inboxCancel 配套），只是门禁从未调用。
+
+**投递时序（field 实证：隔离真宿主 + 事件捕获 + /inbox 采样器 + mock 请求日志，6 轮）**：宿主把排队条目**消费进运行回合的下一个模型调用**（消费时刻与调用发起对齐——条目在该调用的消息快照里，从 /inbox 列表在发起时刻消失）。因此回合终边界处列表里通常只剩"该回合最后一次模型调用之后才入队"的条目——**final window**（宽度 = 最后一次调用的响应时长；mock LLM = 12s，真 LLM 通常更宽）。每回合调用数（mock 环境 2–14+ 次）与回合长度（24–168s）不可预测。`POST /interrupt?resume=true` **不** park 排队 user 消息：下一个 execution 按 FIFO 投递队首（实证：入队 8ms 后即 interrupt 的条目成为后继 execution 的 prompt；"queued prompts remain parked" 仅对 steer-scoped resume drain 生效）。推论：129 型 incident 要求用户消息恰在边界时刻仍未被消费（单模型调用回合的最后一段）——门禁正 hold 于此。
+
+**改动**：
+- `controller.ts` `inFlightSignal` 加 `queued` = `inboxList(sessionID).length`（任意 kind——任一未投递条目都意味着下一个 execution 即将开始）；查询与 shell store 同一 try：失败 = 宿主上下文死 → ownKnown=false → skip，**fail-closed**（看不见的队列不得打开 wake 路径；区别于子任务查询的 fail-open）。
+- 门禁 = own + other + queued；决策日志加独立 `queued` 字段（hold/wake 都记）；hold reason 区分 `queued input (check-in armed)`（仅 queued 非零时）；check-in 计数/文案仍 background-only（own+other，排队消息不是"后台任务"）。
+- 安全论证：任一未投递条目都会作为下一个 execution 被投递（更快：回合中间就被消费进模型调用，见上）→ 下一边界**保证**到达 → 此处 hold 不可能把循环弄静默；field 实证未观察到排队 user 消息"parked 不投递"（interrupt-resume 不 park，见上）——若未来宿主版本引入 parked 态，逃生阀 = check-in（armed 后 300s 静默必触发，语义不变）。
+- **复查修正（2026-10-20，review finding C1）**：§7.1 (a) 例外（check-in 回复 → 正常仲裁）原先忽略 `queued`——最后 inbox 项是我们的 check-in wake 且用户消息落在 final window（echo 丢失、`lastInbox` stale）时，边界会 WAKE with `queued > 0`（129 incident 变体；provider-pause 重试 wake 同形状）。修正：例外让位于 `queued > 0`——hold + 武装 check-in（check-in 仍是 parked 态的逃生阀，上条语义不变）。stub = `background-gate.test.ts` 31；真宿主 lab 仍结构性不可达（final window 对 12s mock 过窄，见上）→ 生产 `queued` 字段观察。
+
+**测试**：`test/background-gate.test.ts` 27（user 排队 → hold queued=1）/ 28（队列空 → wake queued=0）/ 29（synthetic 也门禁）/ 30（inbox 查询失败 → skip fail-closed）；`test/harness.ts` 加 `failInboxList` 脚本化失败口。
+
+**验证边界**：stub 层 = 上述四用例（正向 hold + fail-closed 全覆盖）；实机 = `scripts/verify-active.ts` 第 5 相（重启后）：
+- 5i：/inbox 真实形态钉死（raw fetch + 连续采样器，`{data: Item[]}`，queued 条目实时可见）。
+- 5j：**129 不变式跨真实边界全程验证**——第 5 相的每条决策行都必须带 `queued`（number）+ `ownKnown:true`（= 门禁在**每个**真实边界都真查了 inbox），且**无任何 `wake` 行 `queued>0`**（wake 绝不可能落在队列里——129 incident 的不变式本身）。
+- 5k：循环在连续边界上持续 wake（队列排干、无静默）。
+- **正向 hold 在 lab 不可构造（field 实证，非代码缺陷）**：宿主循环语义 = "step 边界处 inbox 非空 → 继续发模型调用并消费条目"（纯回合 = 1×12s 单次调用；持续喂条目的回合实测 600s+/50+ 次调用不结束；`interrupt?resume=true` 也不 park——后继 execution 按 FIFO 投递，实证见上节）。因此 lab 里**任何**排队条目都会在终边界前被消费，"终边界处 inbox 非空"（129 形态）结构性不可达。该形态要求条目落在"最后一次模型调用之后"——生产真 LLM 回合的最后一次调用耗时秒至分钟、之后无调用（final window 宽），用户/模型消息落入其中是常态 → **129 生产重播 1.1.4 后观察 `decisions-<pid>.jsonl` 的 `queued` 字段与 hold 行 = 正向实机证明**。
+
+## 43. 2026-10-20 裁定 — goal_next_step 下一步恢复（派发简报结构移植进 goal 循环）
+
+**裁决来源（129 现场观察 → 源码取证）**：129 子任务会话出现自动"续派"消息（## 要做什么 / ## 判据 / ## 交付），子任务自我延续 45 分钟。源码取证（sst/opencode v2.0.32 `packages/core/src/tool/plugin/subagent.ts`）：宿主侧**无**自动机制——续派 = 主会话模型**自己**再次调用 `subagent` 工具（传 `sessionID` 续接 + 新 `prompt`）；宿主只做投递（`sessions.prompt`：idle → 启动 execution，running → steering 排队），完成汇报经 synthetic 消息反向回父会话（`subagent-completion.ts`）。简报内容 **100% 来自主模型在 dispatch 时刻的 LLM 输出**（上下文峰值时刻的当下综合：什么变了 → 下一步做什么 → 判据 → 交付）。用户裁定：主会话的唤醒也按这个形态来。
+
+**关键洞察**：派发简报的可靠性来自**结构**——内容骑在**保证发生的动作**上（模型决定派活那一刻必带简报），而非可选仪式。我们的规则唤醒无法保证"回合末"有模型动作（回合结束形态多样：回完用户问题就停 / 派活去等 / 报错截断），但唤醒自身保证"回合首"有模型动作——所以综合步骤锚在**被唤醒回合的第一步**（由唤醒提示词指令），不靠模型自觉。
+
+**设计（两分支 + 陈旧守卫）**：
+- 新工具 `goal_next_step(text)`：模型记录"现状 → 唯一的下一步 → 怎么判"。同族门禁（goal.control 权限 + 非 terminal goal）；写入 `GoalRecord.nextStep {text, turn, ts}` 随记录 kv 持久化——**跨压缩、跨宿主重启存活**；terminal goal 拒写（值只在 goal 活着时移动）。
+- 唤醒两分支（slim/full 都有，插在正文后、judge/wakeText 通道前）：
+  - **情况 1（已记录且新鲜——`used.turns − nextStep.turn < 2`）**：回放 `Resume — your last recorded next step (turn N): <原文>` + "核对仍成立（变了就更新），然后执行"。
+  - **情况 2（未记录 / 陈旧）**：`No recorded next step yet — first record one: goal_next_step(<现状 → 下一步 → 判据>), then execute it.`——一句同时完成"提醒生成 + 让它继续工作"：模型执行后下一边界自然进入情况 1（自愈闭环）。
+- 陈旧守卫：记录落后当前 usage ≥2 turn = 上一轮没更新（典型：run 中重启丢了唤醒）→ 旧计划不可信，按情况 2 逼新综合。
+- i18n 裁定沿用：模板英文；记录文本是用户内容，原样回放（任意语言）。
+
+**改动**：`state.ts`（`GoalNextStep` + `GoalRecord.nextStep?` 可选字段——旧记录自然无该行）；`controller.ts`（工具注册 + `toolNextStep` + `nextStepUpdate`）；`wake.ts`（`buildWakeMessage` 两分支 + 陈旧守卫）；`scripts/verify-active.ts`（5l 相：mock 脚本化发一次 `goal_next_step` 工具调用——由唤醒文本的 record-first 行自身触发、自同步无竞态；5l-a = 真宿主把模型的工具调用派发给插件工具并持久化，5l-b = 下一边界唤醒文本真含 Resume 回放行）。
+
+**测试（stub）**：`test/wake.test.ts`（回放分支 / record-first 分支 / 陈旧分支 / 行序 / CJK 边界 + 两个 pinned 模板更新）+ `test/goal-loop.test.ts` 8b（写入带 turn+ts、last-write-wins、坏输入、terminal 拒写、无 goal 拒绝）+ 10（12 个工具注册）/ 11（坏输入表）。
+
+**验证边界**：实机 = `verify-active.ts` 5l（工具派发 + 持久化 + 回放全链路）；"模型自觉在回合末调用 goal_next_step"是 lab mock 不可控行为（mock 只回固定文本）——留 129 生产观察（重播 1.1.4 后：goal 会话是否自发维护记录、唤醒是否走 Resume 分支）。
+
+**追加裁定（同日，唤醒头行三步裁定，最终形态）**：
+1. **去帽**：头行 `[GOAL id | turn 3/10]` 的**分母（上限）删除**，只留裸计数器；full 档的 `Budget: 10 turns / unbounded tokens` 行同步删除（`buildWakeMessage` 的 caps 参数整个移除）。理由：可见的**使用率分数**（加上唤醒历史里 1/M..N/M 的递增序列）会被模型读成"额度快用完/上下文快耗尽"→ 终局行为（输出缩水、过早弱证据 goal_complete、不敢派新工作）。插件才是预算权威（cap → budget_limited 归档），模型不需要看见自己的倒计时。
+2. **去 ID**：goal id 一并删除——模型的 goal 工具是**会话绑定**的（插件按 session 解析 goal，ID 不是工具输入），归因全部走文本外通道：消息 metadata `goalID`、决策日志、`goal_view` 输出。
+3. **发言人标签 + 单一唤醒形态**（用户提议与裁定："内容不用重渲染——next_step 的内容是要的"）：头行 = 发言人标签 `[goal] turn-N:`（小写、连字符计数器，与自主条款行同段）；`wakeDetail` 选项删除，`buildWakeMessage` 不再接受 detail 参数。唤醒 = `[goal] turn-N: <自主条款行>` + next-step 段（record-first / Resume 回放，**保留——用户点名要**）+ 可选 judge/wakeText 通道。full 的 Objective/Progress/强制工具菜单重渲染整体作废：那些是**模型自己调工具生成的数据**（goal_set/goal_add_task），本来就在会话上下文里；compaction 后由摘要的 `[GOAL STATE]` 块携带。用户内容（objective/任务标题/记录文本）**逐字保留、不压平**——字段（`Progress:`、`  N. `、`Resume —`）本身是"新行 + 标记"，边界天然不混。spec §33 的 wakeDetail 历史保留，以本条为准。
+
+作用域限定：**只动唤醒文本**——judge/compaction 通道（独立的模型调用，不同目的）、`[GOAL STATE]` compaction 锚、goal_set/goal_view 的展示（含 `goal_view` 输出里的 ID）保持原样。
+
+**追加裁定（同日，暴露通道）：全部 goal_* 工具原生暴露（`codemode: false`）+ `goal` namespace 组注册（MCP-server 式），工具调用设计本身不变**
+- 裁定来源（宿主源码深查）：`subagent.ts` L104 `options: { codemode: false }` 解释了子任务派发的"干净形态"——subagent 注册为**原生**工具（进模型请求的 OpenAI `tools` 数组，模型直接调用，会话记录是干净的工具芯片）；宿主 2.0.32 的 `@opencode/schema/tool` `Options` 带 `codemode` 字段。我们此前的 12 个 goal_* 工具注册未传该字段 → 默认 Code Mode 通道（模型只能经 `execute` 代码块触达，记录里是 execute 代码块形态）。用户裁定：既然 opencode 自己全是工具调用，**保持原工具调用设计**（两分支 next-step section、服务端 turn/ts 盖章全部不变），只把 `goal_next_step` 的注册改为 `codemode: false`（同日两度扩权：① 全部 12 个原生 ② namespace 分组 + 单组 transform 注册）。
+- 设计：裁定两度扩权（同日）——① **全部 12 个 goal_* 工具都 flip 为 `codemode: false`**（最初裁"只 flip goal_next_step"被用户否决：一致性与记录洁净优先）。`registerTool` 透传 `codemode` 进 `options`+ ② **`goal` namespace 组注册（MCP-server 式）**：宿主 `Options` 带 `namespace`，工具 `effectiveName` = `namespace_name`（host `tool/runtime.ts` L278-281）→ namespace `goal` + 注册名去前缀（set/complete/.../next_step/...）= **模型可见名零变化**（展平后仍是 goal_set/goal_next_step/...），会话记录、wake 文本、129 生产数据无需迁移；共享 `GOAL_TOOL_OPTIONS`（gate + codemode + namespace）单一来源；**一个 transform 提交全组**（`registerToolGroup` = 一次 `ctx.tool.transform` 内多个 `e.add` = 一个 Registration：整组原子装卸、一次目录提交、坏条目只进宿主 registration errors 不连累同组）。`registerTool`/`registerNamespace`/`registerToolGroup` 透传进 `options`（types.ts spec 扩 `codemode?`/`namespace?`）。旧宿主兼容：字段被忽略（插件 ctx 是进程内工具编辑器，无编解码边界）→ 工具降级回 Code Mode-only，不丢失。接受代价：每个会话的模型请求 tools 数组多 ~1K token 工具描述（含非 goal 会话）；非 goal 会话误调用只得到 "no active goal"，无副作用。
+- 效果：模型请求 tools 数组 12→24（12 内置 + 12 个 goal_* 展平名；goal 与非 goal 会话都可见；非 goal 会话调用即 "no active goal"，无害）；记录里是 `goal_next_step` 等芯片（part 存 namespace=goal + name=next_step，展示层展平；Code Mode 目录路径 `goal.<name>`）。
+- 验证：stub = `goal-loop.test.ts` 10（**全部 12 个** `codemode:false` + `namespace:"goal"` + namespace 已声明）；实机 = `verify-active.ts` **5l-0**（宿主模型请求 tools 数组含全部 12 个 goal_*）+ 5l mock 脚本化原生 tool_call + 5l-a/b 不变（派发 + 持久化 + Resume 回放）；真 LLM 沙箱 `verify-nextstep-llm.ts`（模型直接原生调用，通过判据 A/B 不变）。129 生产种子（2026-10-20 04:27Z 起 seed 1792470397562）已验证重载与 tools 数组；单组 transform 版真宿主验证通过后再重播种（新 ts + nudge）。
+
+## 44. 2026-10-20 裁定 — goal_next_step 复活终态 goal（新相位语义）+ 默认不限预算
+
+**裁决来源（129 现场 → 用户裁定链）**：会话 `ses_ed179b5deffdcXDIjX3reJ1R8J` 的 goal `g_mvg7azbm_0`（四环收口，cap 250）05:09:30Z 正常 `goal_complete`（evidence 硬：1.068ms/72.2GB/s ×3 复核）并归档；用户随后给出新方向（"逮 NCCL 源码、赶上 1.39×"），模型惯性调用 `goal_next_step`（记录"虚拟通道"计划）→ 被拒 "no active goal"。用户裁定：**调 `goal_next_step` 时若会话最近一个 goal 处于非激活态，就重新激活它**；追问两轮后边界收敛为——**只有 `cleared` 不可复活**（用户的显式清除，模型不得推翻）；随后追加"默认情况下应该不限"，裁定为**默认不限轮次、不限预算**。
+
+**复活状态矩阵**（`nextStepUpdate` 查本会话最近一个 goal 记录——active slot 恒为最新 goal）：
+
+| 当前状态 | 行为 |
+|---|---|
+| `active` | 不变：照旧记录（turn = 当前 used.turns） |
+| `completed` / `paused` / `blocked` / `stalled` | **复活**为新相位（见下） |
+| `cleared` | 拒绝："was explicitly cleared — it stays terminal; … call goal_set with a new objective" |
+| `budget_limited` | 拒绝："is budget_limited (used …; cap: …) — it stays terminal; … call goal_set with a larger budget" |
+| 无记录 | "no active goal for this session — call goal_set first (only when the user explicitly asks for a goal)" |
+
+**复活记账（新相位语义）**：`used` 清零 + `stalls` 清零（新相位拿满额 cap 预算，cap 本身不变）、`waitUntil` 清除（旧相位的 goal_wait 静默窗口不得随新相位走——否则"loop resumes"最长要等 60 分钟才兑现）、`providerPause` **保留**（provider 故障保护仍有效且自清除：到期 watchdog 重试唤醒）、旧 `evidence` 移入 `evidenceHistory`（追加，不清——后续再次 complete 不抹掉前段证据）、`blocker` 丢弃（stale blocker 不随新相位走，同 resume 纪律）、`reactivation = {from, at}` 盖章（供唤醒文案）、`decisions`/`continuations` 计数器**不清**（账要全）、刚记录的 next_step = 新相位 turn 0（turn = 记录时的 used.turns，沿用既有约定）。回复模型 "goal g_x reactivated (was <from>); next step recorded (turn 0) — the loop resumes"。
+
+**安全性依据（用户追问"其余为什么都行"的回答，写入设计）**：终端 goal 永不被 wake——终态后模型回合只能由**外部事件**（用户消息 / subagent 回调）驱动，所以每次复活都被一次外部动作 gating，不是循环自驱；cap 仍约束每段相位的用量。`cleared` 与 `budget_limited` 例外：前者是用户对目标本身的否定，后者是**用户显式设的上限**被触了——两者都是"你的决定"，模型一个 next_step 不该推翻（`budget_limited` 的正确路径 = `goal_set` 更大 cap 的新 goal）。`goal_resume` 语义不动（paused/blocked/budget_limited 可 resume，completed/stalled/cleared 硬终端）。
+
+**唤醒文案**：`buildWakeMessage` 在头行后插入**一行**复活上下文（仅当 `reactivation` 字段存在）：有前段 evidence → `Reactivated from <from> — prior phase ended: "<evidence>". That work is already done; pick up where it left off, don't redo it.`；无（从 paused/blocked/stalled 复活）→ `Reactivated from <from> — pick up where the goal left off.`。
+
+**默认不限预算（配套裁定）**：`goal_set`/`/goal set` 不带 `--turns` 时不再落默认 10 turns——`cap = {}`（turns/tokens 均无上限，`isCapReached` 对缺失维度不比较）。`budget_limited` 从此只在**显式设限**的 goal 上触发；默认 goal 的寿命终结点 = completed / stalled（3 连停，judge 默认关）/ 用户 clear。`defaultCapTurns` 插件选项**保留**为显式 opt-in（正整数；非法值 = 不限，不再回落 10）；`defaultCapTokens`、`--turns/--tokens/--unbounded` 行为不变。渲染层无需改（`capText`/`budgetText`/`turnsUsage` 原本就有 unbounded 分支）。
+
+**改动**：`state.ts`（`GoalRecord.evidenceHistory?` + `reactivation?`）；`options.ts`（`defaultCapTurns` 变可选、无默认、`numOpt` 解析）；`controller.ts`（`nextStepUpdate` 复活分支 + 三条文案 + goal_set/goal_next_step 工具描述 + USAGE 行）；`wake.ts`（复活上下文行）。`/goal resume`、judge、compaction、decision log 均不动。
+
+**测试（stub，TDD 先红后绿）**：`options.test.ts`（默认 undefined / 显式 20 生效 / 非法 10.5 → undefined）；`goal-loop.test.ts` 1（cap `{}` + view "unbounded turns / unbounded tokens"）、8（cap `{}`）、8b（terminal 拒写改用 cleared 场景）、**8c**（completed/paused/blocked/stalled 四态复活：计数清零、evidence→history、reactivation 盖章、blocker 丢弃、nextStep turn 0）、**8d**（cleared/budget_limited 拒绝且记录不动）；`wake.test.ts`（复活行有/无两态 + 回放共存）；`compact.test.ts`（unbounded 渲染措辞 `0/(unbounded)`）。
+
+**验证边界**：实机 = `verify-active.ts` 扩展相（真宿主：complete → 原生 `goal_next_step` → 断言复活记录 + 下一边界唤醒文本含复活行 + 默认 goal 的 view 显示 unbounded）；留 129 生产观察（重播后：129 会话里 completed goal 的 next_step 调用是否走复活分支、新相位 wake 是否带复活行）。
+

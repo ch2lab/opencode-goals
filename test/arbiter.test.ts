@@ -131,7 +131,7 @@ test("1: boundary wake — succeeded with sessionID + event id injects a queue w
   expect(p.metadata?.goalWake).toBe(true);
   expect(p.metadata?.goalID).toBe(g.id);
   expect(p.metadata?.goalTurn).toBe(1);
-  expect(p.text).toContain(g.id);
+  expect(p.text).not.toContain(g.id); // 2026-10-20 de-id ruling: the id rides metadata, not the text
   const after = goalOf(h)!;
   expect(after.used.turns).toBe(1);
   expect(after.continuations).toBe(1);
@@ -139,40 +139,25 @@ test("1: boundary wake — succeeded with sessionID + event id injects a queue w
   await stop();
 });
 
-test("1b: wake transcript footprint — default is 'slim' (header + trigger only, minimal ruling); wakeDetail 'full' re-states budget/objective/progress", async () => {
-  // Default (options.wakeDetail "slim", 2026-10-17, then minimized): the
-  // goal tools are exposed in the model's system prompt and the objective
-  // rides the conversation context, so the slim wake is the header + ONE
-  // forced-tool-call line only — no re-teaching, no re-grounding text.
+test("1b: wake transcript footprint — ONE format: tag + autonomy line, no goal content re-stated (single-format ruling)", async () => {
+  // 2026-10-17 minimal ruling, 2026-10-20 single format (wakeDetail removed):
+  // the goal tools are exposed in the model's system prompt and the objective
+  // rides the conversation context (post-compaction: the summary's [GOAL STATE]
+  // block), so the wake re-states nothing — no budget, no objective, no
+  // progress, no tool re-teaching.
   {
     const { h, stop } = await boot();
     const g = await setGoalDirect(h);
     await h.emit(succeeded("e1"));
     const t = h.prompts[0].input.text;
-    expect(t).toContain(`[GOAL ${g.id} | turn 1/(unbounded)]`);
+    expect(t).toContain("[goal] turn-1: You advance");
     expect(t).toContain("goal_complete");
     expect(t).toContain("goal_block");
-    // minimal ruling: the wake no longer re-states goal content or tools
     expect(t).not.toContain("Budget:");
     expect(t).not.toContain(`Objective: ${g.objective}`);
     expect(t).not.toContain("goal_add_task");
     expect(t).not.toContain("goal_update_task");
     expect(t).not.toContain("Progress:");
-    await stop();
-  }
-  // Explicit "full": adds the per-task progress block (budget + objective +
-  // progress re-grounded inside the wake message itself).
-  {
-    const h = await createHarness();
-    const ctrl = new GoalController(h.probe, resolveOptions({ wakeDetail: "full" }), {});
-    const stop = await ctrl.start();
-    const g = await setGoalDirect(h);
-    await h.emit(succeeded("e1"));
-    const t = h.prompts[0].input.text;
-    expect(t).toContain("Budget: unbounded turns / unbounded tokens");
-    expect(t).toContain(`Objective: ${g.objective}`);
-    expect(t).toContain("Progress:");
-    expect(t).toContain("Review the progress above");
     await stop();
   }
 });
@@ -461,7 +446,7 @@ test("14: options.wakeText appends an Extra instruction line to the boundary wak
   const p = h.prompts[0].input;
   expect(p.metadata?.goalWake).toBe(true);
   expect(p.metadata?.goalID).toBe(g.id);
-  expect(p.text).toContain(`[GOAL ${g.id}`); // the normal wake body is intact
+  expect(p.text).toContain("[goal] turn-1: You advance"); // the normal wake body is intact
   expect(p.text).toContain("Extra instruction: 务必先看 CI 日志"); // options.wakeText landed (user content stays verbatim)
   expect(p.text.endsWith("Extra instruction: 务必先看 CI 日志")).toBe(true); // final line
   await stop();

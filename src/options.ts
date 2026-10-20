@@ -2,7 +2,10 @@
 
 export interface Options {
   stallLimit: number;
-  defaultCapTurns: number;
+  /** 2026-10-20 ruling: goals are UNBOUNDED by default (no default cap).
+   *  Explicit opt-in: when set (positive integer), goal_set / `/goal set`
+   *  without an explicit turns value caps at this. */
+  defaultCapTurns?: number;
   /** 2026-10-16 ruling: tokens are statistics by default — no token cap unless
    *  explicitly set (this option or `--tokens`). */
   defaultCapTokens?: number;
@@ -24,20 +27,14 @@ export interface Options {
    *  (default 30 min — long enough for funds/model to be fixed, short enough
    *  that a self-healing provider re-joins the loop without human action). */
   providerPauseMs: number;
-  /** Wake transcript footprint: "full" (budget + objective + per-task
-   *  progress re-grounded in the wake message) or "slim" (2026-10-17 minimal
-   *  ruling: header + ONE forced-tool-call line only — the goal tools are
-   *  exposed in the model's system prompt and the objective rides the
-   *  conversation context, so the wake re-teaches and re-states nothing).
-   *  Default "slim". */
-  wakeDetail: "full" | "slim";
   wakeText?: string;
   model?: ModelRef;
 }
 
 const DEFAULT_OPTIONS: Options = {
   stallLimit: 3,
-  defaultCapTurns: 10,
+  // 2026-10-20 ruling: no default cap — goals are unbounded unless the user
+  // opts in via defaultCapTurns / defaultCapTokens or an explicit flag.
   // 2026-10-17 ruling: default OFF. The side-channel judge's only exclusive
   // value is rescuing a stalled goal (continue + instruction); its failure
   // mode degrades to exactly the no-judge behavior (fail-closed → stalled),
@@ -51,7 +48,6 @@ const DEFAULT_OPTIONS: Options = {
   timeoutWrap: false,
   providerFailLimit: 2,
   providerPauseMs: 30 * 60 * 1000,
-  wakeDetail: "slim",
 };
 
 export function resolveOptions(pluginOptions: Record<string, unknown>): Options {
@@ -72,16 +68,10 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
   const wakeText =
     typeof o.wakeText === "string" && o.wakeText.length > 0 ? o.wakeText : undefined;
   const model = parseModelRef(o.model);
-  // wakeDetail: strict "full"|"slim" strings; anything else falls back to
-  // the default (same fault-tolerance style as the numeric/boolean fields).
-  const wakeDetail =
-    o.wakeDetail === "full" || o.wakeDetail === "slim"
-      ? (o.wakeDetail as "full" | "slim")
-      : DEFAULT_OPTIONS.wakeDetail;
 
   return {
     stallLimit: num("stallLimit", DEFAULT_OPTIONS.stallLimit),
-    defaultCapTurns: num("defaultCapTurns", DEFAULT_OPTIONS.defaultCapTurns),
+    defaultCapTurns: numOpt("defaultCapTurns"),
     defaultCapTokens: numOpt("defaultCapTokens"),
     judgeEnabled: bool("judgeEnabled", DEFAULT_OPTIONS.judgeEnabled),
     judgeMaxPerGoal: num("judgeMaxPerGoal", DEFAULT_OPTIONS.judgeMaxPerGoal),
@@ -90,7 +80,6 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
     timeoutWrap: bool("timeoutWrap", DEFAULT_OPTIONS.timeoutWrap),
     providerFailLimit: num("providerFailLimit", DEFAULT_OPTIONS.providerFailLimit),
     providerPauseMs: num("providerPauseMs", DEFAULT_OPTIONS.providerPauseMs),
-    wakeDetail,
     wakeText,
     model,
   };

@@ -17,6 +17,12 @@
 //                       bracket query location[directory]; dot-notation params are
 //                       invisible -> silent fallback to the service's cwd, which
 //                       for `serve --service` is always home)
+//   active map:        GET    /api/session/active + header x-opencode-directory
+//                      (2026-10-20 reference-UI contract, 2.0.32 binary forensics
+//                       + 129 live probe + isolated real-host verify:
+//                       {data: Map<sessionID, {type: status}>} — the host's
+//                       in-memory liveness state the UI reads; an absent entry
+//                       = "idle", {type:"running"} = a turn is executing now)
 //   inbox list:        GET    /api/session/:sessionID/inbox
 //   inbox cancel:      DELETE /api/session/:sessionID/inbox/:inboxID
 //                      (a 404 SessionNotFound body on inbox routes means
@@ -48,6 +54,7 @@ interface Registration {
 export interface HostApi {
   shellList(locationDirectory: string): Promise<HostApiResult<ShellEntry[]>>;
   sessionList(locationDirectory: string): Promise<HostApiResult<HostSession[]>>;
+  activeSessions(locationDirectory: string): Promise<HostApiResult<Record<string, string>>>;
   inboxList(sessionID: string): Promise<HostApiResult<InboxItem[]>>;
   inboxCancel(sessionID: string, inboxID: string): Promise<HostApiResult<undefined>>;
 }
@@ -193,9 +200,9 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
 
   /** Session list (2026-10-19 in-flight query): GET /api/session, location-
    * scoped like shellList (x-opencode-directory header) — the goal's project's
-   * sessions, each with `parentID` + `time` (the in-flight subtask source; the
-   * in-process `ctx.session.get` does not return `parentID`). The caller
-   * filters by parentID chain. */
+   * sessions, each with `parentID` (subtask attribution; the in-process
+   * `ctx.session.get` does not return `parentID`). The caller filters by
+   * parentID chain. */
   async function sessionList(locationDirectory: string): Promise<HostApiResult<HostSession[]>> {
     const r = await doFetch("/api/session", "GET", locationHeader(locationDirectory));
     if ("reason" in r) return { state: "unavailable", reason: r.reason };
@@ -223,6 +230,35 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
           viewed: typeof t.viewed === "number" ? t.viewed : undefined,
         },
       });
+    }
+    return { state: "ok", value: out };
+  }
+
+  /** Active map (2026-10-20 reference-UI ruling): GET /api/session/active,
+   * location-scoped like sessionList → {data: Map<sessionID, {type: status}>}
+   * (isolated real-host verify 2026-10-20: the mid-turn value is
+   * {type:"running"}; a bare string is accepted defensively). The host's own
+   * in-memory liveness state (the signal the UI reads for its running badge):
+   * "running" = a turn is executing right now (including a turn waiting on a
+   * long shell/tool); an absent entry = "idle". This is the in-flight subtask
+   * criterion — the 1.1.3 time.idle/updated guess is gone (stale time fields
+   * counted dead sessions in-flight forever). */
+  async function activeSessions(locationDirectory: string): Promise<HostApiResult<Record<string, string>>> {
+    const r = await doFetch("/api/session/active", "GET", locationHeader(locationDirectory));
+    if ("reason" in r) return { state: "unavailable", reason: r.reason };
+    if (!r.ok) return { state: "unavailable", reason: `http-${r.status}` };
+    const body = await safeJson(r);
+    const data =
+      typeof body === "object" && body !== null && typeof (body as Record<string, unknown>).data === "object" &&
+      (body as Record<string, unknown>).data !== null
+        ? ((body as Record<string, unknown>).data as Record<string, unknown>)
+        : {};
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(data)) {
+      if (typeof v === "string") out[k] = v;
+      else if (typeof v === "object" && v !== null && typeof (v as Record<string, unknown>).type === "string") {
+        out[k] = (v as Record<string, unknown>).type as string;
+      }
     }
     return { state: "ok", value: out };
   }
@@ -255,7 +291,7 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
     return { state: "ok" };
   }
 
-  return { shellList, sessionList, inboxList, inboxCancel };
+  return { shellList, sessionList, activeSessions, inboxList, inboxCancel };
 }
 
 /**

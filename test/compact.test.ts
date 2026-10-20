@@ -84,7 +84,7 @@ test("3: compaction hook sets result.summary with the generated text, verbatim o
   // [GOAL STATE] is a MANDATORY trailing section: it exists even if the
   // generated text is empty/malformed, and it comes after the generated text.
   expect(summary.lastIndexOf("[GOAL STATE]")).toBeGreaterThan(summary.indexOf("SUMMARY-TEXT"));
-  expect(summary).toContain(`${g.used.turns}/${g.cap.turns}`);
+  expect(summary).toContain(`Turns used: ${g.used.turns}/${g.cap.turns ?? "(unbounded)"}`);
 
   // The generate request carried the conversation history AND the state block.
   expect(h.generated).toHaveLength(1);
@@ -186,7 +186,7 @@ test("6: full compaction round-trip keeps objective, task statuses, and turns us
   expect(summary).toContain("Lossless compaction");
   expect(summary).toContain("1. [done] write the report");
   expect(summary).toContain("2. [todo] ship it");
-  expect(summary).toContain(`Turns used: ${g.used.turns}/${g.cap.turns}`);
+  expect(summary).toContain(`Turns used: ${g.used.turns}/${g.cap.turns ?? "(unbounded)"}`);
   expect(summary).toContain("compact body text");
   await stop();
 });

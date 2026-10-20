@@ -285,6 +285,56 @@ test("myPID defaults to process.pid", async () => {
   expect((await api.shellList("/w")).state).toBe("ok");
 });
 
+// ── active map (2026-10-20 reference-UI) ───────────────────────────────────
+
+test("activeSessions: GET /api/session/active + x-opencode-directory; object values normalize to their type token", async () => {
+  const f = fakeFetch((url, init) => {
+    expect(url).toBe("http://127.0.0.1:45278/api/session/active");
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    expect(headers["x-opencode-directory"]).toBe(encodeURIComponent("/proj"));
+    return jsonRes(200, {
+      data: {
+        ses_a: { type: "running" },
+        ses_b: { type: "question" },
+        ses_c: "running", // bare string (defensive)
+        ses_d: { type: 42 }, // non-string type -> dropped
+      },
+    });
+  });
+  const api = createHostApi({
+    fetch: f.fn,
+    readRegistration: async () => reg("http://0.0.0.0:45278", 4242, "pw"),
+    myPID: 4242,
+  });
+  const r = await api.activeSessions("/proj");
+  expect(r.state).toBe("ok");
+  expect(r.value).toEqual({ ses_a: "running", ses_b: "question", ses_c: "running" });
+});
+
+test("activeSessions: empty data -> ok + {}", async () => {
+  const f = fakeFetch(() => jsonRes(200, { data: {} }));
+  const api = createHostApi({
+    fetch: f.fn,
+    readRegistration: async () => reg("http://127.0.0.1:45278", 4242, "pw"),
+    myPID: 4242,
+  });
+  const r = await api.activeSessions("/proj");
+  expect(r.state).toBe("ok");
+  expect(r.value).toEqual({});
+});
+
+test("activeSessions: 500 -> unavailable(http-500)", async () => {
+  const f = fakeFetch(() => jsonRes(500, { _tag: "UnknownError" }));
+  const api = createHostApi({
+    fetch: f.fn,
+    readRegistration: async () => reg("http://127.0.0.1:45278", 4242, "pw"),
+    myPID: 4242,
+  });
+  const r = await api.activeSessions("/proj");
+  expect(r.state).toBe("unavailable");
+  expect(r.reason).toBe("http-500");
+});
+
 // ── inbox routes ───────────────────────────────────────────────────────────
 
 test("inboxList: 200 normalizes items", async () => {

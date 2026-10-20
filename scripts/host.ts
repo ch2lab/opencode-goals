@@ -81,6 +81,9 @@ export interface IsolatedHost {
   /** Subscribe to /api/event, appending SSE data lines to a file (bounded). */
   startEventCapture(timeoutS?: number): Promise<string>;
   stopEventCapture(): void;
+  /** Tail of the serve process's drained stdout/stderr (last ~4000 chars) —
+   *  plugin console output lands here, not in opencode.log. */
+  stdoutTail(): string;
   stop(): Promise<void>;
 }
 
@@ -155,7 +158,7 @@ async function startEventCaptureImpl(host: IsolatedHost, timeoutS: number): Prom
   void (async () => {
     try {
       const res = await fetch(`${host.baseUrl}/api/event`, {
-        headers: { authorization: basic(host.password) },
+        headers: { authorization: basic(host.password), "x-opencode-directory": encodeURIComponent(host.project) },
         signal: ctrl.signal,
       });
       if (!res.body) return;
@@ -295,7 +298,7 @@ export async function startHost(opts: HostOptions = {}): Promise<IsolatedHost> {
         while (true) {
           const { done, value } = await r.read();
           if (done) break;
-          tail = (tail + Buffer.from(value).toString()).slice(-4000);
+          tail = (tail + Buffer.from(value).toString()).slice(-300000);
         }
       } catch {}
     })();
@@ -351,6 +354,7 @@ export async function startHost(opts: HostOptions = {}): Promise<IsolatedHost> {
         clearTimeout((host as any).evTimer);
       } catch {}
     },
+    stdoutTail: () => tail,
     stop: async () => {
       (host as any).evAbort?.abort();
       clearTimeout((host as any).evTimer);

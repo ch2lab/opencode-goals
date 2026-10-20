@@ -15,7 +15,7 @@ on:
 
 permissions:
   id-token: write # required for OIDC (npm trusted publishing)
-  contents: read
+  contents: write # create the GitHub Release (title + notes) after publish
 
 jobs:
   publish:
@@ -37,6 +37,9 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
+      - name: changelog gate — every release ships with notes (missing/empty section = fail before npm publish)
+        run: bun run scripts/changelog.mjs gate "${GITHUB_REF_NAME#v}"
+
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
@@ -52,3 +55,15 @@ jobs:
       # `npm publish --access public`; provenance is attached
       # automatically by the npm CLI.
       - run: bun run scripts/publish.mjs publish
+      - name: create GitHub Release (title vX.Y.Z + notes from the changelog section)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          notes="$RUNNER_TEMP/notes.md"
+          bun run scripts/changelog.mjs extract "$v" "$notes"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "v$v" --notes-file "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" --title "v$v" --notes-file "$notes"
+          fi

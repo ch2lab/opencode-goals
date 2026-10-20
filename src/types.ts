@@ -29,7 +29,7 @@
 //   schema/dist/session-message.d.ts        per-message shapes (id, type tag, time,
 //                                           metadata? on most)
 //   schema/dist/tool.d.ts                  Tool.Info { name, input, description,
-//                                           options?: { namespace?, permission? } }
+//                                           options?: { namespace?, permission?, codemode? } }
 //   plugin/dist/promise/shell.d.ts          ShellCreateBefore { command, cwd,
 //                                           timeout, shell, env }
 //   plugin/dist/promise/permission.d.ts     PermissionEvaluation { sessionID,
@@ -178,10 +178,13 @@ export interface ShellEntry {
  * The probe the controller codes against. The real host (adapter, Task 7)
  * and the deterministic test harness (test/harness.ts) both implement it.
  */
-/** Host session record (GET /api/session list item) — the fields the in-flight
- * gate reads: `parentID` (subtask attribution) and `time` (in-flight = no idle
- * yet, or a turn started after the last idle). Same source the host UI reads —
- * the in-process `ctx.session.get` does NOT return `parentID`. */
+/** Host session record (GET /api/session list item) — the in-flight gate reads
+ * `parentID` (subtask attribution: whose parent chain walks back to the goal
+ * session). `time`/`outcome` are carried for completeness but are NO LONGER
+ * the liveness criterion (2026-10-20 reference-UI ruling: the host's active
+ * map, sessionID→status, is the in-flight signal — these time fields go stale
+ * and counted dead sessions forever: the 1.1.3 zombie lock). Same source the
+ * host UI reads — the in-process `ctx.session.get` does NOT return `parentID`. */
 export interface HostSession {
   id: string;
   projectID?: string;
@@ -205,14 +208,32 @@ export interface WakeProbe {
   inboxList(sessionID: string): Promise<InboxItem[]>; // hostapi GET /api/session/:id/inbox
   inboxCancel(inboxID: string): Promise<void>; // hostapi DELETE /api/session/:id/inbox/:inboxID
   shellList(locationDirectory: string): Promise<ShellEntry[]>; // hostapi GET /api/shell（宿主 shell store）
-  sessionList(locationDirectory: string): Promise<HostSession[]>; // hostapi GET /api/session（按目录限定，同 shellList；parentID + time，子任务在飞发现源）
+  sessionList(locationDirectory: string): Promise<HostSession[]>; // hostapi GET /api/session（按目录限定，同 shellList；parentID 链 = 子任务归属源）
+  activeSessions(locationDirectory: string): Promise<Record<string, string>>; // hostapi GET /api/session/active（参考UI 在飞判据，2026-10-20：sessionID→status，"running" = 在飞；缺条目 = idle）
   projectID?: string;
   locationDirectory?: string;
   // —— 注册面（adapter 转真实 ctx；harness 记录供断言；hook 载荷字段以 2.0.29 .d.ts 为准）——
   // Ruling R5: command invocations (CommandInvocation) and tool contexts
   // (Tool.Context) both carry sessionID in 2.0.29 — multi-session attribution.
   registerCommand(name: string, description: string, run: (text: string, sessionID: string) => Promise<void>): void;
-  registerTool(name: string, spec: { description: string; input: unknown; permission?: string }, run: (input: unknown, sessionID: string) => Promise<string>): void;
+  // Host namespace declaration (MCP-server style; host editor.namespace): the
+  // tools below carry this name in spec.namespace; the host flattens the
+  // model-visible name to `namespace_name` (effectiveName).
+  registerNamespace(name: string, description: string): void;
+  registerTool(name: string, spec: { description: string; input: unknown; permission?: string; codemode?: boolean; namespace?: string }, run: (input: unknown, sessionID: string) => Promise<string>): void;
+  // ONE group registration (2026-10-20 ruling, MCP-server style): the host
+  // commits all entries in a single transform → ONE Registration (atomic
+  // teardown, one catalog commit); a malformed entry only lands in the
+  // host's registration errors, siblings unaffected.
+  registerToolGroup(tools: Array<{
+    name: string;
+    description: string;
+    input: unknown;
+    permission?: string;
+    codemode?: boolean;
+    namespace?: string;
+    run: (input: unknown, sessionID: string) => Promise<string>;
+  }>): void;
   onSessionHook(kind: "context" | "compaction", fn: (sessionID: string, payload: Record<string, unknown>) => void): void;
   onShellCreateBefore(fn: (input: { command: string; cwd: string; timeout: number }) => void): void;
   // R9: the callback receives the full PermissionHookInput and RETURNS its

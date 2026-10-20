@@ -59,12 +59,16 @@ export interface Harness {
   setMessages(sessionID: string, messages: SessionMessage[]): void; // context() 后端
   setShells(entries: ShellEntry[]): void; // host shell-store 后端（shell.list）；事件同步维护（见 emit）
   failShellList(on: boolean): void; // 脚本化 shell.list 抛错（信号不可用用例）
+  setActiveSessions(map: Record<string, string>): void; // active map 后端（GET /api/session/active，参考UI 在飞判据）
+  failActiveSessions(on: boolean): void; // 脚本化 active map 查询抛错（fail-open 用例）
+  failInboxList(on: boolean): void; // 脚本化 inbox 查询抛错（fail-closed 用例）
   shellListCalls: number; // shell.list 查询次数（活值 getter）
   commands: Map<string, (text: string, sessionID: string) => Promise<void>>;
   commandDescriptions: Map<string, string>; // 命令菜单里的友好描述（宿主 CommandDefinition.description）
+  namespaces: Map<string, string>; // 已声明的工具命名空间（宿主 editor.namespace，MCP-server 式）
   tools: Map<
-    string,
-    { spec: { description: string; input: unknown; permission?: string }; run: (input: unknown, sessionID: string) => Promise<string> }
+    string, // 宿主 effectiveName：带 namespace 时 = `namespace_name`（模型可见展平名）
+    { spec: { description: string; input: unknown; permission?: string; codemode?: boolean; namespace?: string }; run: (input: unknown, sessionID: string) => Promise<string> }
   >;
   sessionHooks: {
     context: Array<(sessionID: string, payload: Record<string, unknown>) => void>;
@@ -248,6 +252,7 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
   const permissionDecisions: Harness["permissionDecisions"] = [];
   const commands: Harness["commands"] = new Map();
   const commandDescriptions: Harness["commandDescriptions"] = new Map();
+  const namespaces: Harness["namespaces"] = new Map();
   const tools: Harness["tools"] = new Map();
   const sessionHooks: Harness["sessionHooks"] = { context: [], compaction: [] };
   const shellCreateBefore: Harness["shellCreateBefore"] = [];
@@ -260,6 +265,9 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
   let shellStore: ShellEntry[] = [];
   let shellListFail = false;
   let shellListCalls = 0;
+  let activeMap: Record<string, string> = {};
+  let activeMapFail = false;
+  let inboxListFail = false;
 
   const probe: WakeProbe = {
     projectID: typeof overrides?.projectID === "string" ? overrides.projectID : undefined,
@@ -312,7 +320,14 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
           time: s.time,
         })),
       ),
-    inboxList: async (sessionID) => structuredClone(inbox.get(sessionID) ?? []),
+    activeSessions: async () => {
+      if (activeMapFail) throw new Error("active map query failed (scripted)");
+      return structuredClone(activeMap);
+    },
+    inboxList: async (sessionID) => {
+      if (inboxListFail) throw new Error("inbox list query failed (scripted)");
+      return structuredClone(inbox.get(sessionID) ?? []);
+    },
     inboxCancel: async (inboxID) => {
       cancelledInbox.push(inboxID);
       for (const items of inbox.values()) {
@@ -332,8 +347,25 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
       commands.set(name, run);
       commandDescriptions.set(name, description);
     },
+    registerNamespace: (name, description) => {
+      namespaces.set(name, description);
+    },
+    // Mirror the host registry (host tool/runtime.ts effectiveName): a
+    // namespaced tool keys under `namespace_name` — the model-visible
+    // flattened name — so test call sites keep using goal_<name>.
     registerTool: (name, spec, run) => {
-      tools.set(name, { spec: { ...spec }, run });
+      const effective =
+        spec.namespace !== undefined ? `${spec.namespace.replaceAll(".", "_")}_${name}` : name;
+      tools.set(effective, { spec: { ...spec }, run });
+    },
+    // Mirror the host group registration (one transform commits all entries).
+    registerToolGroup: (entries) => {
+      for (const t of entries) {
+        const { name, run, ...spec } = t;
+        const effective =
+          spec.namespace !== undefined ? `${spec.namespace.replaceAll(".", "_")}_${name}` : name;
+        tools.set(effective, { spec: { ...spec }, run });
+      }
     },
     onSessionHook: (kind, fn) => {
       sessionHooks[kind].push(fn);
@@ -348,6 +380,7 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
 
   const harness: Harness = {
     probe,
+    namespaces,
     emit: (event) => {
       // Mirror the host: the shell store is host-maintained — started adds a
       // running entry, ended removes it (exited shells are not in the store).
@@ -427,6 +460,15 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
     },
     failShellList: (on) => {
       shellListFail = on;
+    },
+    setActiveSessions: (map) => {
+      activeMap = structuredClone(map);
+    },
+    failActiveSessions: (on) => {
+      activeMapFail = on;
+    },
+    failInboxList: (on) => {
+      inboxListFail = on;
     },
     get shellListCalls() {
       return shellListCalls;

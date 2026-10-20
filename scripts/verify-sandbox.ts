@@ -121,20 +121,20 @@ async function main(): Promise<void> {
     }
     check("C2: model turn completed (execution.succeeded observed)", turnDone);
     const ctx1 = (await host.api.context(sessionId)) ?? [];
-    const wakes1 = ctx1.filter((m: any) => typeof m.text === "string" && m.text.startsWith("[GOAL"));
+    const wakes1 = ctx1.filter((m: any) => typeof m.text === "string" && m.text.startsWith("[goal] turn-"));
     check("C3: NO ordinary boundary wake while shell running (fast path silent)", wakes1.length === 0, `wake msgs so far: ${wakes1.length}`);
 
     // D: config churn ×2 (semantic option changes → host hot-reload, multi-load)
     const cfg = join(host.directory, "config", "opencode", "opencode.jsonc");
     const j = JSON.parse(await readFile(cfg, "utf8"));
-    j.plugins[0].options = { wakeDetail: "slim" };
+    j.plugins[0].options = { judgeEnabled: false };
     await writeFile(cfg, JSON.stringify(j, null, 2));
-    console.log("  churn #1 (options → wakeDetail:slim); waiting 20s for hot reload…");
+    console.log("  churn #1 (options → judgeEnabled:false); waiting 20s for hot reload…");
     await sleep(20_000);
     const j2 = JSON.parse(await readFile(cfg, "utf8"));
-    j2.plugins[0].options = { wakeDetail: "slim", judgeEnabled: false };
+    j2.plugins[0].options = { judgeEnabled: false, checkInDelaySec: 300 };
     await writeFile(cfg, JSON.stringify(j2, null, 2));
-    console.log("  churn #2 (options += judgeEnabled:false); waiting 20s…");
+    console.log("  churn #2 (options += checkInDelaySec:300); waiting 20s…");
     await sleep(20_000);
     const ps2 = await host.api.plugins();
     const p2 = (ps2 ?? []).find((x: any) => x?.id === "opencode-goal");
@@ -144,7 +144,7 @@ async function main(): Promise<void> {
     check("D2: goal survived churn (record readable, still active)", rec2?.status === "active", `status=${rec2?.status}`);
     check("D3: watchdog re-armed after takeover reconcile", (rec2?.waitingShells?.length ?? 0) > 0, `waitingShells=${rec2?.waitingShells?.length}`);
     const ctx2 = (await host.api.context(sessionId)) ?? [];
-    const wakes2 = ctx2.filter((m: any) => typeof m.text === "string" && m.text.startsWith("[GOAL"));
+    const wakes2 = ctx2.filter((m: any) => typeof m.text === "string" && m.text.startsWith("[goal] turn-"));
     check("D4: still NO wake after churn boundaries (single consumer, fast path)", wakes2.length === 0, `wake msgs: ${wakes2.length}`);
 
     // E: shell exits (~150s after creation) → exactly ONE exit-result wake.

@@ -19,7 +19,8 @@
 - 测试两层：`test/*.test.ts` = 进程内 stub 宿主（`test/harness.ts`，快，可伪造 parentID/shell 等契约数据）；`scripts/host.ts` 的 `startHost()` = 本机隔离真实宿主（慢；lab LLM 需 env `OPENCODE_LAB_PROVIDER_BASE/KEY`）——宿主行为级结论必须出自后者（调用方：`scripts/verify-*.ts`、`probe-*.ts`）
 
 ## 发布通道（2026-10-18 起：tag 触发 CI/OIDC）
-- 流程：main 开发（version 停在最后已发布版本）→ 发布时切 `publish` 分支 bump version → 打 `vX.Y.Z` tag → push → `publish.yml` 自动发布（版本门 tag==package.json → typecheck/test → 双硬门 → npm publish，零 token；provenance 自动附加 sigstore 日志）
+- 流程：main 开发（version 停在最后已发布版本）→ 发布时切 `publish` 分支 bump version + 把 `CHANGELOG.md` 的 `## [Unreleased]` 移到 `## [X.Y.Z] - 日期` → 打 `vX.Y.Z` tag → push → `publish.yml` 自动发布（版本门 tag==package.json → changelog 门 → typecheck/test → 双硬门 → npm publish → 自动创建 GitHub Release，零 token；provenance 自动附加 sigstore 日志）
+- **版本说明（2026-10-20 裁定）**: 每个版本必须带版本说明（更新了什么 / 修复了什么 / 优化与设计）。载体 = 仓库根 `CHANGELOG.md`（不进 tarball）：在途版本记 `## [Unreleased]`，三段 `### 新增` / `### 修复` / `### 优化与设计`（+ 可选 `### 验证`）；章节缺失/空 = CI 发布失败（npm publish 之前，fail fast）；publish 成功后 CI 自动创建 GitHub Release（标题 `vX.Y.Z`，正文 = 章节内容；重跑幂等 edit）
 - 禁令不变：bump 与推 tag 都须用户当轮明令，CI 只执行
 - 仓库防护（bypass 均仅 ch2lab；agent push 日志出现 "Bypassed rule violations" 属正常）：`main-gate`（PR 1 审批 + `test` 检查必过 + 禁 force push）、`tag-gate`（`v*` tag 创建/删除受限）
 - GitHub Actions 白名单 action：`actions/checkout@*`、`actions/setup-node@*`、`oven-sh/setup-bun@*`——**pattern 必须带 `@*`**（裸仓库名匹配不到 `@v6` 引用，已实证卡死过一次发布）。新 workflow 用白名单外 action 须先请用户扩白名单
