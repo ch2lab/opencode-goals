@@ -6,7 +6,7 @@
 - 章节三段结构：`### 新增`（新功能/新工具/新命令）、`### 修复`（修了什么，含 incident 来源）、`### 优化与设计`（架构/行为变更/设计裁定）；可加 `### 验证`。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
-## [Unreleased]
+## [1.1.5] - 2026-10-20
 
 ### 修复
 - **goal 写失败误报成功**（129 block 状态丢失 incident 取证收口）：`saveGoal` 在 `storageSet` 抛异常时原为 catch→warn→返回成功——`goal_block` 等终态转换若没落盘，仍向模型报"blocked"成功（129 现场：block 确认成功 7 分钟后 `goal_next_step` 读回 active/turn 7）。现写失败返回 false，命令/工具面终态转换统一回 "changed underneath"（不假成功）；loop 内写入保持 best-effort 容错（spec §46）。
