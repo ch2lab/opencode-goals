@@ -653,3 +653,23 @@ test("31: reply to OUR check-in wake while user input is queued → HOLD (the §
   expect(line?.own).toBe(0);
   await stop();
 });
+
+// 2026-10-20 (129 forensics): a watchdog-injected message (check-in) left NO
+// decision log line — a queued wake the user saw and removed was
+// unexplainable from the server side. Every watchdog wake must now log one
+// line, so "message present, log absent" can never happen again.
+test("32: a fired check-in logs a decision line (the watchdog path is observable)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set LogWatchdog32");
+  h.setSession(S, { location: { directory: "/w" } });
+  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  await modelWorked(h, "a");
+  await h.emit(succeeded("b1", S)); // in flight → hold (logged), check-in armed (1s)
+  await sleep(1500); // past due: the 1ms tick fires the one-shot
+  expect(h.prompts.length).toBe(1);
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
+  const line = lastDecision(S);
+  expect(line?.decision).toBe("watchdog");
+  expect(String(line?.reason)).toContain("check-in");
+  await stop();
+});

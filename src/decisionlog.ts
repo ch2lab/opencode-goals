@@ -1,6 +1,6 @@
 // Boundary decision log (2026-10-17): one JSON line per gate decision
-// (wake / hold / skip), append-only, best-effort — a broken log never
-// breaks the loop.
+// (wake / hold / skip / watchdog), append-only, best-effort — a broken log
+// never breaks the loop.
 //
 // Path: <dir | <tempdir>/opencode-goal>/decisions-<pid>.jsonl
 import * as fs from "node:fs";
@@ -16,7 +16,7 @@ export interface DecisionEntry {
   /** Queued undelivered inbox items at the boundary (2026-10-20 queued-input ruling). */
   queued?: number;
   ownKnown: boolean;
-  decision: "wake" | "hold" | "skip";
+  decision: "wake" | "hold" | "skip" | "watchdog";
   reason: string;
 }
 

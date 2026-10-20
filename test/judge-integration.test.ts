@@ -15,7 +15,9 @@
 //    (buildWakeMessage contract);
 //  - judge-unavailable at the limit (disabled / already used) → directly
 //    stalled with a stallReport explaining why the judge did not rule.
+import * as fs from "node:fs";
 import { expect, test } from "bun:test";
+import { decisionLogPath } from "../src/decisionlog.ts";
 import { resolveOptions } from "../src/options.ts";
 import { archivedGoalKey, goalStorageKey, type GoalRecord } from "../src/state.ts";
 import { GoalController } from "../src/controller.ts";
@@ -187,6 +189,9 @@ test("2: complete with valid evidence — completed + archived (evidence gate pa
   const archived = h.storage.get(archivedGoalKey(S, g.id));
   expect(archived).toBeDefined();
   expect((archived as GoalRecord).status).toBe("completed");
+  const notice = h.synthetics[h.synthetics.length - 1].input;
+  expect(notice.text).toContain("completed");
+  expect(notice.resume).toBe(false); // §48: terminal notice = record, not a host auto-wake
   expect(fake.calls).toBe(1);
   await stop();
 });
@@ -235,6 +240,9 @@ test("4: needs_human — blocked with the judge's reason; a user inbox message r
   expect(g.id).toBe(g0.id);
   expect(g.status).toBe("blocked");
   expect(g.blocker).toContain("需要生产库凭据"); // judge's reason verbatim
+  const notice = h.synthetics[h.synthetics.length - 1].input;
+  expect(notice.text).toContain("blocked");
+  expect(notice.resume).toBe(false); // §48: blocked notice = record, not a host auto-wake
   expect(fake.calls).toBe(1);
   // blocked-resume path (Task 8, spec §15-9): user inbox → active again.
   await h.emit(enqueuedUser("i_resume"));
@@ -242,6 +250,17 @@ test("4: needs_human — blocked with the judge's reason; a user inbox message r
   expect(after.status).toBe("active");
   expect(after.stalls).toBe(0);
   expect(h.prompts[h.prompts.length - 1].input.metadata?.goalWake).toBe(true);
+  // §49: the resume re-wake is logged — previously "有消息无日志" (the user
+  // message re-woke the goal with no decisions line at all).
+  const resumeLines = fs
+    .readFileSync(decisionLogPath(process.pid), "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l) as Record<string, unknown>)
+    .filter((l) => l.sessionID === S && l.goalID === after.id && String(l.reason).includes("§15-9"));
+  expect(resumeLines.length).toBeGreaterThanOrEqual(1);
+  expect(resumeLines[resumeLines.length - 1]!.decision).toBe("wake");
   await stop();
 });
 
@@ -275,6 +294,7 @@ test("5: give_up — stalled with stallReport (objective, tasks, no-action tails
   expect(notice.metadata?.goalControl).toBe(true);
   expect(notice.text).toContain("JudgeGiveUp"); // the synthetic carries the report
   expect(notice.text).toContain("no viable path remains");
+  expect(notice.resume).toBe(false); // §48: stall notice = record, not a host auto-wake
   expect(h.storage.get(archivedGoalKey(S, g.id))).toBeDefined(); // archived
   await stop();
 });

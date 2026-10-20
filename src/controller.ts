@@ -535,14 +535,16 @@ export class GoalController {
         name: "resume",
         description:
           "Resume a goal in a resumable state: paused (silent restart), blocked (stale blocker " +
-          "cleared, re-wake injected) or budget_limited (cap still enforced — the goal " +
-          "re-terminates at the next boundary unless the cap is raised). " +
+          "cleared) or budget_limited (cap still enforced — the resumed goal gets ONE boundary " +
+          "of budget grace (§49), then re-terminates at the following boundary unless the cap " +
+          "is raised). " +
           "Gating: goal.control permission; refused for completed/stalled/cleared (hard terminal) " +
           "or when no goal exists. " +
           "Use when the user asks you to continue or resume the goal in conversation.",
         input: { type: "object", properties: {} },
         ...GOAL_TOOL_OPTIONS,
-        run: (input, sessionID) => this.guarded("goal_resume", () => this.resumeGoal(sessionID)),
+        run: (input, sessionID) =>
+          this.guarded("goal_resume", async () => (await this.resumeGoal(sessionID)).text),
       },
       {
         name: "view",
@@ -836,6 +838,19 @@ export class GoalController {
         // /goal view and to the model's own context. The reason lives on
         // in the transcript (the block synthetic), not in the live record.
         goal.blocker = undefined;
+        // §49: the resume re-wake is logged — previously this path re-woke
+        // the goal with no decisions line at all ("有消息无日志").
+        bumpGoalDecision(goal, "wake");
+        await appendDecision({
+          ts: new Date().toISOString(),
+          sessionID,
+          goalID: goal.id,
+          own: 0,
+          other: 0,
+          ownKnown: true,
+          decision: "wake",
+          reason: `user message resumed blocked goal (§15-9)`,
+        });
         // injectWake bumps used.turns / continuations in memory; the save
         // below persists everything (status, stalls, usage) in one write.
         await this.injectWake(goal);
@@ -1075,24 +1090,47 @@ export class GoalController {
     // ④ budget (spec §11): ANY terminal boundary (incl. inactivity interrupt)
     // checks the caps BEFORE attribution; missing cap dimensions don't compare.
     if (isCapReached(goal)) {
-      goal.status = "budget_limited";
-      this.judgeInstruction.delete(sessionID); // terminal: drop any pending judge paragraph
-      if (eventID !== undefined) goal.lastHandledEventID = eventID;
-      await this.saveGoal(goal);
-      await this.archiveGoal(goal);
-      try {
-        await this.probe.synthetic({
+      if (goal.budgetGrace) {
+        // §49: post-resume budget grace — a goal resumed from budget_limited
+        // consumes ONE boundary budget re-check. The resume command's own
+        // result line kicks a real turn (host auto-wake, §48-B); without the
+        // grace, that kick turn's boundary would immediately re-limit the
+        // just-resumed goal (caps still exhausted), making /goal resume a
+        // no-op. The grace is consumed here (one-shot) and the boundary falls
+        // through to normal arbitration — the kicked turn proceeds.
+        goal.budgetGrace = false;
+        bumpGoalDecision(goal, "hold");
+        await appendDecision({
+          ts: new Date().toISOString(),
           sessionID,
-          text: `goal ${goal.id} stopped: budget_limited (used ${goal.used.turns} turns / ` +
-            `${goal.used.tokens} tokens; cap: ${this.capText(goal)})`,
-          metadata: { goalControl: true },
+          goalID: goal.id,
+          own: 0,
+          other: 0,
+          ownKnown: true,
+          decision: "hold",
+          reason: `post-resume budget grace consumed (resumed from budget_limited; cap: ${this.capText(goal)})`,
         });
-      } catch (err) {
-        console.warn(`opencode-goal: failed to deliver budget_limited notice for goal ${goal.id}:`, err);
+      } else {
+        goal.status = "budget_limited";
+        this.judgeInstruction.delete(sessionID); // terminal: drop any pending judge paragraph
+        if (eventID !== undefined) goal.lastHandledEventID = eventID;
+        await this.saveGoal(goal);
+        await this.archiveGoal(goal);
+        try {
+          await this.probe.synthetic({
+            sessionID,
+            text: `goal ${goal.id} stopped: budget_limited (used ${goal.used.turns} turns / ` +
+              `${goal.used.tokens} tokens; cap: ${this.capText(goal)})`,
+            metadata: { goalControl: true },
+            resume: false, // §48: terminal notice = record, not a host auto-wake
+          });
+        } catch (err) {
+          console.warn(`opencode-goal: failed to deliver budget_limited notice for goal ${goal.id}:`, err);
+        }
+        this.markTurnInactive(sessionID);
+        this.rememberHandled(eventID);
+        return;
       }
-      this.markTurnInactive(sessionID);
-      this.rememberHandled(eventID);
-      return;
     }
     // Provider failure pause (2026-10-17 ruling, 129 "Insufficient account
     // funds" incident): a boundary whose LAST assistant message carries a
@@ -1129,6 +1167,7 @@ export class GoalController {
               sessionID,
               text: providerPauseNoticeText(goal.id, minutes),
               metadata: { goalControl: true },
+              resume: false, // §48: pause notice = record, not a host auto-wake
             });
             goal.providerPause!.noticeSent = true; // one per INCIDENT (a re-arm must not re-notify)
           } catch (err) {
@@ -1703,6 +1742,11 @@ export class GoalController {
         sessionID: goal.sessionID,
         text,
         metadata: { goalControl: true },
+        // §48 (2026-10-20): terminal/pause notices are RECORDS. The host
+        // auto-wakes every synthetic (default steer + execution.wake), which
+        // would kick a spurious model turn after every terminal transition —
+        // resume:false suppresses it (the record still lands in the transcript).
+        resume: false,
       });
     } catch (err) {
       console.warn(`opencode-goal: failed to deliver goal ${goal.id} notice:`, err);
@@ -1788,6 +1832,7 @@ export class GoalController {
       await this.deliverWatchdogWake(
         goal,
         backgroundCheckInText(due.inFlight, this.options.checkInDelaySec),
+        `watchdog check-in (in-flight ${due.inFlight})`,
       );
     }
     // Provider pause deadline reached → fire ONE retry wake (retrySent: the
@@ -1803,7 +1848,7 @@ export class GoalController {
     ) {
       goal.providerPause.retrySent = true;
       await this.saveGoal(goal);
-      await this.deliverWatchdogWake(goal, providerPauseRetryText(goal.id));
+      await this.deliverWatchdogWake(goal, providerPauseRetryText(goal.id), "watchdog provider-pause retry");
     }
     // Disarm only when nothing is pending: no deadline, and no UNEXPIRED
     // provider pause (while armed, this tick IS the retry heartbeat).
@@ -1822,7 +1867,7 @@ export class GoalController {
    * "唤醒注入仍置 pending") with the watchdog flag so the boundary fast path
    * can keep normal arbitration for a reply to OUR wake.
    */
-  private async deliverWatchdogWake(goal: GoalRecord, text: string): Promise<void> {
+  private async deliverWatchdogWake(goal: GoalRecord, text: string, reason: string): Promise<void> {
     // Task 14 Fix 3a note: this wake path (check-in / shell exit / lost) uses
     // its own watchdog text family — options.wakeText intentionally does NOT
     // apply here (ruling: check-in wakes are independent copy).
@@ -1841,6 +1886,20 @@ export class GoalController {
       this.contPending.set(sessionID, Date.now());
       this.pendingSkipped.delete(sessionID);
       await this.saveGoal(goal);
+      // 2026-10-20 (129 forensics): the watchdog path was the ONE message
+      // injection that left no decision log line — a queued wake the user
+      // removed was unexplainable from the server side. The line = "a message
+      // actually in the queue" (the prompt succeeded). Logged AFTER the save,
+      // never between the tick's load and save: an fs write in that window
+      // widens the CAS race and can cost a boundary its increments.
+      await appendDecision({
+        ts: new Date().toISOString(),
+        sessionID,
+        goalID: goal.id,
+        ownKnown: true,
+        decision: "watchdog",
+        reason,
+      });
     } catch (err) {
       // Fault tolerance: a failed injection must not break the loop and must
       // not leave the continuationPending window open forever.
@@ -1878,62 +1937,84 @@ export class GoalController {
    */
   private async handleCommand(sessionID: string, text: string): Promise<void> {
     let out: string;
+    let kick = false; // §48-#2: only set/resume keep the host's synthetic auto-wake
     try {
-      out = await this.dispatchCommand(sessionID, text);
+      const res = await this.dispatchCommand(sessionID, text);
+      out = res.text;
+      kick = res.kick;
     } catch (err) {
       out = `goal command failed: ${err instanceof Error ? err.message : String(err)}`;
+      kick = false; // a failed command is a record, never a wake
     }
     try {
+      // LastInbox attribution (spec §6-⑤): every goal command reply is a
+      // goalControl synthetic. Set it BEFORE the synthetic so the host's
+      // auto-wake turn (the set/resume result line kicks a turn, §48-B)
+      // arbitrates against a control lastInbox (no stall, no re-wake) — the
+      // admitted control message IS that turn's last inbox item in the real
+      // host. (The harness emits no inbox.enqueued echo for probe.synthetic,
+      // so the plugin records its own delivery.)
+      this.lastInbox.set(sessionID, { id: "control", kind: "control" });
       await this.probe.synthetic({
         sessionID,
         text: out,
         metadata: { goalControl: true },
+        // §48-#2: set/resume kick (their result line is the trigger, §47); every
+        // other subcommand's result line is a pure record — resume:false stops
+        // the host's synthetic auto-wake from kicking a spurious model turn.
+        resume: kick ? undefined : false,
       });
-      // LastInbox attribution (spec §6-⑤): every goal command reply is a
-      // goalControl synthetic. In the real host the session.inbox.enqueued
-      // echo records it; the harness emits no echo for probe.synthetic, so
-      // this plugin records its own delivery (controller ruling fallback).
-      this.lastInbox.set(sessionID, { id: "control", kind: "control" });
     } catch (err) {
       // Best-effort delivery (fault-tolerance discipline).
       console.warn("opencode-goal: failed to deliver goal feedback:", err);
     }
   }
 
-  private async dispatchCommand(sessionID: string, text: string): Promise<string> {
+  private async dispatchCommand(
+    sessionID: string,
+    text: string,
+  ): Promise<{ text: string; kick: boolean }> {
     let tokens = text.trim().split(/\s+/).filter((t) => t.length > 0);
     // Accept both the full "/goal set ..." form and the host-routed remainder
     // "set ..." (the host strips the command name before calling us).
     if (tokens[0] === "/goal" || tokens[0] === "goal") tokens = tokens.slice(1);
-    if (tokens.length === 0) return USAGE;
+    if (tokens.length === 0) return { text: USAGE, kick: false };
     const [sub, ...rest] = tokens;
+    // §48-#2 / §49 (2026-10-20): only a SUCCESSFUL set/resume result line kicks
+    // — the host auto-wake on their result line IS the intended trigger (§47
+    // removed the resume re-wake to rely on it). A refused set, a failed
+    // resume, and every other subcommand's result line are pure records
+    // (handleCommand passes resume:false) so they do not kick a spurious model
+    // turn.
     switch (sub) {
       case "set":
-        return this.cmdSet(sessionID, rest);
-      case "view":
-        return this.viewGoal(sessionID);
-      case "pause":
-        return this.pauseGoal(sessionID);
+        const set = await this.cmdSet(sessionID, rest);
+        return { text: set.text, kick: set.ok };
       case "resume":
-        return this.resumeGoal(sessionID);
+        const resumed = await this.resumeGoal(sessionID);
+        return { text: resumed.text, kick: resumed.ok };
+      case "view":
+        return { text: await this.viewGoal(sessionID), kick: false };
+      case "pause":
+        return { text: await this.pauseGoal(sessionID), kick: false };
       case "complete":
-        if (rest.length === 0) return "missing evidence: /goal complete <evidence>";
-        return this.completeGoal(sessionID, rest.join(" "));
+        if (rest.length === 0) return { text: "missing evidence: /goal complete <evidence>", kick: false };
+        return { text: await this.completeGoal(sessionID, rest.join(" ")), kick: false };
       case "block":
-        if (rest.length === 0) return "missing reason: /goal block <reason>";
-        return this.blockGoal(sessionID, rest.join(" "));
+        if (rest.length === 0) return { text: "missing reason: /goal block <reason>", kick: false };
+        return { text: await this.blockGoal(sessionID, rest.join(" ")), kick: false };
       case "clear":
-        return this.clearGoalFromCommand(sessionID);
+        return { text: await this.clearGoalFromCommand(sessionID), kick: false };
       case "history":
-        return this.historyGoal(sessionID);
+        return { text: await this.historyGoal(sessionID), kick: false };
       case "task":
-        return this.cmdTask(sessionID, rest);
+        return { text: await this.cmdTask(sessionID, rest), kick: false };
       default:
-        return `unknown goal subcommand: "${sub}" — ${USAGE}`;
+        return { text: `unknown goal subcommand: "${sub}" — ${USAGE}`, kick: false };
     }
   }
 
-  private async cmdSet(sessionID: string, tokens: string[]): Promise<string> {
+  private async cmdSet(sessionID: string, tokens: string[]): Promise<{ text: string; ok: boolean }> {
     const objectiveParts: string[] = [];
     let turns: number | undefined;
     let tokenCap: number | undefined;
@@ -1942,26 +2023,26 @@ export class GoalController {
       const t = tokens[i];
       if (t === "--turns") {
         const v = tokens[++i];
-        if (v === undefined) return `--turns expects a positive integer value`;
+        if (v === undefined) return { text: `--turns expects a positive integer value`, ok: false };
         const n = Number(v);
-        if (!Number.isInteger(n) || n <= 0) return `--turns expects a positive integer (got "${v}")`;
+        if (!Number.isInteger(n) || n <= 0) return { text: `--turns expects a positive integer (got "${v}")`, ok: false };
         turns = n;
       } else if (t === "--tokens") {
         const v = tokens[++i];
-        if (v === undefined) return `--tokens expects a positive integer value`;
+        if (v === undefined) return { text: `--tokens expects a positive integer value`, ok: false };
         const n = Number(v);
-        if (!Number.isInteger(n) || n <= 0) return `--tokens expects a positive integer (got "${v}")`;
+        if (!Number.isInteger(n) || n <= 0) return { text: `--tokens expects a positive integer (got "${v}")`, ok: false };
         tokenCap = n;
       } else if (t === "--unbounded") {
         unbounded = true;
       } else if (t.startsWith("--")) {
-        return `unknown flag "${t}" — expected --turns, --tokens or --unbounded`;
+        return { text: `unknown flag "${t}" — expected --turns, --tokens or --unbounded`, ok: false };
       } else {
         objectiveParts.push(t);
       }
     }
     const objective = objectiveParts.join(" ");
-    if (objective === "") return "missing objective: /goal set <objective> [--turns N] [--tokens N] [--unbounded]";
+    if (objective === "") return { text: "missing objective: /goal set <objective> [--turns N] [--tokens N] [--unbounded]", ok: false };
     const cap: GoalRecord["cap"] = unbounded
       ? {}
       : {
@@ -2030,7 +2111,7 @@ export class GoalController {
           turns: turns ?? this.options.defaultCapTurns,
           tokens: tokenCap ?? this.options.defaultCapTokens,
         };
-    return this.setGoal(sessionID, rec.objective, cap);
+    return (await this.setGoal(sessionID, rec.objective, cap)).text;
   }
 
   private async toolComplete(sessionID: string, input: unknown): Promise<string> {
@@ -2124,7 +2205,8 @@ export class GoalController {
   }
 
   /**
-   * Every save bumps updatedAt (Task 1 ruling). Storage write = best-effort.
+   * Every save bumps updatedAt (Task 1 ruling). Storage write = best-effort for the
+    * loop itself, but a FAILED set is reported (returns false), never silent.
    *
    * Task 14 Fix 1 (compare-and-set staleness guard): the judge await can span
    * a whole load→mutate→save sequence — if a newer record (e.g. a user
@@ -2136,7 +2218,9 @@ export class GoalController {
    * "no current record" (ruling: storage faults don't block the write —
    * best-effort discipline).
    *
-   * @returns true = written, false = dropped as stale.
+   * @returns true = written, false = dropped as stale OR the storage set
+    *   failed (2026-10-20 fail-closed: a failed set is not a write — callers
+    *   on command/tool surfaces refuse with "changed underneath").
    */
   private async saveGoal(goal: GoalRecord): Promise<boolean> {
     const base = goal.updatedAt; // load baseline (pre-bump; every bump happens here)
@@ -2160,6 +2244,11 @@ export class GoalController {
       await this.probe.storageSet(goalStorageKey(goal.sessionID), goal);
     } catch (err) {
       console.warn(`opencode-goal: failed to save goal ${goal.id}:`, err);
+      // fail-closed (2026-10-20, 129 incident): a write that never reached
+      // storage must never be reported as written — the command/tool
+      // surfaces (finishGoal, nextStepUpdate) turn this false into their
+      // "changed underneath" refusal instead of a false success.
+      return false;
     }
     // timeoutWrap sync (Task 14 Fix 3b): reflect the record's status
     if (goal.status === "active") this.activeGoalSessions.add(goal.sessionID);
@@ -2205,19 +2294,27 @@ export class GoalController {
     return `${turns} / ${tokens}`;
   }
 
-  private async setGoal(sessionID: string, objective: string, cap: GoalRecord["cap"]): Promise<string> {
+  private async setGoal(
+    sessionID: string,
+    objective: string,
+    cap: GoalRecord["cap"],
+  ): Promise<{ text: string; ok: boolean }> {
     const existing = await this.loadGoal(sessionID);
     if (existing !== undefined && !isTerminal(existing.status)) {
       // Ruling R7 (spec §9): a refused set must NOT touch the old goal — no
       // status change, no updatedAt bump, no archive write. The old goal is
       // terminated first (complete/block/clear), then a new set succeeds.
-      return `goal ${existing.id} is still in progress (status: ${existing.status}): ` +
-        `complete, block or clear it before starting a new goal (${objective}).`;
+      return {
+        text:
+          `goal ${existing.id} is still in progress (status: ${existing.status}): ` +
+          `complete, block or clear it before starting a new goal (${objective}).`,
+        ok: false,
+      };
     }
     const goal = createGoal({ sessionID, objective, cap });
     this.judgeInstruction.delete(sessionID); // new goal: stale instruction must not leak over
     await this.saveGoal(goal);
-    return `goal ${goal.id} created: ${objective} (cap: ${this.capText(goal)})`;
+    return { text: `goal ${goal.id} created: ${objective} (cap: ${this.capText(goal)})`, ok: true };
   }
 
   private async viewGoal(sessionID: string): Promise<string> {
@@ -2311,17 +2408,17 @@ export class GoalController {
     return `goal ${goal.id} paused`;
   }
 
-  private async resumeGoal(sessionID: string): Promise<string> {
+  private async resumeGoal(sessionID: string): Promise<{ text: string; ok: boolean }> {
     const goal = await this.loadGoal(sessionID);
-    if (goal === undefined) return "no active goal for this session";
-    if (goal.status === "active") return `goal ${goal.id} is already active`;
+    if (goal === undefined) return { text: "no active goal for this session", ok: false };
+    if (goal.status === "active") return { text: `goal ${goal.id} is already active`, ok: false };
     // Resumable: paused (existing), blocked (spec §15-9 — the command entry
     // beside the user-message resume) and budget_limited (spec §11: 可 resume
     // 续跑 — the cap is still enforced at the next boundary, so resuming
     // without raising it re-terminates on the next boundary). completed /
     // stalled / cleared stay hard-terminal.
     if (goal.status !== "paused" && goal.status !== "blocked" && goal.status !== "budget_limited") {
-      return `goal ${goal.id} is not resumable (status: ${goal.status})`;
+      return { text: `goal ${goal.id} is not resumable (status: ${goal.status})`, ok: false };
     }
     const wasBlocked = goal.status === "blocked";
     const wasBudgetLimited = goal.status === "budget_limited";
@@ -2333,12 +2430,22 @@ export class GoalController {
         // resumed goal must not keep carrying its stale blocker.
         goal.blocker = undefined;
       }
-      // A fresh phase re-wakes the model (mirrors the §15-9 user-message
-      // resume); paused keeps its historical no-wake behavior.
-      await this.injectWake(goal);
+      if (wasBudgetLimited) {
+        // §49: the resume command's own result line kicks a real turn (host
+        // auto-wake); grant the one-shot budget grace so that kick turn does
+        // not immediately re-limit the just-resumed goal.
+        goal.budgetGrace = true;
+      }
     }
+    // 2026-10-20 ruling (129 "double message" incident): NO explicit re-wake.
+    // The command face's result line (a goalControl synthetic) is admitted by
+    // the host as steer + execution.wake, so it already kicks the turn; the
+    // tool face runs mid-turn (the model is already executing). An injected
+    // re-wake was a redundant SECOND execution-capable message (a queued turn
+    // the user had to delete). The normal boundary re-wakes at the next turn
+    // end when the goal is active.
     await this.saveGoal(goal);
-    return `goal ${goal.id} resumed (active)`;
+    return { text: `goal ${goal.id} resumed (active)`, ok: true };
   }
 
   private async taskAdd(sessionID: string, title: string): Promise<string> {

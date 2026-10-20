@@ -70,6 +70,13 @@ export function providerPauseRetryText(goalID: string): string {
  * message always overrides. Enforcement backstop is unchanged: turns that
  * neither stop nor advance still tick the stall ladder.
  *
+ * "Safe" de-emphasis (2026-10-20 ruling, 129 live block incident): the line
+ * used to say "take the next SAFE step" — the word gave the model a veto
+ * criterion: uncertainty mapped to "not safe enough", and goal_block was the
+ * face-saving stop. The safety net is the record + the flow (the next-step
+ * record, the stall ladder, user override) — not a word in the prompt.
+ * "genuinely blocked" stays: that is the bar for a real stop, not an escape.
+ *
  * Header ruling (2026-10-20, user ruling chain): the header is the speaker tag
  * `[goal] turn-N:` — the goal ID is GONE (the model's goal tools are
  * session-bound — the controller resolves the goal per session, the ID is
@@ -102,7 +109,7 @@ export function buildWakeMessage(
   wakeText?: string,
 ): string {
   const lines = [
-    `[goal] turn-${goal.used.turns}: You advance this goal unattended. Don't ask the user questions and wait — follow the goal's discipline and take the next safe step. The only stops are goal_complete(evidence, a concrete verifiable anchor ≥24 chars) when the goal is done and goal_block(concrete reason) when you are genuinely blocked. A user message always overrides this reminder.`,
+    `[goal] turn-${goal.used.turns}: You advance this goal unattended. Don't ask the user questions and wait — follow the goal's discipline and take the next step. The only stops are goal_complete(evidence, a concrete verifiable anchor ≥24 chars) when the goal is done and goal_block(concrete reason) when you are genuinely blocked. A user message always overrides this reminder.`,
   ];
   // Reactivation context (2026-10-20 ruling): a reactivated goal's first
   // wakes carry ONE line — the prior status and (if the previous phase

@@ -671,3 +671,97 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 
 **验证边界**：实机 = `verify-active.ts` 扩展相（真宿主：complete → 原生 `goal_next_step` → 断言复活记录 + 下一边界唤醒文本含复活行 + 默认 goal 的 view 显示 unbounded）；留 129 生产观察（重播后：129 会话里 completed goal 的 next_step 调用是否走复活分支、新相位 wake 是否带复活行）。
 
+## 45. 2026-10-20 裁定 — 主 wake 文案去"安全"强调（129 现场 block 事件驱动）
+
+**裁定来源（129 现场 → 用户裁定）**：goal `g_mvgb55bo_0`（会话 `ses_ed179b5deffdcXDIjX3reJ1R8J`，AR push 环复刻）在 6 个 wake 周期真实推进后，模型自行调用 `goal_block`（理由：context exhausted；state documented；next step recorded）。对模型自述"My context is essentially nil (~0.1%)"取证：**全程无 compact**（`time_compacting`/`summary_*` 全 null）、该轮 cache read ~896K——上下文不是"空"而是**近满**。耗竭信号真实，机制表述失真。用户裁定：既然已有**记录**（`goal_next_step`）与**流程**（stall 阶梯 / 用户消息覆盖 / 终态归档），wake 文案不用强调"安全推进"——"the next SAFE step"给了模型一个否决判据（不确定 → "不够安全" → `goal_block` 成为体面出口）。安全网在记录与流程里，不在提示词的字里。
+
+**改动**（`buildWakeMessage` 唯一文本点）：`take the next safe step` → `take the next step`。`genuinely blocked` 保留——那是"真停"的 bar，不是逃生门；两个唯一点 + 用户覆盖条款不变。
+
+**范围（有意不动）**：`backgroundCheckInText` 文案不改——其 "safe step" 绑定两个具体安全动作（核后台结果 / 独立推进），是动作菜单而非否决词，且该通道无 `goal_block` 菜单；provider-pause 重试文案不含 "safe step"。
+
+**测试（TDD）**：`wake.test.ts` 主 wake 全文断言 ×2 改新文本（RED → GREEN）；check-in 断言不动，充当范围钉。全量 339/0 + typecheck。
+
+**验证边界**：纯字符串常量——stub 层齐；真宿主上以**下个版本种子**生效（129 现种子仍旧文案）。观察点：模型在低置信状态（上下文近满、无 compact）是否仍找"安全理由" block。诚实注记：本次 129 案例本身是 6 轮推进后的正当终态（block 理由成立），本裁定是**预防性**的，不是已证因果事件的修复。
+
+## 46. 2026-10-20 裁定 — 129 block 状态丢失 incident 的插件侧收口：fail-closed 写入 + watchdog 唤醒日志（取证驱动）
+
+**裁定来源（129 现场取证）**：同会话上 `g_mvgb55bo_0` 的 06:49:22 `goal_block` 被插件确认成功后，06:56:58 `goal_next_step` 读回 **active/turn 7**（普通分支而非复活分支）——block 状态在插件读取的存储层丢失。用户随后观察到一条"挂在发送队列"的自动唤醒消息（已随手删除，物证灭失）。代码审计三结论：① 边界仲裁 wake/hold/skip 全部必留 decisions 行、且日志停在 06:49:15 → 该消息**不是**边界唤醒；② 边界遇终态 goal 静默 return（by design，不写行）；③ **watchdog 路径（check-in / provider-pause 重试）不写任何决策行**——唯一"有消息、无日志"的注入路径。check-in 于 06:34:31 武装（due 06:39:31，错过后 pending），其触发条件 = goal 读回 active → **check-in 能发出本身就是状态翻转的直接证据**（大概率即用户所见消息）。
+
+**改动**：
+1. **`saveGoal` fail-closed**（`controller.saveGoal`）：原实现 `storageSet` 抛异常时 catch→warn→**`return true`**（写失败当成功）——正是"block 报成功但没落盘"这一缺陷类别的温床。现写失败返回 `false`；命令/工具面的终态转换（block/complete/clear/next_step）一律回 "changed underneath"（绝不假成功）。loop 内路径（wake/check-in）保持 best-effort 容错不变（写失败不毁循环）。
+2. **watchdog 唤醒补决策日志**（`deliverWatchdogWake`）：新增 `reason` 参数（`watchdog check-in (in-flight N)` / `watchdog provider-pause retry`），入队成功后写一行 `decision:"watchdog"`。此后**插件注入的每条消息必留一行 decisions**。
+   - 次序约束（回归教训）：日志写必须放在 `saveGoal` **之后**——fs 写插在 tick 的 load→save 之间会拓宽 CAS 竞态窗口，边界方的 stalls 增量会输掉丢写（`watchdog.test.ts` 3 实证回归后修正）。
+
+**测试（TDD）**：`goal-loop.test.ts` 14f（storageSet 脚本化失败 → goal_block 回 "changed underneath"、存储原样不动，RED→GREEN）；`background-gate.test.ts` 32（check-in 触发后决策日志末行 `decision:"watchdog"`、reason 含 check-in，RED→GREEN）。全量 341/0 + typecheck。
+
+**边界（未解）**：状态翻转的根因在宿主 `ctx.storage` 层——磁盘 kv 停在 10-17、活 goal 记录不在盘上、插件当天热重载多次——持久化时机 / 热重载多实例命名空间待宿主存储合同取证（todo #253）。本节两项是独立的插件侧缺陷与可观测性收口，不是根因修复；根因定位前不得汇报"129 incident 已修"。
+
+## 47. 2026-10-20 裁定 — /goal resume 去掉显式 re-wake（"命令已 resume，还 re-wake 干嘛"；129 双消息驱动）
+
+**裁定来源（用户 2026-10-20 当轮）**：129 重启后用户一次 `/goal resume` 产生两条"唤醒"消息（"2 条唤醒消息到了队列"），用户裁定："我都调用命令去 resume 了，还产生什么 re-wake 之类的东西干嘛？"——resume 不应再注入显式 re-wake。
+
+**取证**：`/goal resume` 一次操作产生两条**都能触发执行**的消息——
+1. **显式 re-wake**（`resumeGoal` 的 `injectWake`，delivery:queue 排队）。kv 证明全程只注入这一条（`continuations` 只 +1）。
+2. **命令结果行**（`handleCommand` 自动记录的 goalControl synthetic "goal ... resumed (active)"）。宿主 `sessions.synthetic` 默认 delivery=steer 且无条件 `execution.wake`（2.0.32 / 2.1.0 一致）→ 结果行本身即踢起模型 turn。
+
+结果行先踢掉 turn（模型首句"goal is resumed/active, now I can run the post-reboot script"即对着结果行说的），显式 re-wake 挂在队列等下一轮 → 用户看到"2 条唤醒"、手动删掉多余那条（否则多触发一轮冗余 turn）。`/goal set` 无此问题（`setGoal` 不注入显式 wake，只靠结果行那一条）。
+
+**改动**（`resumeGoal`，`controller.ts`）：去掉 `await this.injectWake(goal)`。命令面 = 状态变更 + 结果行（宿主 steer+wake 即 kick）；工具面 = 模型本就 mid-turn，边界在下一轮 end 时按 active goal 正常唤醒。stale blocker 清除 / stalls 清零逻辑不变。
+
+**关联（129 "block 状态丢失" incident 重新诊断，memory #12320）**：更早的 14:49 incident 根因**非宿主存储层**——是 §15-9 user-inbox auto-resume（14:55:42 用户消息触发 blocked→active + re-wake，设计行为）+ 该路径 re-wake 无 decisions 日志（用户所见"幽灵唤醒"即此）。宿主存储层取证（kv 即时 upsert / 单 db / live-slot 守卫）均正常 → §46 的"根因在宿主 ctx.storage"暂定被取代，根因已定位（插件设计行为 + 可观测性缺口）。
+
+**测试（TDD）**：`goal-loop.test.ts` 16/17/20 改断言 resume **不产生**任何 prompt（RED→GREEN）。全量 341/0 + typecheck。
+
+**边界（未解）**：(B) user-inbox resume 路径（`controller.ts:841`）的 re-wake **无** decisions 日志——"有消息、无日志"缺口仍在（watchdog 那条已由 §46 覆盖）；(C) §15-9 "任意用户消息复活 blocked goal" 语义（14:49 incident 源头）是否过激进、是否收紧为显式 resume——待用户裁定。
+
+## 48. 2026-10-20 裁定 — 终态/暂停通知改为纯记录（`resume:false`），不再触发宿主 auto-wake
+
+**裁定来源（用户 2026-10-20 当轮）**：全面梳理"触发唤醒的场景"时发现 5 条终态/暂停通知（completed / blocked / stalled / budget_limited / provider-pause）是 `probe.synthetic`（goalControl 记录），而**宿主对每条 synthetic 都 auto-wake**（默认 delivery=steer + 无条件 `execution.wake`，2.0.32/2.1.0 一致）→ 每次 goal 走到终态都**额外踢一轮**让模型读"goal X …"。用户裁定"这个有什么意义？？？"——记录有意义、kick 无意义（provider-pause 那条还把注定失败的请求又打一次），改。
+
+**根因（为何活过"简化"）**：设计上这些就是纯记录——`test/arbiter.test.ts` 4c 明确钉"goalControl synthetic → record only, no wake"。但 **harness 把 `synthetic` 建模成 no-op**（`test/harness.ts` 只 push、不 wake），真宿主却 auto-wake → 偏差在 stub 里不可见、只在 129 真宿主上爆（resume 双消息是它第一次咬人，本节 5 条是同一条潜在路径）。`probe.synthetic` 适配器（index.ts）也原本没转发 `resume`（宿主明明支持）。
+
+**改动**：
+1. `SyntheticInput` 加 `resume?: boolean | null`（对齐宿主 `SessionSyntheticInput.resume`），`index.ts` 的 synthetic 适配器转发 `resume`。
+2. 5 条终态/暂停通知传 `resume: false`——`notify`（judge complete / judge blocked / stalled 三条）+ `budget_limited`（boundary cap）+ `provider-pause`（每 incident 一次）。记录照旧落 transcript，宿主不再 kick turn。
+3. **命令结果行（handleCommand）不传 resume（保留 kick）**——`/goal set` / `/goal resume` 的结果行 kick 是有意的触发（§47 去掉显式 re-wake 后正靠它）。
+
+**测试（TDD）**：`arbiter.test.ts`（budget_limited / provider-pause）+ `judge-integration.test.ts`（complete / blocked / stalled）断言对应 synthetic `resume === false`（RED→GREEN）。全量 341/0 + typecheck。
+
+**边界（未解）**：
+- **stub 层无法真验证**：harness 的 synthetic 是 no-op，"改后不再 kick"只能在**真宿主**确认（改前终态通知真会起 turn、改后不起）——纳入发布前真宿主验证批（与 §45/§46/§47 同批）。
+- **harness 硬化（建议）**：把 `synthetic` 改成真宿主语义（steer + 无条件 wake，除非 resume:false），否则这类"记录被宿主 kick"的偏差 stub 永远抓不到。
+- **B1 残留（待裁）**：`/goal view` / `pause` / `block` / `clear` 命令的结果行也在 auto-wake（白踢一轮）；set/resume 的 kick 是有意的——是否把非 set/resume 的结果行也压成纯记录，用户未定。
+
+## 49. 2026-10-20 裁定 — harness 硬化落地（A+B）+ kick 归属精化 + post-resume budget grace + §15-9 resume 日志
+
+**裁定来源（用户 2026-10-20 当轮，依次）**：§48 残留项（harness 硬化 / B1 残留）收口——用户先委托"插件侧四项优化"全部（harness 保真 / 结果行 kick 归属 / §15-9 日志 / 收紧 §15-9），随后撤销第 4 项（"用户发消息就触发 resume 这个不用改，保持"）；harness 保真先裁定 A+B 双管（A=唤醒记账、B=事件流保真）；实现暴露 B 的副作用后（见下），三选一裁定**"保持 A+B 且修 plugin"**（A only / 保持 A+B / 保持 A+B + plugin 修复）。
+
+**§49-A harness 硬化（A+B，兑现 §48"harness 硬化（建议）"）**：
+- **A 记账**：`h.wakes`（`resume !== false` 的 synthetic 列表）——"一条记录即将踢 model turn"的唯一断言面：终态场景 `h.wakes` 应为空。
+- **B 事件保真**：harness `synthetic` 对每条非 `resume:false` 记录真驱动一个 `started+succeeded` turn，走完控制器完整边界仲裁——忠实建模宿主无条件 `execution.wake`。
+  - 必须 **awaited** 而非 fire-and-forget：FG 版实证挂死 `stop()`（turn 的边界在飞，loop 调 next() 后等到已被 stop 移除的 consumer）。
+  - 依赖不变量：非 `resume:false` 的 synthetic **只来自 external command context**（set/resume 结果行——宿主 command dispatch / 测试 commandExecutor）；事件循环内的路径（终态通知 / budget / provider-pause）全传 `resume:false` 不触发。将来若有 wake 路径 synthetic 从 loop 内发出，此处会死锁（注释已钉）。
+  - 次序推论（`handleCommand`）：`lastInbox=control` 必须先于 synthetic 设——awaited 自动 turn 的边界在 `probe.synthetic` 之内运行，归因晚设会让边界看到非 control lastInbox、错误 stall/wake（实证 57 失败，前置后归零）。
+  - 自动 turn **不是** no-op：它的边界真跑（re-budget / recordHandled / saveGoal）——这正是 B 的目的（忠实），也暴露了 stub 一直藏住的不一致（见下）。
+- **B1 残留收口**：非 set/resume 命令的结果行（view/pause/complete/block/clear/history/task + 全部失败路径）传 `resume:false`——纯记录，不再白踢。
+
+**kick 归属精化（kick-on-success）**：`cmdSet` / `setGoal` / `resumeGoal` 改报 `{text, ok}`——
+- 被拒 set（R7：goal 仍非终态）/ set 参数错误 / 失败 resume（无 goal / already active / 硬终态）→ `resume:false` 纯记录：拒绝没有可干的事，不该白踢；R7"拒绝后 goal 精确不变"原样保住。
+- 成功 set / 成功 resume → kick（§47 机制）。
+- 工具面（goal_set / goal_resume）不动（模型本就 mid-turn，无 kick）。
+
+**plugin 新行为 — post-resume budget grace（B 副作用收口）**：
+- **暴露（test 17，stub 藏住的不一致）**：`budget_limited` + `/goal resume` → resume 成功 active，但 resume 结果行自己的 kick turn 跑一次边界 → cap 仍耗尽 → **立刻 re-limit 回 `budget_limited`**——resume 变成无效操作。真宿主会**真实地**这么发生（结果行真踢 turn）：§11 裁定（budget_limited 可 resume 且 resume 后 active）在真机上兑现不了，该不一致一直被 harness 的 no-op 建模藏着。
+- **修复**：`GoalRecord.budgetGrace?: boolean`——`resumeGoal` 从 `budget_limited` 恢复时授予一次性豁免；边界预算重检 cap 命中且有豁免 → 消耗豁免（decisions 日志 `decision:"hold"`，reason `post-resume budget grace consumed …`）、继续正常仲裁；无豁免 → 现状 `budget_limited`。语义 = "resume 买一次完整工作的机会；下一轮仍触 cap 照旧 limit"。
+- 工具面（goal_resume mid-turn）同路径：豁免在自然 turn 边界被消耗，无特殊处理；工具描述同步更新。
+
+**§15-9 用户消息 resume 日志（收口 §47 未解项 (B)）**："用户 inbox 消息复活 blocked goal"（`controller.ts` §15-9 块）的 re-wake 原无 decisions 日志（"有消息、无日志"）。现 `injectWake` 前写一行 `decision:"wake"`（reason `user message resumed blocked goal (§15-9)`），与 §46 watchdog 行同构。**§15-9 任意用户消息复活 blocked goal 的语义本身保持**（用户撤销了收紧项）。
+
+**测试（TDD 全程先红后绿）**：
+- `goal-loop.test.ts`：**1d**（kick 归属：set/resume kick，view/pause/history/complete 纯记录）、**1e**（A+B：set 结果行 `h.wakes` +1 且自动 turn 真被处理——`lastHandledEventID` = `awake_N_e`；终态通知不加 wake）、**1f**（kick-on-success：被拒 set / already-active resume → `resume:false`）、**19**（grace：resume 后保持 active，下一个 over-cap 边界照旧 re-limit——一次性）
+- `arbiter.test.ts` **5b**：`lastHandledEventID` 期望由 `undefined` 改为自动 turn 的 ID（`/^awake_\d+_e$/`）——无 ID 边界不记自己的 ID，残留的是 kick turn 的 ID（§49 前为 undefined）。
+- `judge-integration.test.ts` **4**：§15-9 resume 后 decisions 日志有 §15-9 标记的 wake 行。
+- 全量 345/0 + typecheck。
+
+**验证边界（2026-10-20 已验）**：隔离真宿主（`scripts/verify-wake.ts`，lab LLM `Qwen3.8-27B`）五断言全 PASS：① set 结果行真踢 turn（事件流 `session.execution.started` +1，§47 机制真机存活）；② view 结果行 25s 窗口零新 turn（§48/§49 B1 收口）；③ `budget_limited` 终态通知零 kick（§48 核心主张——修复前宿主必白踢一轮）；④ resume 自 `budget_limited` 保持 active，其 kick turn 的边界消耗 grace，decisions 日志实得 `decision:"hold"` 行（§49，修复前真宿主必被立刻打回）；⑤ grace 一次性，下一个 over-cap 边界照旧 re-limit（全程恰好 5 turns，无模型干预）。§45 纯字符串常量（stub 层齐）；§46/§47 的 129 生产观察项属发布后动作，不受本批影响。实证注记：宿主 command 端点返回 **204**（非 200）；lab 模型对模糊目标会自发 `goal_complete`（模型合规性，验证脚本用"永不完成的倒计时"目标 + 禁 tool 提示规避）。
+

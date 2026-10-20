@@ -97,8 +97,9 @@ export interface InboxRef {
 
 /**
  * Narrowed ctx.session.synthetic input (host: SessionSyntheticInput).
- * The host also carries `id?`, `description?`, `metadata?`, `delivery?`,
- * `resume?` — the goal loop only sends text.
+ * The host also carries `id?`, `description?`, `delivery?`, `resume?` — the
+ * goal loop sends text + metadata, and `resume: false` for terminal/pause
+ * notices (records that must not host-auto-wake; spec §48).
  */
 export interface SyntheticInput {
   sessionID: string;
@@ -109,6 +110,15 @@ export interface SyntheticInput {
    * the Task 8 arbiter depends on this marker.
    */
   metadata?: Record<string, unknown>;
+  /**
+   * host: SessionSyntheticInput.resume?: boolean. The host auto-wakes a
+   * synthetic on admission (default delivery "steer" + execution.wake), so a
+   * goalControl record would kick a model turn unless `resume: false`.
+   * Terminal/pause notices are RECORDS (not wakes) and pass `resume: false`
+   * (spec §48). Command result lines (handleCommand) omit it — their kick is
+   * the intended /goal set / resume trigger.
+   */
+  resume?: boolean | null;
 }
 
 /**

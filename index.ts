@@ -164,6 +164,9 @@ export default Plugin.define({
           sessionID: input.sessionID,
           text: input.text,
           metadata: input.metadata as unknown as Record<string, never> | undefined,
+          // §48: forward `resume` so terminal/pause notices (resume:false)
+          // are records that do NOT host-auto-wake a model turn.
+          resume: input.resume,
         });
       },
 

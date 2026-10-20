@@ -107,6 +107,13 @@ export interface GoalRecord {
    *  and the moment of reactivation. The next boundary wake carries a
    *  reactivation context line from this (buildWakeMessage). */
   reactivation?: { from: GoalStatus; at: number };
+  /** One-shot budget grace (2026-10-20 ruling, spec §49): set when a goal is
+   *  resumed from budget_limited. The resume command's own result line kicks a
+   *  real turn (host auto-wake, §48-B); without the grace, that kick turn's
+   *  boundary would immediately re-limit the just-resumed goal (the caps are
+   *  still exhausted), making /goal resume a no-op. The next boundary budget
+   *  re-check consumes it (decision "hold") instead of re-limiting. */
+  budgetGrace?: boolean;
 }
 
 export const GOAL_STORAGE_PREFIX = "goal/";

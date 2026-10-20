@@ -44,6 +44,11 @@ export interface Harness {
   storage: Map<string, unknown>; // storageGet/Set/Remove/Scan 的后端
   prompts: PromptCall[]; // 捕获的 prompt 调用（含 metadata/delivery）
   synthetics: SyntheticCall[];
+  // §48 A: the synthetics that WOULD trigger the host's execution.wake on
+  // admission (resume !== false). A terminal/pause notice (resume:false) never
+  // lands here — so a terminal scenario leaving h.wakes unchanged is the
+  // assertion that "no record here kicks a model turn."
+  wakes: SyntheticCall[];
   toolExecutor(name: string, input: unknown, sessionID: string): Promise<string>; // 驱动已注册工具（R5: 携带 sessionID）
   commandExecutor(sessionID: string, text: string): Promise<void>; // 驱动已注册命令（R5: 携带 sessionID）
   setGenerate(reply: string | ((input: { sessionID: string; prompt: string }) => string)): void;
@@ -247,6 +252,8 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
   const cancelledInbox: string[] = [];
   const prompts: PromptCall[] = [];
   const synthetics: SyntheticCall[] = [];
+  const wakes: SyntheticCall[] = [];
+  let awakeSeq = 0;
   const generated: Harness["generated"] = [];
   const permissions: Harness["permissions"] = [];
   const permissionDecisions: Harness["permissionDecisions"] = [];
@@ -285,7 +292,35 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
       return ref;
     },
     synthetic: async (input) => {
-      synthetics.push({ input: structuredClone(input) });
+      const call: SyntheticCall = { input: structuredClone(input) };
+      synthetics.push(call);
+      if (input.resume === false) return; // pure record — the host does NOT wake
+      // §48 A: record that this synthetic WOULD host-auto-wake (default steer).
+      // The assertion surface for "a record here is going to kick a model
+      // turn"; terminal/pause notices pass resume:false and never reach this.
+      wakes.push(call);
+      // §48 B: faithfully drive the host's auto-wake turn, AWAITED to
+      // completion so no auto-wake turn is left pending at test end — a
+      // fire-and-forget turn deadlocked stop(): after the loop handled the
+      // harness-injected boundary it called next() and waited on a consumer
+      // stop() had already removed. Safe to await here ONLY because every
+      // non-resume synthetic is emitted from an external command context
+      // (set/resume) — never from within the controller's event loop (terminal/
+      // pause notices are resume:false). If a wake-path synthetic were ever
+      // emitted from inside the loop, this would deadlock. The auto-turn is a
+      // NO-OP on goal state for the scenarios that matter (control/terminal
+      // boundaries), so it disturbs no assertion.
+      const n = ++awakeSeq;
+      await stream.emit({
+        type: "session.execution.started",
+        id: `awake_${n}_s`,
+        properties: { sessionID: input.sessionID },
+      });
+      await stream.emit({
+        type: "session.execution.succeeded",
+        id: `awake_${n}_e`,
+        properties: { sessionID: input.sessionID },
+      });
     },
     context: async (sessionID) => structuredClone(messages.get(sessionID) ?? []),
     storageGet: async (key) => structuredClone(storage.get(key)),
@@ -400,6 +435,7 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
     storage,
     prompts,
     synthetics,
+    wakes,
     toolExecutor: async (name, input, sessionID) => {
       const tool = tools.get(name);
       if (tool === undefined) throw new Error(`toolExecutor: unknown tool "${name}"`);

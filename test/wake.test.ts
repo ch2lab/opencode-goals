@@ -133,7 +133,7 @@ test("default (no wakeText) message is byte-identical to the pinned template", (
   // Pinned byte-for-byte: the wake = tag + autonomy line + next-step section.
   const g = goalWith({});
   const expected = [
-    "[goal] turn-3: You advance this goal unattended. Don't ask the user questions and wait — follow the goal's discipline and take the next safe step. The only stops are goal_complete(evidence, a concrete verifiable anchor ≥24 chars) when the goal is done and goal_block(concrete reason) when you are genuinely blocked. A user message always overrides this reminder.",
+    "[goal] turn-3: You advance this goal unattended. Don't ask the user questions and wait — follow the goal's discipline and take the next step. The only stops are goal_complete(evidence, a concrete verifiable anchor ≥24 chars) when the goal is done and goal_block(concrete reason) when you are genuinely blocked. A user message always overrides this reminder.",
     RECORD_FIRST_LINE,
   ].join("\n");
   expect(buildWakeMessage(g)).toBe(expected);
@@ -165,7 +165,7 @@ test("the wake is the speaker tag + the autonomous goal-mode line ONLY (no goal 
   const msg = buildWakeMessage(g, undefined, undefined);
   expect(msg).toBe(
     [
-      "[goal] turn-3: You advance this goal unattended. Don't ask the user questions and wait — follow the goal's discipline and take the next safe step. The only stops are goal_complete(evidence, a concrete verifiable anchor ≥24 chars) when the goal is done and goal_block(concrete reason) when you are genuinely blocked. A user message always overrides this reminder.",
+      "[goal] turn-3: You advance this goal unattended. Don't ask the user questions and wait — follow the goal's discipline and take the next step. The only stops are goal_complete(evidence, a concrete verifiable anchor ≥24 chars) when the goal is done and goal_block(concrete reason) when you are genuinely blocked. A user message always overrides this reminder.",
       RECORD_FIRST_LINE,
     ].join("\n"),
   );

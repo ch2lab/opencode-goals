@@ -313,7 +313,10 @@ test("5b: id-less boundary still persists usage increments (unconditional saveGo
   const after = goalOf(h)!;
   expect(after.used.turns).toBe(1); // wake increments persist even with no id
   expect(after.continuations).toBe(1);
-  expect(after.lastHandledEventID).toBeUndefined(); // id-less: nothing to record
+  // §49-B: the set's own auto-wake turn (harness-faithful host kick) handled
+  // an event; the id-less boundary records none of its own → the kick turn's
+  // terminal ID is what remains (pre-§49-B this was undefined).
+  expect(after.lastHandledEventID).toMatch(/^awake_\d+_e$/);
   await stop();
 });
 
@@ -338,6 +341,7 @@ test("6: budget — tokens path (usage.updated cumulative + boundary) and turns 
   expect(goalOf(h)!.status).toBe("budget_limited");
   expect(h.prompts.length).toBe(0);
   expect(h.synthetics[h.synthetics.length - 1].input.text).toContain("budget_limited");
+  expect(h.synthetics[h.synthetics.length - 1].input.resume).toBe(false); // §48: terminal notice = record, not a host auto-wake
   expect(h.storage.get(archivedGoalKey(S, g.id))).toBeDefined(); // archive readable
 
   // turns path (isolated session s2): cap.turns = 3
@@ -503,6 +507,7 @@ test("15: provider failure — first errored boundary wakes once (doomed turn NO
   expect(h.synthetics.length).toBe(1); // exactly one notice
   expect(h.synthetics[0].input.metadata?.goalControl).toBe(true);
   expect(h.synthetics[0].input.text).toContain(g.id);
+  expect(h.synthetics[0].input.resume).toBe(false); // §48: pause notice = record, not a host auto-wake
   expect(g.stalls).toBe(stallsAfter1); // the pause does no stall accounting
   expect(g.used.turns).toBe(0);
   expect(g.status).toBe("active"); // paused ≠ terminal — recoverable

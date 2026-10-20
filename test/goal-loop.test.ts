@@ -6,7 +6,7 @@ import { resolveOptions } from "../src/options.ts";
 import { archivedGoalKey, goalStorageKey, type GoalRecord } from "../src/state.ts";
 import { GoalController } from "../src/controller.ts";
 import { createHarness, type Harness } from "./harness.ts";
-import type { HostEvent } from "../src/types.ts";
+import type { HostEvent, SyntheticInput } from "../src/types.ts";
 
 const S = "s1";
 
@@ -43,7 +43,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function lastSynthetic(h: Harness): { text: string; metadata?: Record<string, unknown> } {
+function lastSynthetic(h: Harness): SyntheticInput {
   const call = h.synthetics[h.synthetics.length - 1];
   expect(call, "a synthetic feedback must have been emitted").toBeDefined();
   return call.input;
@@ -117,6 +117,58 @@ test("1c: unknown subcommand and bare /goal produce usage text, never a throw", 
   expect(lastSynthetic(h).text).toContain("unknown goal subcommand");
   await h.commandExecutor(S, "/goal");
   expect(lastSynthetic(h).text).toContain("Usage:");
+  await stop();
+});
+
+test("1d: only set/resume result lines kick; every other subcommand is a pure record (resume:false) (§48-#2)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Kick");
+  expect(lastSynthetic(h).resume).not.toBe(false); // set keeps the host auto-wake
+
+  await h.commandExecutor(S, "/goal view");
+  expect(lastSynthetic(h).resume).toBe(false); // pure record
+  await h.commandExecutor(S, "/goal pause");
+  expect(lastSynthetic(h).resume).toBe(false); // pure record
+  await h.commandExecutor(S, "/goal history");
+  expect(lastSynthetic(h).resume).toBe(false); // pure record
+  await h.commandExecutor(S, "/goal resume");
+  expect(lastSynthetic(h).resume).not.toBe(false); // resume keeps the kick (§47)
+  await h.commandExecutor(S, "/goal complete");
+  expect(lastSynthetic(h).resume).toBe(false); // complete (and its error path) = pure record
+
+  await stop();
+});
+
+test("1e: harness A+B — a non-resume synthetic is recorded as a would-wake AND drives a real turn; a terminal notice adds neither (§48)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Terminal --tokens 100000");
+  // A: the set's result line (no resume) is the single would-wake.
+  expect(h.wakes).toHaveLength(1);
+  // B: that wake drove a REAL turn — by the time commandExecutor returns the
+  // auto-turn is processed, so the goal's last handled event is the auto-wake
+  // turn's terminal (the controller actually processed it).
+  expect(goalOf(h)!.lastHandledEventID).toMatch(/^awake_\d+_e$/);
+
+  // Trip the tokens cap → budget_limited (a terminal notice, resume:false).
+  await h.emit(usage("u1", { input: 100000 }));
+  await h.emit(started("s1"));
+  await h.emit(succeeded("e1"));
+  expect(goalOf(h)!.status).toBe("budget_limited");
+  // A: the terminal notice added NO wake — h.wakes is still just the set.
+  expect(h.wakes).toHaveLength(1);
+  await stop();
+});
+
+test("1f: kick-on-success — a refused set and a no-op resume are pure records (resume:false) (§49)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Kick");
+  expect(lastSynthetic(h).resume).not.toBe(false); // successful set → kick
+  await h.commandExecutor(S, "/goal set Other");
+  expect(lastSynthetic(h).text).toContain("still in progress");
+  expect(lastSynthetic(h).resume).toBe(false); // refused set → record, no kick
+  await h.commandExecutor(S, "/goal resume");
+  expect(lastSynthetic(h).text).toContain("already active");
+  expect(lastSynthetic(h).resume).toBe(false); // nothing resumed → record, no kick
   await stop();
 });
 
@@ -267,7 +319,7 @@ test("7: pause rejects goal_complete (not active); resume restores active", asyn
 // 16-18. /goal resume coverage (spec §15-9 / §11: blocked and budget_limited are resumable)
 // ---------------------------------------------------------------------------
 
-test("16: /goal resume on a blocked goal → active, blocker cleared, stalls 0, one wake (spec §15-9 command entry)", async () => {
+test("16: /goal resume on a blocked goal → active, blocker cleared, stalls 0, NO explicit wake (2026-10-20 ruling: the command result line is the kick — an injected re-wake was a redundant second execution-capable message the user had to delete)", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Blocked via command");
   const reply = await h.toolExecutor("goal_block", { reason: "waiting for external decision" }, S);
@@ -280,14 +332,13 @@ test("16: /goal resume on a blocked goal → active, blocker cleared, stalls 0, 
   expect(after.status).toBe("active");
   expect(after.stalls).toBe(0);
   expect(after.blocker).toBeUndefined(); // the stale blocker must not survive the resume (129 incident)
-  expect(h.prompts.length).toBe(1);
-  expect(h.prompts[0].input.metadata?.goalWake).toBe(true);
-  expect(after.used.turns).toBe(1);
-  expect(after.continuations).toBe(1);
+  expect(h.prompts.length).toBe(0); // no explicit re-wake: the host admits the result-line synthetic (steer + wake) — ONE message
+  expect(after.used.turns).toBe(0);
+  expect(after.continuations).toBe(0);
   await stop();
 });
 
-test("17: /goal resume on a budget_limited goal → active + one wake (spec §11: resumable continuation)", async () => {
+test("17: /goal resume on a budget_limited goal → active, NO explicit wake (2026-10-20 ruling; spec §11: resumable continuation)", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Budgeted --tokens 100");
   await h.emit(usage("u1", { input: 100, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }));
@@ -301,8 +352,7 @@ test("17: /goal resume on a budget_limited goal → active + one wake (spec §11
   expect(after.id).toBe(id);
   expect(after.status).toBe("active");
   expect(after.stalls).toBe(0);
-  expect(h.prompts.length).toBe(before + 1);
-  expect(h.prompts[before].input.metadata?.goalWake).toBe(true);
+  expect(h.prompts.length).toBe(before); // no explicit re-wake
   await stop();
 });
 
@@ -316,6 +366,23 @@ test("18: /goal resume rejects terminal states (completed stays hard-terminal, n
   await h.commandExecutor(S, "/goal resume");
   expect(goalOf(h)!.status).toBe("completed"); // untouched
   expect(h.prompts.length).toBe(before); // no wake
+  await stop();
+});
+
+test("19: resume from budget_limited grants one boundary budget grace — the kick turn does not re-limit; the next over-cap boundary does (§49)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set G --tokens 100000");
+  await h.emit(usage("u1", { input: 100000 }));
+  await h.emit(started("s1"));
+  await h.emit(succeeded("e1"));
+  expect(goalOf(h)!.status).toBe("budget_limited");
+  await h.commandExecutor(S, "/goal resume");
+  // The resume's own kick turn (host auto-wake, §48-B) consumes the grace
+  // instead of immediately re-limiting the just-resumed goal.
+  expect(goalOf(h)!.status).toBe("active");
+  await h.emit(started("s2"));
+  await h.emit(succeeded("e2"));
+  expect(goalOf(h)!.status).toBe("budget_limited"); // one-shot: the next over-cap boundary re-limits
   await stop();
 });
 
@@ -347,14 +414,14 @@ test("20: goal_resume tool resumes paused/blocked/budget_limited, refuses active
   expect(await h.toolExecutor("goal_resume", {}, S)).toContain("resumed");
   expect(goalOf(h)!.status).toBe("active");
   expect(h.prompts.length).toBe(before); // paused keeps its no-wake behavior
-  // blocked: blocker cleared + one wake (same core as the command, §15-9)
+  // blocked: blocker cleared, NO explicit wake (2026-10-20 ruling — the model
+  // is mid-turn on the tool path; the boundary re-wakes at the next turn end)
   await h.toolExecutor("goal_block", { reason: "waiting on vendor" }, S);
   expect(goalOf(h)!.status).toBe("blocked");
   expect(await h.toolExecutor("goal_resume", {}, S)).toContain("resumed");
   expect(goalOf(h)!.status).toBe("active");
   expect(goalOf(h)!.blocker).toBeUndefined();
-  expect(h.prompts.length).toBe(before + 1);
-  expect(h.prompts[h.prompts.length - 1].input.metadata?.goalWake).toBe(true);
+  expect(h.prompts.length).toBe(before);
   // budget_limited: active + one wake (spec §11) — the previous goal must be
   // terminal first (R7: set refuses while a non-terminal goal exists)
   h.setMessages(S, [EVIDENCE_MESSAGE]);
@@ -368,7 +435,7 @@ test("20: goal_resume tool resumes paused/blocked/budget_limited, refuses active
   const before2 = h.prompts.length;
   expect(await h.toolExecutor("goal_resume", {}, S)).toContain("resumed");
   expect(goalOf(h)!.status).toBe("active");
-  expect(h.prompts.length).toBe(before2 + 1);
+  expect(h.prompts.length).toBe(before2); // no explicit re-wake (2026-10-20 ruling)
   // completed: hard terminal, refused, no wake
   h.setMessages(S, [EVIDENCE_MESSAGE]);
   await h.toolExecutor("goal_complete", { evidence: EVIDENCE }, S);
@@ -682,6 +749,26 @@ test("14c: goal_next_step whose save is dropped by a concurrent write reports th
   const stored = goalOf(h)!;
   expect(stored.status).toBe("cleared"); // the dropped write did not resurrect/reactivate
   expect(stored.nextStep).toBeUndefined();
+  await stop();
+});
+
+test("14f: goal_block whose storage write fails reports the change, not success (fail-closed)", async () => {
+  // 129 incident class (2026-10-20): a block that never reached storage was
+  // later read back as ACTIVE — the write failure had been reported as
+  // success. A terminal transition whose storageSet throws must surface as
+  // "changed underneath" and never claim the transition landed.
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set FailClosed block");
+  const before = goalOf(h)!;
+  (h.probe as unknown as Record<string, unknown>).storageSet = async () => {
+    throw new Error("kv write failed (scripted)");
+  };
+  const reply = await h.toolExecutor("goal_block", { reason: "kv down" }, S);
+  expect(reply).toContain("changed underneath");
+  expect(reply).not.toContain("blocked:"); // never claims success
+  const stored = goalOf(h)!;
+  expect(stored.status).toBe("active"); // the failed write did not land
+  expect(stored.updatedAt).toBe(before.updatedAt); // storage untouched
   await stop();
 });
 
