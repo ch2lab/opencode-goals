@@ -765,3 +765,31 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 
 **验证边界（2026-10-20 已验）**：隔离真宿主（`scripts/verify-wake.ts`，lab LLM `Qwen3.8-27B`）五断言全 PASS：① set 结果行真踢 turn（事件流 `session.execution.started` +1，§47 机制真机存活）；② view 结果行 25s 窗口零新 turn（§48/§49 B1 收口）；③ `budget_limited` 终态通知零 kick（§48 核心主张——修复前宿主必白踢一轮）；④ resume 自 `budget_limited` 保持 active，其 kick turn 的边界消耗 grace，decisions 日志实得 `decision:"hold"` 行（§49，修复前真宿主必被立刻打回）；⑤ grace 一次性，下一个 over-cap 边界照旧 re-limit（全程恰好 5 turns，无模型干预）。§45 纯字符串常量（stub 层齐）；§46/§47 的 129 生产观察项属发布后动作，不受本批影响。实证注记：宿主 command 端点返回 **204**（非 200）；lab 模型对模糊目标会自发 `goal_complete`（模型合规性，验证脚本用"永不完成的倒计时"目标 + 禁 tool 提示规避）。
 
+## 50. 2026-10-21 裁定 — §49-rev（用户命令结果行恢复 kick）+ 事件循环自愈（129 sm70 incident 根治）
+
+**裁定来源（用户 2026-10-21）**：129 "vllm sm70 dev" 会话 goal 停摆 ~4.5h（19:14Z turn 正常结束后插件事件订阅静默断流，宿主 2.1.1 零 ERROR；7 次热重载因 `subscribe()` 从 live head 起而全部无效）。用户用 `/goal view` 试图查看状态——**无任何 UI 显示**。排查链（全只读取证 + 2.1.1 上游源码）：① 宿主 `resume:false` 的 synthetic 只进 `session_inbox`，**永不晋升 `session_message`**（UI 时间线数据源）→ §49 的"记录行留在 transcript"对用户不可见（2.0.x→2.1.x 渲染/晋升行为变化）；② 插件 `runLoop` 对迭代器 `done` **静默永久退出**（零日志）、对 `throw` 退出且**从不重订阅**→ 任何一次瞬断 = 永久失聪（宿主断流只是引信，插件无自愈才是 4.5h 冻结核因）。用户裁定："可以"——两件都做。
+
+**§49-rev（用户命令结果行恢复 kick）**：所有用户 `/goal` 命令结果行（set/view/pause/complete/block/clear/history/task + 拒绝/失败/未知子命令/usage/异常路径）恢复 kick——**模型的可见回复是唯一用户可见输出**（2.1.1 下记录行不可渲染）。§48 的 5 条机器发起的终态/暂停通知保持 `resume:false` 纯记录不变（无人在等，不白踢）。kick turn 的边界按 control 语义不链式再唤醒（parked 循环不被命令重启，stub T4 钉死）。
+
+**§50-A 事件循环自愈**：
+- **重订阅**：`runLoop` 迭代器 `done`/`throw` → 大声日志（done 路径原为零日志）+ 新订阅（≥1s 回退防 hot-loop；**循环内迭代器变量替换**——首版 bug：resubscribe 新建了订阅但循环仍轮询死迭代器，空转风暴，TDD 抓到）。
+- **全局 liveness 定时器**（30s 扫描，默认静默窗 5min，deps 可注入）：**故意不挂 per-goal watchdog**——watchdog 在 `execution.started` 时止表，而致命形态（sm70）正是"started 已见、terminal 丢失"→ 无人重武装。规则：`lastEventAt` 静默 > livenessMs 且某会话 `turns.active=true`（我们看到的 started 没有对应 terminal）→ 强制重订阅 + 按 `session.idle` 重跑边界仲裁（arbitration 自带 in-flight 门：真在跑的 turn 只会 hold，不会误 wake；误报成本 = 一次 hold 边界，漏报成本 = 此前的 4.5h 静默）。
+
+**宿主侧待办（插件无法自修，另行跟进）**：① 2.1.1 事件流在长 turn 窗口内静默终止的死因未钉（无 ERROR 日志；候选：desktop-ssh 隧道/bus scope 生命周期）；② `resume:false` 记录行不渲染（若宿主修复，§49-rev 的 kick 可再收紧，但当前保留——可见性优先）。
+
+**测试（TDD 全程先红后绿）**：
+- 新增 `stream-heal.test.ts`：T1 流死→重订阅→新管道收事件（`lastHandledEventID` 推进实证）；T2 **sm70 形态**——turn started 后 terminal 丢失 → liveness 重查 → 补发被丢的 wake；T3 parked goal 不被 liveness 误唤醒（零新 wake/check-in）；T4 `/goal view` kick 可见回复 turn 且不链式再唤醒。
+- `goal-loop.test.ts`：**1d/1f 翻转**（所有命令结果行 kick，含拒绝/失败）；**2**（R7 断言放宽：拒绝 kick turn 的边界可推进 `lastHandledEventID`——传输记账，非 goal 变更）。
+- harness：kick auto-turn 的 await ack 加 500ms 界（事件循环被长 await 阻塞时——judge pending——不再死锁 command handler；正常路径仍是微任务级，确定性不变）。
+- 全量 349/0 + typecheck。
+
+**真宿主发现（2026-10-21 verify-wake 首跑失败，decisions-2420 实锤，两修后全 PASS）**：
+- **busy-steer**：2.1.1 对运行中会话的 command/synthetic/prompt 做 STEER（吸收进运行中 turn，不产生新 `started`、不排队成独立 turn）。首跑中 B（view kick）撞上运行中的 set-kick turn，被 steer 的项以 `type:"user"` 投递且未命中 isControl 原判据（要求 `itemType==="synthetic"`）→ `lastInbox` 误翻 user → set-kick turn 边界**误 wake**（决策行 `00:14:02Z decision:"wake"` 实锤），白烧掉 goal 唯一预算 turn → C 阶段 prompt 又被 steer 吸收 → 计数全线错位（C0/C1/E 三 FAIL，goal 状态推进本身正常）。
+- **修复 A（插件）**：`isControl` 判据改为**只看 `metadata.goalControl`**（宿主投递的 item 类型不可信——record 行 `type:"synthetic"`、被 steer 的 kick 行观测到 `type:"user"`）；stub 1g 钉死（user 型 + goalControl → control，边界零 wake）。
+- **修复 B（验证脚本）**：busy-steer 是宿主契约，验证批每个阶段先用 active map（`GET /api/session/active`，`host.ts` 新增 `sessionActive()`）等会话非 running 再发命令/prompt（A2/B2 idle 门）——turn 计数断言因此确定性成立。
+- **投递形态取证（保留现场 event 流，正则统计）**：命令结果行 synthetic 一律 `type:"synthetic"` + `metadata:{goalControl:true}`（5 条）；注入 wake 与用户 prompt 为 `type:"user"`（wake 带 `goalWake` metadata，3 条）。
+
+**验证边界（2026-10-21 已验）**：隔离真宿主（宿主 2.1.1，lab LLM `Qwen3.8-27B`）两条批全 PASS：
+- `verify-wake.ts` 12/12：① set 结果行真踢 turn；② **view 结果行真踢可见回复 turn（§49-rev 核心断言）**；③ `budget_limited` 终态通知零 kick（§48 不回归）；④ resume 自 `budget_limited` 保持 active、grace 消耗留痕 `decision:"hold"`（§49）；⑤ grace 一次性 re-limit（**C1 恰好 4 turns**：set kick + view kick + prompt + wake；**E 恰好 6 turns**：+ resume kick + prompt——view kick 计入 ladder，全程无模型干预）。
+- `verify-heal.ts` 5/5（**§50 自愈真宿主证据**，探针 `OPENCODE_GOAL_KILL_STREAM=1` 在首个 turn 开始处自杀一次订阅 = 129 死法的受控复现）：H1b 断流 + done 路径 `event stream ended — re-subscribing` 日志实锤（宿主 stdout）；H2 新订阅收到后续事件（prompt turn 启动）；H3 新订阅上的边界注入 wake（决策日志 `decision:"wake"` 行——129 症状"零决策行"的反例）；H4 循环自治到 `budget_limited`（3 turns）。liveness 重查（5min 静默窗）为 stub 层验证（stream-heal T2 的 sm70 形态），真宿主 5min 窗口不适配脚本时长，不硬凑。
+

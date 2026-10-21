@@ -120,21 +120,21 @@ test("1c: unknown subcommand and bare /goal produce usage text, never a throw", 
   await stop();
 });
 
-test("1d: only set/resume result lines kick; every other subcommand is a pure record (resume:false) (§48-#2)", async () => {
+test("1d: every user command result line kicks (visible output); machine notices stay pure records (§48-#2 / §49-rev 2026-10-21)", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Kick");
   expect(lastSynthetic(h).resume).not.toBe(false); // set keeps the host auto-wake
 
   await h.commandExecutor(S, "/goal view");
-  expect(lastSynthetic(h).resume).toBe(false); // pure record
+  expect(lastSynthetic(h).resume).not.toBe(false); // §49-rev: user query kicks — the reply IS the visible output
   await h.commandExecutor(S, "/goal pause");
-  expect(lastSynthetic(h).resume).toBe(false); // pure record
+  expect(lastSynthetic(h).resume).not.toBe(false); // §49-rev: state change → user sees confirmation
   await h.commandExecutor(S, "/goal history");
-  expect(lastSynthetic(h).resume).toBe(false); // pure record
+  expect(lastSynthetic(h).resume).not.toBe(false); // §49-rev: user query kicks
   await h.commandExecutor(S, "/goal resume");
   expect(lastSynthetic(h).resume).not.toBe(false); // resume keeps the kick (§47)
   await h.commandExecutor(S, "/goal complete");
-  expect(lastSynthetic(h).resume).toBe(false); // complete (and its error path) = pure record
+  expect(lastSynthetic(h).resume).not.toBe(false); // §49-rev: error path visible too
 
   await stop();
 });
@@ -159,16 +159,41 @@ test("1e: harness A+B — a non-resume synthetic is recorded as a would-wake AND
   await stop();
 });
 
-test("1f: kick-on-success — a refused set and a no-op resume are pure records (resume:false) (§49)", async () => {
+test("1f: every command result line kicks — a refused set and a no-op resume included, so the user sees the refusal (§49-rev)", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Kick");
   expect(lastSynthetic(h).resume).not.toBe(false); // successful set → kick
   await h.commandExecutor(S, "/goal set Other");
   expect(lastSynthetic(h).text).toContain("still in progress");
-  expect(lastSynthetic(h).resume).toBe(false); // refused set → record, no kick
+  expect(lastSynthetic(h).resume).not.toBe(false); // refused set → visible to the user
   await h.commandExecutor(S, "/goal resume");
   expect(lastSynthetic(h).text).toContain("already active");
-  expect(lastSynthetic(h).resume).toBe(false); // nothing resumed → record, no kick
+  expect(lastSynthetic(h).resume).not.toBe(false); // no-op resume → visible too
+  await stop();
+});
+
+test("1g: 2.1.1 kick-synthetic shape — a goalControl item delivered as type:user is CONTROL, no spurious wake (§50)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set NoSpur");
+  // §50 real-host finding (2026-10-21 verify-wake run): 2.1.1 delivers our KICK
+  // result-line synthetic as a USER-typed inbox item carrying the goalControl
+  // metadata (record lines arrive as type:"synthetic"). The metadata — not the
+  // host's item type — is the attribution signal; classifying on the type
+  // re-attributed the kick line as "user" and the kick turn's boundary woke
+  // spuriously (burning the goal's budget turn).
+  await h.emit(ev("session.inbox.enqueued", "q_k1", {
+    sessionID: S,
+    inboxID: "inbox_k1",
+    item: { type: "user", payload: { text: "goal NoSpur set — active", metadata: { goalControl: true } }, delivery: "queue" },
+  }));
+  // The host steers it into the running turn: by the boundary it is delivered
+  // (gone from the live inbox store) — the queued gate is clear.
+  await h.probe.inboxCancel("inbox_k1");
+  await h.emit(started("s1"));
+  await h.emit(succeeded("e1"));
+  // The kick turn's boundary sees lastInbox=control → NO wake: a kick line must
+  // never burn budget nor restart a parked loop.
+  expect(h.prompts.length).toBe(0);
   await stop();
 });
 
@@ -185,13 +210,18 @@ test("2: set while a non-terminal goal exists refuses (still) and leaves the old
   const archivedBefore = await h.probe.storageScan(archivedPrefix);
   await h.commandExecutor(S, "/goal set New objective");
   expect(lastSynthetic(h).text).toContain("still");
-  // R7 (spec §9): the old goal is EXACTLY as it was — same record including
-  // updatedAt, same status, nothing written under archivedGoalKey.
+  // R7 (spec §9): the old goal is untouched as a GOAL — same id/status/
+  // objective/tasks/usage, nothing written under archivedGoalKey. (§49-rev:
+  // the refused set now kicks a visible-reply turn, whose boundary may
+  // advance lastHandledEventID — that is transport bookkeeping, not a goal
+  // change.)
   const after = goalOf(h)!;
-  expect(after).toEqual(beforeRaw);
   expect(after.id).toBe(before.id);
   expect(after.status).toBe(before.status); // unchanged (still active)
   expect(after.objective).toBe("Old objective");
+  expect(after.tasks).toEqual(beforeRaw.tasks);
+  expect(after.used).toEqual(beforeRaw.used);
+  expect(after.cap).toEqual(beforeRaw.cap);
   const archivedAfter = await h.probe.storageScan(archivedPrefix);
   expect(archivedAfter).toEqual(archivedBefore); // empty: the refusal archived nothing
   expect(h.storage.get(archivedGoalKey(S, before.id))).toBeUndefined();

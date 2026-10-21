@@ -115,6 +115,11 @@ export interface ControllerDeps {
    *  wake turn takes seconds-to-minutes, so a boundary far beyond the
    *  window is the wake turn's own terminal, not a sibling. */
   contWindowMs?: number;
+  /** §50 liveness: no events received for this long while a started turn has
+   *  no terminal → re-subscribe + re-arbitrate (default 5 min; tests inject). */
+  livenessMs?: number;
+  /** §50 liveness scan period (default 30s; tests inject). */
+  livenessCheckMs?: number;
 }
 
 const TASK_STATUSES: readonly GoalTaskStatus[] = ["todo", "doing", "done"];
@@ -319,6 +324,21 @@ export class GoalController {
    */
   private judgeInstruction = new Map<string, string>();
   private loopIter: AsyncIterator<HostEvent> | undefined;
+  /** §50: wall clock of the last event actually RECEIVED (freshness of the
+   *  subscription, independent of any goal state). */
+  private lastEventAt = 0;
+  /** §50: timestamp of the last re-subscribe (≥1s apart: a stream that dies
+   *  instantly must not hot-loop the subscription). */
+  private lastResubAt = 0;
+  /** §50: per-session liveness recheck cooldown (one recheck per livenessMs). */
+  private recheckAt = new Map<string, number>();
+  /** §50 global liveness timer (independent of the per-goal watchdog). */
+  private livenessTimer: ReturnType<typeof setInterval> | undefined;
+  /** §50 probe (verification only, OPENCODE_GOAL_KILL_STREAM=1): kill our own
+   * subscription once, at the first handled turn start — simulates the 129
+   * host-side stream death so scripts/verify-heal.ts can exercise the
+   * re-subscribe recovery on a real host. No-op unless the env is set. */
+  private killStreamProbePending = true;
   private loopPromise: Promise<void> | undefined;
   private stopped = false;
   /** This instance's live-slot reference (set at the first line of start()). */
@@ -606,8 +626,15 @@ export class GoalController {
     // probe.eventSubscribe() — spec §6 arbitration, §11 budget,
     // §15-9 blocked resume. One consumer per controller instance.
     this.stopped = false;
-    this.loopIter = this.probe.eventSubscribe()[Symbol.asyncIterator]();
-    this.loopPromise = this.runLoop(this.loopIter);
+    this.loopPromise = this.runLoop();
+    // §50: the liveness scan runs on its own clock for the whole lifetime of
+    // the instance (the per-goal watchdog is disarmed while a turn is in
+    // flight — exactly when a lost terminal would otherwise go unnoticed).
+    this.livenessTimer = setInterval(() => {
+      void this.livenessScan().catch((err) => {
+        console.warn("opencode-goal: liveness scan failed:", err);
+      });
+    }, this.livenessCheckMs());
     return slot.stop;
   }
 
@@ -622,6 +649,8 @@ export class GoalController {
     if (this.stopping !== undefined) return this.stopping;
     this.stopping = (async () => {
       this.stopped = true;
+      if (this.livenessTimer !== undefined) clearInterval(this.livenessTimer);
+      this.livenessTimer = undefined;
       // stop EVERYTHING — all per-goal watchdog timers and pending tick work
       // (test/watchdog.test.ts #10).
       for (const timer of this.wdTimers.values()) clearInterval(timer);
@@ -653,24 +682,141 @@ export class GoalController {
   // call is the sole exception, with inline verdict disposition — Task 9)
   // ------------------------------------------------------------------
 
-  private async runLoop(iter: AsyncIterator<HostEvent>): Promise<void> {
+  /**
+   * §50 stream self-healing (2026-10-21 129 incident: the host's event stream
+   * ended cleanly mid-session; the old loop returned — the DONE path silently,
+   * with zero logs — and the goal froze for ~4.5h while the host kept
+   * emitting). A dropped subscription is now a transient condition:
+   * - iterator `done` or `throw` → fresh subscription (≥1s apart), loudly logged;
+   * - the loop's iterator variable is REPLACED on reopen — the old code kept
+   *   polling the dead iterator (resubscribed consumers went unused).
+   */
+  private async runLoop(): Promise<void> {
+    let iter = this.openSubscription();
     for (;;) {
       let result: IteratorResult<HostEvent>;
       try {
         result = await iter.next();
       } catch (err) {
-        console.warn("opencode-goal: event stream errored, stopping wake loop:", err);
+        console.warn("opencode-goal: event stream errored — re-subscribing:", err);
+        const next = await this.reopenSubscription(iter);
+        if (next === undefined) return;
+        iter = next;
+        continue;
+      }
+      if (result.done) {
+        console.warn("opencode-goal: event stream ended — re-subscribing");
+        const next = await this.reopenSubscription(iter);
+        if (next === undefined) return;
+        iter = next;
+        continue;
+      }
+      if (this.stopped) {
+        await iter.return?.();
         return;
       }
-      if (result.done || this.stopped) return;
+      this.lastEventAt = Date.now();
       try {
         await this.handleEvent(result.value);
+        // §50 probe (verification only): kill our own subscription once, at
+        // the first handled turn start — the loop's done path must
+        // re-subscribe and keep processing (scripts/verify-heal.ts).
+        if (this.killStreamProbePending && process.env.OPENCODE_GOAL_KILL_STREAM === "1") {
+          if (result.value.type === "session.execution.started") {
+            this.killStreamProbePending = false;
+            console.warn("opencode-goal: [probe] force-killing event stream (OPENCODE_GOAL_KILL_STREAM)");
+            this.forceResubscribe();
+          }
+        }
       } catch (err) {
         // Fault-tolerance discipline: a single event failure never breaks the loop.
         console.warn(
           `opencode-goal: failed to handle event ${result.value.type} (${result.value.id ?? "no id"}):`,
           err,
         );
+      }
+    }
+  }
+
+  /** Open a fresh subscription and register it as the loop's iterator. */
+  private openSubscription(): AsyncIterator<HostEvent> {
+    const iter = this.probe.eventSubscribe()[Symbol.asyncIterator]();
+    this.loopIter = iter;
+    return iter;
+  }
+
+  /** Close `old`, back off (≥1s between re-subscribes: a stream that dies
+   * instantly must not hot-loop the subscription), and open a fresh one.
+   * Resolves undefined iff the instance was stopped (caller ends the loop). */
+  private async reopenSubscription(
+    old: AsyncIterator<HostEvent>,
+  ): Promise<AsyncIterator<HostEvent> | undefined> {
+    try {
+      await old.return?.();
+    } catch {
+      // already closed
+    }
+    this.loopIter = undefined;
+    const wait = this.lastResubAt + 1_000 - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    if (this.stopped) return undefined;
+    this.lastResubAt = Date.now();
+    return this.openSubscription();
+  }
+
+  /** §50 liveness: force the loop onto a fresh subscription by closing the
+   * current one — the loop's done path does the backoff/reopen. (The liveness
+   * scan must NOT open its own subscription: the loop owns the iterator.) */
+  private forceResubscribe(): void {
+    const iter = this.loopIter;
+    if (iter === undefined) return;
+    this.loopIter = undefined;
+    void iter.return?.();
+  }
+
+  /** §50 liveness window (default 5 min — a missed boundary must cost at most
+   * this much silence; tests inject deps.livenessMs). */
+  private livenessMs(): number {
+    return this.deps.livenessMs ?? 5 * 60_000;
+  }
+
+  /** §50 liveness scan period (default 30s; tests inject deps.livenessCheckMs).
+   * A GLOBAL timer — deliberately NOT the per-goal watchdog: the watchdog is
+   * disarmed when a turn starts, and the fatal case (129 incident) is exactly
+   * "turn started (seen), terminal lost (never seen) → nothing re-arms the
+   * watchdog". */
+  private livenessCheckMs(): number {
+    return this.deps.livenessCheckMs ?? 30_000;
+  }
+
+  /** §50 one scan: if the stream has been silent for livenessMs while a turn we
+   * STARTED is still tracked active (its terminal was never received — a dead
+   * subscription), re-subscribe and re-arbitrate the boundary as if the
+   * terminal had just arrived. The arbitration's own in-flight gate (host
+   * active-map / shell store) keeps a genuinely running turn from being
+   * woken — a false positive costs one held boundary, never a spurious wake. */
+  private async livenessScan(): Promise<void> {
+    if (this.stopped) return;
+    const now = Date.now();
+    if (now - this.lastEventAt <= this.livenessMs()) return;
+    for (const [sessionID, t] of this.turns) {
+      if (!t.active) continue;
+      if (now - (this.recheckAt.get(sessionID) ?? 0) <= this.livenessMs()) continue;
+      this.recheckAt.set(sessionID, now);
+      console.warn(
+        `opencode-goal: liveness recheck for ${sessionID} — no events for ` +
+          `${Math.round((now - this.lastEventAt) / 1000)}s while a started turn has no terminal ` +
+          `(stream died?); re-subscribing + re-arbitrating the boundary`,
+      );
+      this.forceResubscribe();
+      try {
+        await this.arbitrateBoundary(sessionID, {
+          type: "session.idle",
+          id: undefined,
+          properties: { sessionID },
+        });
+      } catch (err) {
+        console.warn(`opencode-goal: liveness recheck failed for ${sessionID}:`, err);
       }
     }
   }
@@ -792,8 +938,14 @@ export class GoalController {
     const payload = (typeof item.payload === "object" && item.payload !== null && !Array.isArray(item.payload)
       ? item.payload
       : {}) as Record<string, unknown>;
+    // §50 real-host finding (2026-10-21): the goalControl marker in the payload
+    // is the AUTHORITATIVE signal — the host's delivered item TYPE is not:
+    // 2.1.1 delivers our KICK result-line synthetic as a user-typed inbox item
+    // (records arrive as type:"synthetic"); classifying on itemType==="synthetic"
+    // re-attributed the kick line as "user" and the kick turn's boundary woke
+    // spuriously (verify-wake 2026-10-21 run: the set-kick turn consumed the
+    // goal's only budget turn).
     const isControl =
-      itemType === "synthetic" &&
       typeof payload.metadata === "object" &&
       payload.metadata !== null &&
       !Array.isArray(payload.metadata) &&
@@ -1937,14 +2089,20 @@ export class GoalController {
    */
   private async handleCommand(sessionID: string, text: string): Promise<void> {
     let out: string;
-    let kick = false; // §48-#2: only set/resume keep the host's synthetic auto-wake
+    // §49-rev (2026-10-21): every USER command result line kicks — 2.1.1 hosts
+    // do not render resume:false record lines in the UI (verified: they stay
+    // in session_inbox, never promoted to session_message), so a pure record
+    // is invisible to the person who typed the command. The model's one-line
+    // reply IS the visible output. Machine-originated notices (terminal/
+    // pause, §48) keep resume:false — no human is waiting for those.
+    let kick = true;
     try {
       const res = await this.dispatchCommand(sessionID, text);
       out = res.text;
       kick = res.kick;
     } catch (err) {
       out = `goal command failed: ${err instanceof Error ? err.message : String(err)}`;
-      kick = false; // a failed command is a record, never a wake
+      kick = true; // an escaped error is user-facing feedback too
     }
     try {
       // LastInbox attribution (spec §6-⑤): every goal command reply is a
@@ -1978,39 +2136,38 @@ export class GoalController {
     // Accept both the full "/goal set ..." form and the host-routed remainder
     // "set ..." (the host strips the command name before calling us).
     if (tokens[0] === "/goal" || tokens[0] === "goal") tokens = tokens.slice(1);
-    if (tokens.length === 0) return { text: USAGE, kick: false };
+    if (tokens.length === 0) return { text: USAGE, kick: true };
     const [sub, ...rest] = tokens;
-    // §48-#2 / §49 (2026-10-20): only a SUCCESSFUL set/resume result line kicks
-    // — the host auto-wake on their result line IS the intended trigger (§47
-    // removed the resume re-wake to rely on it). A refused set, a failed
-    // resume, and every other subcommand's result line are pure records
-    // (handleCommand passes resume:false) so they do not kick a spurious model
-    // turn.
+    // §48-#2 / §49-rev (2026-10-21): EVERY user command result line kicks —
+    // the model's reply is the only user-visible output on hosts that do not
+    // render resume:false record lines (2.1.1, verified 2026-10-21). Success,
+    // refusal, and error lines alike; machine notifications keep resume:false
+    // (§48, unchanged — they are emitted by the loop, not by a command).
     switch (sub) {
       case "set":
         const set = await this.cmdSet(sessionID, rest);
-        return { text: set.text, kick: set.ok };
+        return { text: set.text, kick: true };
       case "resume":
         const resumed = await this.resumeGoal(sessionID);
-        return { text: resumed.text, kick: resumed.ok };
+        return { text: resumed.text, kick: true };
       case "view":
-        return { text: await this.viewGoal(sessionID), kick: false };
+        return { text: await this.viewGoal(sessionID), kick: true };
       case "pause":
-        return { text: await this.pauseGoal(sessionID), kick: false };
+        return { text: await this.pauseGoal(sessionID), kick: true };
       case "complete":
-        if (rest.length === 0) return { text: "missing evidence: /goal complete <evidence>", kick: false };
-        return { text: await this.completeGoal(sessionID, rest.join(" ")), kick: false };
+        if (rest.length === 0) return { text: "missing evidence: /goal complete <evidence>", kick: true };
+        return { text: await this.completeGoal(sessionID, rest.join(" ")), kick: true };
       case "block":
-        if (rest.length === 0) return { text: "missing reason: /goal block <reason>", kick: false };
-        return { text: await this.blockGoal(sessionID, rest.join(" ")), kick: false };
+        if (rest.length === 0) return { text: "missing reason: /goal block <reason>", kick: true };
+        return { text: await this.blockGoal(sessionID, rest.join(" ")), kick: true };
       case "clear":
-        return { text: await this.clearGoalFromCommand(sessionID), kick: false };
+        return { text: await this.clearGoalFromCommand(sessionID), kick: true };
       case "history":
-        return { text: await this.historyGoal(sessionID), kick: false };
+        return { text: await this.historyGoal(sessionID), kick: true };
       case "task":
-        return { text: await this.cmdTask(sessionID, rest), kick: false };
+        return { text: await this.cmdTask(sessionID, rest), kick: true };
       default:
-        return { text: `unknown goal subcommand: "${sub}" — ${USAGE}`, kick: false };
+        return { text: `unknown goal subcommand: "${sub}" — ${USAGE}`, kick: true };
     }
   }
 

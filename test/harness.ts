@@ -49,6 +49,10 @@ export interface Harness {
   // lands here — so a terminal scenario leaving h.wakes unchanged is the
   // assertion that "no record here kicks a model turn."
   wakes: SyntheticCall[];
+  // §50: host-side stream-death simulation; subscribe() call count — the
+  // assertion surface for the self-heal resubscribe.
+  killStream(): void;
+  streamSubscribes(): number;
   toolExecutor(name: string, input: unknown, sessionID: string): Promise<string>; // 驱动已注册工具（R5: 携带 sessionID）
   commandExecutor(sessionID: string, text: string): Promise<void>; // 驱动已注册命令（R5: 携带 sessionID）
   setGenerate(reply: string | ((input: { sessionID: string; prompt: string }) => string)): void;
@@ -90,6 +94,7 @@ type StreamConsumer = {
   index: number; // next log position to hand out (no replay of old events)
   wait: ((r: IteratorResult<HostEvent>) => void) | null;
   inflight: HostEvent | null; // delivered, consumer body not yet finished
+  dead: boolean; // §50 kill(): this consumer's stream ended — next() resolves done
 };
 
 type PendingEmit = {
@@ -106,8 +111,17 @@ class EventStream {
   private pending: PendingEmit[] = [];
 
   /** ctx.event.subscribe() stand-in: every subscriber gets future events in order. */
+  subscribes = 0;
   subscribe(): AsyncIterable<HostEvent> {
+    this.subscribes += 1;
     return { [Symbol.asyncIterator]: () => this.iterator() };
+  }
+
+  /** §50: host-side stream-death simulation — kill every live consumer (each
+   * pending next() resolves done; consumers mid-body finish, then see done on
+   * their next call). A later subscribe() yields a fresh live stream. */
+  kill(): void {
+    for (const c of [...this.consumers]) this.end(c);
   }
 
   /**
@@ -142,7 +156,7 @@ class EventStream {
 
   private iterator(): AsyncIterator<HostEvent> {
     const self = this;
-    const c: StreamConsumer = { index: this.log.length, wait: null, inflight: null };
+    const c: StreamConsumer = { index: this.log.length, wait: null, inflight: null, dead: false };
     this.consumers.add(c);
     // A late subscriber never replays history: any orphan event it cannot
     // receive is dropped (its emit resolves) instead of hanging forever.
@@ -153,6 +167,7 @@ class EventStream {
     // stream is referenced through `self`.
     return {
       next(): Promise<IteratorResult<HostEvent>> {
+        if (c.dead) return Promise.resolve({ value: undefined, done: true });
         if (c.inflight !== null) {
           // Re-pumping means the consumer's body for the previous event
           // has finished -> that event is "processed".
@@ -211,6 +226,7 @@ class EventStream {
   }
 
   private end(c: StreamConsumer): void {
+    c.dead = true;
     this.consumers.delete(c);
     if (c.inflight !== null) {
       // The loop ended only after its body ran: the event was processed.
@@ -311,16 +327,27 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
       // NO-OP on goal state for the scenarios that matter (control/terminal
       // boundaries), so it disturbs no assertion.
       const n = ++awakeSeq;
-      await stream.emit({
-        type: "session.execution.started",
-        id: `awake_${n}_s`,
-        properties: { sessionID: input.sessionID },
-      });
-      await stream.emit({
-        type: "session.execution.succeeded",
-        id: `awake_${n}_e`,
-        properties: { sessionID: input.sessionID },
-      });
+      // Bounded ack: the normal path is a microtask; if the consumer is
+      // blocked (e.g. a long judge await inside a boundary) the kick's auto-
+      // turn must not deadlock the COMMAND handler that emitted this
+      // synthetic — the turn's events stay in the log and are processed when
+      // the loop is free (or skipped at stop).
+      const ackOrGiveUp = (p: Promise<void>) =>
+        Promise.race([p, new Promise<void>((r) => setTimeout(r, 500))]);
+      await ackOrGiveUp(
+        stream.emit({
+          type: "session.execution.started",
+          id: `awake_${n}_s`,
+          properties: { sessionID: input.sessionID },
+        }),
+      );
+      await ackOrGiveUp(
+        stream.emit({
+          type: "session.execution.succeeded",
+          id: `awake_${n}_e`,
+          properties: { sessionID: input.sessionID },
+        }),
+      );
     },
     context: async (sessionID) => structuredClone(messages.get(sessionID) ?? []),
     storageGet: async (key) => structuredClone(storage.get(key)),
@@ -436,6 +463,8 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
     prompts,
     synthetics,
     wakes,
+    killStream: () => stream.kill(),
+    streamSubscribes: () => stream.subscribes,
     toolExecutor: async (name, input, sessionID) => {
       const tool = tools.get(name);
       if (tool === undefined) throw new Error(`toolExecutor: unknown tool "${name}"`);

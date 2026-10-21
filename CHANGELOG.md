@@ -6,6 +6,22 @@
 - 章节三段结构：`### 新增`（新功能/新工具/新命令）、`### 修复`（修了什么，含 incident 来源）、`### 优化与设计`（架构/行为变更/设计裁定）；可加 `### 验证`。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
+## [Unreleased]
+
+### 修复
+- **`/goal` 查询命令用户不可见**（2026-10-21 裁定，129 + 本机双实锤）：2.1.1 宿主不把 `resume:false` 记录行晋升到 `session_message`（UI 数据源）——§49 之后所有 `/goal` 查询命令变成盲操作。现：**所有用户命令结果行恢复 kick**（模型回一行可见结果，含拒绝/失败/未知子命令路径）；5 条机器终态/暂停通知保持纯记录（§48 不变，不白踢）；kick turn 按 control 语义不链式再唤醒（spec §49-rev）。
+- **事件订阅断流永久失聪**（129 sm70 incident：turn 正常结束后插件事件订阅静默断，循环冻 4.5h，7 次热重载无效）：事件循环对"流结束/异常"从不重订阅（done 路径零日志）→ 现大声日志 + 自动重订阅（≥1s 回退）；新增独立全局 liveness 探测（5min 静默 + started turn 无 terminal → 强制重订阅 + 边界重仲裁，in-flight 门防误唤醒）。2.1.1 宿主断流死因未钉（零 ERROR），插件侧自愈不依赖宿主版本（spec §50）。
+- **kick 结果行误归类引发误唤醒**（2026-10-21 真宿主首跑实锤：运行中会话的命令被宿主 STEER 吸收，被 steer 的 kick 行以 `type:"user"` 投递，旧判据要求 `itemType==="synthetic"` → `lastInbox` 误翻 user → kick turn 边界白踢一轮、烧掉预算）：`isControl` 判据改为只看 `metadata.goalControl`（宿主投递的 item 类型不可信，metadata 是权威标记）；验证脚本按 2.1.1 busy-steer 契约加 active map idle 门（spec §50 真宿主发现）。
+
+### 优化与设计
+- **liveness 探测故意不挂 per-goal watchdog**（spec §50）：watchdog 在 turn 开始时止表，而致命形态正是"started 已见、terminal 丢失"→ 无人重武装；独立全局定时器（30s 扫描）覆盖该形态。误报成本 = 一次 in-flight 门 hold 边界，漏报成本 = 此前的 4.5h 静默。
+- **harness 流断模拟 + kick auto-turn 有界 ack**（test 基建）：`killStream()`/`streamSubscribes()` 断流开关与订阅计数；kick turn 的 await ack 加 500ms 界——事件循环被长 await 阻塞（judge pending）时不再死锁 command handler，正常路径仍是微任务级确定性不变。
+- **自愈验证探针**（`OPENCODE_GOAL_KILL_STREAM=1`，仅验证用）：插件在首个 turn 开始处自杀一次事件订阅——129 死法的受控复现开关，随包发布（env 未设时零行为），`scripts/verify-heal.ts` 用它做真宿主自愈断言。
+
+### 验证
+- stub 350/0 + typecheck；新增 `stream-heal.test.ts` T1–T4（重订阅 / sm70 形态丢 terminal 恢复 / parked 不误唤醒 / view kick 不链式再唤醒）+ `goal-loop` 1g（2.1.1 kick 行 user 型投递仍归 control）。
+- **隔离真宿主双批全 PASS**（宿主 2.1.1 + lab LLM，2026-10-21）：`verify-wake.ts` 12/12（set/view 结果行真踢 turn——view = §49-rev 新断言；`budget_limited` 通知零 kick——§48 不回归；resume grace 消耗留痕；grace 一次性，C1 恰好 4 turns、E 恰好 6 turns，无模型干预）+ `verify-heal.ts` 5/5（**§50 自愈真机证据**：探针受控断流 → done 路径重订阅日志实锤 → 新订阅收事件 + 边界注入 wake（决策日志行）→ 循环自治到 `budget_limited`）。stub 350/0 + typecheck。首跑失败暴露 2.1.1 busy-steer 契约（运行中会话的命令被吸收进运行 turn）+ kick 行 user 型投递误归类——插件 isControl 改 metadata 判据、脚本加 active map idle 门，复跑全 PASS（spec §50）。
+
 ## [1.1.5] - 2026-10-20
 
 ### 修复

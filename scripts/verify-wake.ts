@@ -1,6 +1,8 @@
-// §48/§49 真宿主验证批（2026-10-20）：在【隔离真实宿主】上验证
+// §48/§49/§49-rev/§50 真宿主验证批（2026-10-20 批 + 2026-10-21 B 断言翻转）：
+// 在【隔离真实宿主】上验证
 //   A: /goal set 结果行 kick（宿主 auto-wake → 模型 turn 真的起来，§47 机制存活）
-//   B: /goal view 结果行 resume:false → 纯记录，不再白踢（§48/§49 B1 收口）
+//   B: /goal view 结果行 kick（§49-rev：2.1.1 不渲染 resume:false 记录行——
+//      模型的可见回复才是用户可见输出；kick turn 不链式再唤醒）
 //   C: budget_limited 终态通知 resume:false → 不再白踢（§48）
 //   D: budget_limited → /goal resume：kick turn 走真边界、post-resume budget
 //      grace 消耗（decision:"hold" 日志行）、goal 保持 active 不被立刻打回（§49）
@@ -39,7 +41,7 @@ async function waitUntil(cond: () => boolean | Promise<boolean>, timeoutMs: numb
 async function main(): Promise<void> {
   const provider = await labProvider(); // throws with a clear message when env is unset
   console.log(`[verify] lab model: ${provider.modelID}`);
-  const host: IsolatedHost = await startHost({ provider, waitMs: 60_000 });
+  const host: IsolatedHost = await startHost({ provider, waitMs: 60_000, keepDir: process.env.VERIFY_KEEP_DIR === "1" });
   console.log(`[verify] isolated host up (port ${host.port}, pid ${host.pid}, dir ${host.directory})`);
 
   // memory #12243: plain serve does NOT write the registry file the plugin's
@@ -79,6 +81,17 @@ async function main(): Promise<void> {
     return lines.filter((l) => String(l.reason ?? "").includes("budget grace")).pop();
   };
 
+  // §50: 2.1.1 STEERs a command-synthetic/prompt sent into a RUNNING session
+  // into the in-flight turn (no new started event) — every phase therefore
+  // waits for the session to be idle before issuing its command/prompt.
+  const idle = async (): Promise<boolean> => {
+    try {
+      return (await host.api.sessionActive())[S] !== "running";
+    } catch {
+      return true; // query failure must not wedge the run
+    }
+  };
+
   // A: /goal set kicks — the result line is the host's steer+wake (spec §47/§49).
   // Objective framed as an endless countdown: the model has nothing to
   // "complete" (a first run of this script let the model call goal_complete on
@@ -90,13 +103,20 @@ async function main(): Promise<void> {
   );
   check("A0: /goal set accepted", stSet >= 200 && stSet < 300, { status: stSet });
   check("A: the set's result line kicked a model turn (host auto-wake alive)", await waitUntil(async () => (await turnCount()) >= 1, CHECK_TIMEOUT_MS, "A: kick turn"));
+  check("A2: session idle before the view command (2.1.1 busy-steer guard)", await waitUntil(idle, CHECK_TIMEOUT_MS, "A2: idle"));
 
-  // B: /goal view result line is a pure record (resume:false) — no new turn, ever.
+  // B: /goal view result line KICKS a visible-reply turn (§49-rev 2026-10-21:
+  // 2.1.1 hosts do not render resume:false record lines in the UI — the model's
+  // one-line reply IS the user-visible output). That kick turn's boundary sees
+  // a control lastInbox → no chained wake (the parked loop does not restart).
   const stView = await host.api.command(S, "goal", "view");
   check("B0: /goal view accepted", stView >= 200 && stView < 300, { status: stView });
-  const cAfterView = await turnCount();
-  await waitUntil(async () => (await turnCount()) > cAfterView, 25_000, "B: (expect no kick)");
-  check("B: view result line did NOT kick a turn (§48/§49 B1)", (await turnCount()) === cAfterView, { before: cAfterView, after: await turnCount() });
+  check(
+    "B: view result line kicked a visible-reply turn (§49-rev)",
+    await waitUntil(async () => (await turnCount()) >= 2, CHECK_TIMEOUT_MS, "B: view kick"),
+    { turns: await turnCount() },
+  );
+  await waitUntil(idle, CHECK_TIMEOUT_MS, "B2: idle before the prompt");
 
   // C: drive to budget_limited (--turns 1). A user prompt triggers the wake
   // ladder; the cap trips at the next boundary; the budget_limited terminal
@@ -105,14 +125,15 @@ async function main(): Promise<void> {
     "Automated goal-loop test. Reply with ONLY the next countdown integer per the goal objective. " +
     "Do NOT call any tool — especially never goal_complete, goal_block, goal_pause, goal_wait or goal_next_step.";
   await host.api.prompt(S, PROMPT);
-  check("C0: prompt turn started", await waitUntil(async () => (await turnCount()) >= 2, CHECK_TIMEOUT_MS, "C0: prompt turn"));
+  check("C0: prompt turn started", await waitUntil(async () => (await turnCount()) >= 3, CHECK_TIMEOUT_MS, "C0: prompt turn"));
   const budget = await waitUntil(async () => (await goalStatus()) === "budget_limited", 240_000, "C: budget_limited");
   // C1 is a guard against model intervention, not a timing assertion: a model
   // goal_* call would land on completed/blocked/paused (or an extra turn),
-  // never on budget_limited — so the goal arriving there with EXACTLY 3 turns
-  // (kick + prompt + injected wake) proves the ladder ran plugin-driven.
-  check("C1: budget_limited reached via the turn ladder (exactly 3 turns, no goal_* intervention)",
-    budget && (await turnCount()) === 3,
+  // never on budget_limited — so the goal arriving there with EXACTLY 4 turns
+  // (set kick + view kick + prompt + injected wake) proves the ladder ran
+  // plugin-driven. (§49-rev: the view kick adds one turn to the count.)
+  check("C1: budget_limited reached via the turn ladder (exactly 4 turns, no goal_* intervention)",
+    budget && (await turnCount()) === 4,
     { status: await goalStatus(), turns: await turnCount() });
   check("C0b: goal reached budget_limited", budget, { status: await goalStatus(), turns: await turnCount() });
   const cAfterNotice = await turnCount();
@@ -136,11 +157,12 @@ async function main(): Promise<void> {
   check("D2: grace consumption logged (decision:hold, reason mentions grace)", graceLine?.decision === "hold", graceLine);
 
   // E: one-shot — the next over-cap boundary re-limits (a user prompt drives it).
+  // Total: 4 (C) + 1 (resume kick, D) + 1 (prompt, E) = 6.
   await host.api.prompt(S, PROMPT);
   const relimit = await waitUntil(async () => (await goalStatus()) === "budget_limited", 240_000, "E: re-limit");
   check(
-    "E: grace was one-shot — next over-cap boundary re-limits to budget_limited (5 turns total, no intervention)",
-    relimit && (await turnCount()) === 5,
+    "E: grace was one-shot — next over-cap boundary re-limits to budget_limited (6 turns total, no intervention)",
+    relimit && (await turnCount()) === 6,
     { status: await goalStatus(), turns: await turnCount() },
   );
 

@@ -60,6 +60,9 @@ export interface Api {
   shellGet(id: string): Promise<{ status: number; data?: any }>;
   context(sessionID: string): Promise<any[]>;
   inbox(sessionID: string): Promise<any[]>;
+  /** Active map (2026-10-20 reference-UI ruling): GET /api/session/active —
+   * sessionID→status, "running" = in flight. */
+  sessionActive(): Promise<Record<string, string>>;
   modelList(): Promise<any>;
 }
 
@@ -495,6 +498,7 @@ function makeApi(baseUrl: string, password: string, project: string): Api {
     },
     context: async (sessionID) => j((await get(`/api/session/${sessionID}/context`)).text)?.data ?? [],
     inbox: async (sessionID) => j((await get(`/api/session/${sessionID}/inbox`)).text)?.data ?? [],
+    sessionActive: async () => j((await get("/api/session/active")).text) ?? {},
     modelList: async () => j((await get("/api/model")).text) ?? {},
   };
 }
