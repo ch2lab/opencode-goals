@@ -163,6 +163,30 @@ test("1: shell in flight — the boundary arms the check (no wake); shell.ended 
 // one-shot progress check, covered by test 1 and background-gate.test.ts.)
 
 // ---------------------------------------------------------------------------
+// §51 (2026-10-21 ruling): the check-in carries the in-flight roster —
+// id + elapsed, uncapped, NO command text (the model must not re-query to
+// find out what it is waiting on).
+// ---------------------------------------------------------------------------
+
+test("51: the check-in carries the in-flight roster (shell id + elapsed, no command text)", async () => {
+  const { h, stop } = await boot(resolveOptions({ watchdogTickMs: 1, checkInDelaySec: 1 }));
+  await h.commandExecutor(S, "/goal set Roster");
+  h.setSession(S, { location: { directory: "/w" } });
+  // A running shell (with the host-store start time) stays in the store when the check-in fires.
+  h.setShells([{ id: "sh_live", status: "running", sessionID: S, time: { started: Date.now() - 250_000 } }]);
+  await h.emit(started("a1"));
+  await h.emit(succeeded("b1")); // in-flight boundary → arms the check-in (no wake)
+  expect(h.prompts.length).toBe(0);
+  await waitFor(() => h.prompts.length === 1, 3000, "progress check-in");
+  const text = h.prompts[0].input.text;
+  expect(text).toContain("Background check-in");
+  expect(text).toContain("In flight now (no need to re-query)");
+  expect(text).toMatch(/sh_live \(\d+m\d+s\)/); // id + elapsed
+  expect(text).not.toContain("cmd"); // no command text (the ruling)
+  await stop();
+});
+
+// ---------------------------------------------------------------------------
 // 3. a progress check replied with pure text (no tool) → stall counts
 //    normally at the boundary (spec §7.1 attribution, kept for the new
 //    check-in family)

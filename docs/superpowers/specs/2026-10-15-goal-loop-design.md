@@ -793,3 +793,24 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 - `verify-wake.ts` 12/12：① set 结果行真踢 turn；② **view 结果行真踢可见回复 turn（§49-rev 核心断言）**；③ `budget_limited` 终态通知零 kick（§48 不回归）；④ resume 自 `budget_limited` 保持 active、grace 消耗留痕 `decision:"hold"`（§49）；⑤ grace 一次性 re-limit（**C1 恰好 4 turns**：set kick + view kick + prompt + wake；**E 恰好 6 turns**：+ resume kick + prompt——view kick 计入 ladder，全程无模型干预）。
 - `verify-heal.ts` 5/5（**§50 自愈真宿主证据**，探针 `OPENCODE_GOAL_KILL_STREAM=1` 在首个 turn 开始处自杀一次订阅 = 129 死法的受控复现）：H1b 断流 + done 路径 `event stream ended — re-subscribing` 日志实锤（宿主 stdout）；H2 新订阅收到后续事件（prompt turn 启动）；H3 新订阅上的边界注入 wake（决策日志 `decision:"wake"` 行——129 症状"零决策行"的反例）；H4 循环自治到 `budget_limited`（3 turns）。liveness 重查（5min 静默窗）为 stub 层验证（stream-heal T2 的 sm70 形态），真宿主 5min 窗口不适配脚本时长，不硬凑。
 
+## 51. 2026-10-21 裁定 — check-in 提醒附带在飞任务名单（免二次查询）
+
+**裁定来源（用户 2026-10-21，129 sm70 现场驱动）**：背景 check-in 提醒（watchdog 进度检查）只带**计数**（"N background item(s) in flight"），模型醒来后不知道是谁在飞，得自己再查一次 shell store。用户裁定：把任务 ID 放进提醒——**不封顶、只要 ID 和运行时长、不要 command**（command 文本长、且模型核对任务不需要它）。
+
+**实现**：
+- check-in **触发时**（`runWatchdogWake` 的 due 到点分支）新鲜查询一次在飞名单：本会话 running shells（宿主 shell store 条目：`id` + `time.started` → 运行时长）+ 在飞子任务会话（active map，沿用 `listSubtasksInFlight`——由 `countSubtasksInFlight` 拆分出返回 ID 的变体）。
+- 名单进 `backgroundCheckInText(inFlight, waitSec, items?)` 第三参数：无参调用 = 旧文案逐字不变（wake.test 既有断言不回归）。格式：
+  ```
+  Background check-in: 1 background item(s) in flight, no session activity for 300s.
+  In flight now (no need to re-query):
+    - sh_15be382a… (4m12s)
+    - subtask ses_xxx (running)
+  Goal mode: keep working unattended — …（原句不动）
+  ```
+  无 `time.started` 的条目只列 ID；**不封顶、不截断**（用户裁定）；**不列 command**（用户裁定）。
+- **容错**：新鲜查询任一环节失败（宿主上下文死 / sessionGet 无 location）→ 回退纯计数文案（第三参 `undefined`），check-in 本身绝不因附名单而丢失。名单是"附带情报"，`due.inFlight`（武装时计数）语义不变。
+- 类型面：`ShellEntry` 增加可选 `time?: { started?: number }`（宿主 shell store 本来携带——129 实机条目实锤）；`hostapi.normalizeShells` 透传。
+
+**测试**：wake.test 加 items 形态断言（含时长格式、旧签名零回归）；watchdog.test 加 §51 用例（shell 在飞时 check-in 文本含 shell ID + 时长、不含 command 文本）。
+**验证边界（2026-10-21 已验）**：stub 层先红后绿（wake.test 名单形态钉死 + watchdog §51 用例 + background-gate 四处钉文案改带名单，352/0 + typecheck）；真宿主 `verify-checkin.ts` **7/7 全 PASS**（隔离宿主 2.1.1 + lab LLM，`checkInDelaySec` 注入 15s + `sleep 90` 后台 shell）：K2 shell 入宿主 shell store → K3 prompt turn 边界 arm → K4 check-in 注入，**消息实带名单行 `sh_15bf… (21s)`**（ID + 运行时长）、K4d 无 command 文本（裁定钉死）。首跑 K2/K4b 失败是验证脚本自身 bug（`api.shellList()` 返回宿主原始 JSON，`sessionID` 在 `metadata` 下——非插件视图），非插件问题。
+

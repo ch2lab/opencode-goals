@@ -1142,6 +1142,12 @@ export class GoalController {
    * queries are location-scoped (like the shell store). Bounded 8-hop walk —
    * subagent depth is small. */
   private async countSubtasksInFlight(root: string, directory: string): Promise<number> {
+    return (await this.listSubtasksInFlight(root, directory)).length;
+  }
+
+  /** §51: same query as countSubtasksInFlight, returning the in-flight subtask
+   * session IDs (the check-in roster shows them by id). */
+  private async listSubtasksInFlight(root: string, directory: string): Promise<string[]> {
     const [all, active] = await Promise.all([
       this.probe.sessionList(directory),
       this.probe.activeSessions(directory),
@@ -1156,13 +1162,46 @@ export class GoalController {
       }
       return false;
     };
-    let n = 0;
+    const out: string[] = [];
     for (const s of all) {
       if (s.id === root) continue;
       if (!isSubtask(s.id)) continue;
-      if (active[s.id] === "running") n += 1;
+      if (active[s.id] === "running") out.push(s.id);
     }
-    return n;
+    return out;
+  }
+
+  /** §51 (2026-10-21 ruling): the check-in roster — ids + elapsed, UNCAPPED,
+   * NO command text (the model must not re-query to learn what is in flight).
+   * Fresh query at fire time: this session's running shells (host shell
+   * store: id + time.started → elapsed) + in-flight subtask sessions (active
+   * map). ANY query failure → undefined (count-only fallback — the check-in
+   * itself must never be lost over its attachment). */
+  private async inFlightRoster(sessionID: string): Promise<string[] | undefined> {
+    try {
+      const info = await this.probe.sessionGet(sessionID);
+      const directory = info?.location?.directory;
+      if (directory === undefined) return undefined;
+      const now = Date.now();
+      const elapsed = (started: number): string => {
+        const s = Math.max(0, Math.floor((now - started) / 1000));
+        const m = Math.floor(s / 60);
+        return m > 0 ? `${m}m${s % 60}s` : `${s}s`;
+      };
+      const items: string[] = [];
+      const shells = (await this.probe.shellList(directory)).filter(
+        (e) => e.sessionID === sessionID && e.status === "running",
+      );
+      for (const sh of shells) {
+        items.push(sh.time?.started !== undefined ? `${sh.id} (${elapsed(sh.time.started)})` : sh.id);
+      }
+      for (const id of await this.listSubtasksInFlight(sessionID, directory)) {
+        items.push(`subtask ${id} (running)`);
+      }
+      return items;
+    } catch {
+      return undefined; // host context dead → count-only text
+    }
   }
 
   private async arbitrateBoundary(sessionID: string, event: HostEvent): Promise<void> {
@@ -1983,7 +2022,7 @@ export class GoalController {
       this.checkinDue.delete(sessionID); // one-shot: consumed on fire
       await this.deliverWatchdogWake(
         goal,
-        backgroundCheckInText(due.inFlight, this.options.checkInDelaySec),
+        backgroundCheckInText(due.inFlight, this.options.checkInDelaySec, await this.inFlightRoster(sessionID)),
         `watchdog check-in (in-flight ${due.inFlight})`,
       );
     }

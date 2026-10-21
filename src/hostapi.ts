@@ -319,10 +319,12 @@ function normalizeShells(data: unknown[]): ShellEntry[] {
     if (typeof o.id !== "string" || typeof o.status !== "string") continue;
     const meta =
       typeof o.metadata === "object" && o.metadata !== null ? (o.metadata as Record<string, unknown>) : {};
+    const t = (typeof o.time === "object" && o.time !== null ? o.time : {}) as Record<string, unknown>;
     out.push({
       id: o.id,
       status: o.status,
       sessionID: typeof meta.sessionID === "string" ? meta.sessionID : undefined,
+      time: typeof t.started === "number" ? { started: t.started } : undefined, // §51: elapsed in the check-in roster
     });
   }
   return out;

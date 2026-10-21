@@ -237,7 +237,7 @@ test("9: due fires exactly once - pinned reminder text + goalControl metadata; a
   await h.emit(succeeded("b1", S)); // own-in-flight boundary → arm (1s)
   await sleep(1500); // past due: the 1ms tick fires the one-shot
   expect(h.prompts.length).toBe(1);
-  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1, ["shX"])); // §51: roster rides along
   expect(h.prompts[0].input.metadata?.goalControl).toBe(true);
   await sleep(300); // one-shot: no recurrence before a re-arm
   expect(h.prompts.length).toBe(1);
@@ -253,7 +253,7 @@ test("9: due fires exactly once - pinned reminder text + goalControl metadata; a
   await h.emit(succeeded("b2", S));
   await sleep(1500);
   expect(h.prompts.length).toBe(2);
-  expect(h.prompts[1].input.text).toBe(backgroundCheckInText(1, 1));
+  expect(h.prompts[1].input.text).toBe(backgroundCheckInText(1, 1, ["shX"])); // §51: re-arm fires with the roster too
   await stop();
 });
 
@@ -319,7 +319,7 @@ test("14: stale shell (started, no ended) - no self-heal, no permanent silence: 
   await h.emit(succeeded("b1", S)); // in flight (the stale shell) → arm
   await sleep(1500);
   expect(h.prompts.length).toBe(1); // a reminder — never a fabricated "lost"
-  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1, ["sh1"])); // §51: the stale shell is listed
   expect(h.prompts[0].input.text).not.toContain("lost");
   await stop();
 });
@@ -444,7 +444,7 @@ test("21: late usage.updated / tool.called after a terminal boundary do NOT canc
   await h.emit(toolCalled("t1", S));
   await sleep(1500); // past the deadline: the uncancelled check-in fires
   expect(h.prompts.length).toBe(1);
-  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1, ["shX"]));
   await stop();
 });
 
@@ -667,7 +667,7 @@ test("32: a fired check-in logs a decision line (the watchdog path is observable
   await h.emit(succeeded("b1", S)); // in flight → hold (logged), check-in armed (1s)
   await sleep(1500); // past due: the 1ms tick fires the one-shot
   expect(h.prompts.length).toBe(1);
-  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1));
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1, ["shX"]));
   const line = lastDecision(S);
   expect(line?.decision).toBe("watchdog");
   expect(String(line?.reason)).toContain("check-in");

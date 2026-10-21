@@ -19,9 +19,18 @@ import type { GoalRecord } from "./state";
  * to wait/ask", so the line grants goal-mode autonomy (take the next safe
  * step per the goal's discipline, don't stall on a question to the user) and
  * carries the user-message-overrides clause, like the slim wake.
+ *
+ * §51 (2026-10-21 ruling): `items` carries the in-flight roster (shell id +
+ * elapsed, subtask session id — UNCAPPED, NO command text) so the model does
+ * not re-query to find out what it is waiting on. Omitted/empty = the legacy
+ * text, byte-for-byte.
  */
-export function backgroundCheckInText(inFlight: number, waitSec: number): string {
-  return `Background check-in: ${inFlight} background item(s) in flight, no session activity for ${waitSec}s. Goal mode: keep working unattended — check what finished, then take the next safe step per the goal's discipline (verify the background result, or make independent progress); don't stall on a question to the user. A user message always overrides this reminder.`;
+export function backgroundCheckInText(inFlight: number, waitSec: number, items?: string[]): string {
+  const roster =
+    items !== undefined && items.length > 0
+      ? `\nIn flight now (no need to re-query):\n${items.map((i) => `  - ${i}`).join("\n")}`
+      : "";
+  return `Background check-in: ${inFlight} background item(s) in flight, no session activity for ${waitSec}s.${roster} Goal mode: keep working unattended — check what finished, then take the next safe step per the goal's discipline (verify the background result, or make independent progress); don't stall on a question to the user. A user message always overrides this reminder.`;
 }
 
 /**

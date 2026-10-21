@@ -182,6 +182,10 @@ export interface ShellEntry {
   id: string;
   status: string; // "running"
   sessionID?: string;
+  /** Host shell store: start timestamp (ms) — §51 check-in roster shows the
+   * elapsed time. Optional: the harness may omit it (roster then shows the
+   * bare id). */
+  time?: { started?: number };
 }
 
 /**

@@ -6,6 +6,15 @@
 - 章节三段结构：`### 新增`（新功能/新工具/新命令）、`### 修复`（修了什么，含 incident 来源）、`### 优化与设计`（架构/行为变更/设计裁定）；可加 `### 验证`。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
+## [Unreleased]
+
+### 优化与设计
+- **check-in 提醒附带在飞任务名单**（2026-10-21 裁定，129 sm70 现场驱动：模型被 check-in 唤醒后要再查一次 shell store 才知道谁在飞）：check-in 触发时新鲜查询一次，把在飞名单写进提醒——**不封顶、只要 ID + 运行时长、不要 command**（用户裁定；宿主 shell store 条目本就携带 `time.started`，`ShellEntry` 扩类型透传，子任务会话列 `subtask ses_x (running)`）。查询失败回退纯计数文案（提醒本身绝不丢）；传统两参调用逐字不变（wake.test 既有断言零回归）。spec §51。
+
+### 验证
+- stub 352/0 + typecheck；wake.test 名单形态钉死（含"不封顶/无 command/空名单=旧文案逐字不变"）；watchdog §51 用例 + background-gate 四处钉文案改带名单形态。
+- **隔离真宿主 7/7 全 PASS**（`verify-checkin.ts`，宿主 2.1.1 + lab LLM，`checkInDelaySec` 15s + `sleep 90` 后台 shell）：check-in 注入消息**实带名单行 `sh_… (21s)`**（ID + 运行时长）、无 command 文本（裁定钉死，K4d）。
+
 ## [1.1.6] - 2026-10-21
 
 ### 修复

@@ -215,6 +215,27 @@ test("backgroundCheckInText: byte-pinned reminder (in-flight count + wait, Engli
   expect(t1).not.toContain("end this turn");
 });
 
+test("backgroundCheckInText §51: optional in-flight roster (id + elapsed; uncapped; no command; empty = byte-identical legacy)", () => {
+  const legacy = backgroundCheckInText(1, 300);
+  expect(backgroundCheckInText(1, 300, [])).toBe(legacy); // no roster items → legacy byte-for-byte
+  const t = backgroundCheckInText(3, 300, [
+    "sh_15be382a2001C0z3d7b2Xj3OGO (4m12s)",
+    "sh_deadbeef (58s)",
+    "subtask ses_abc123 (running)",
+  ]);
+  expect(t).toContain("\nIn flight now (no need to re-query):\n");
+  expect(t).toContain("  - sh_15be382a2001C0z3d7b2Xj3OGO (4m12s)");
+  expect(t).toContain("  - sh_deadbeef (58s)");
+  expect(t).toContain("  - subtask ses_abc123 (running)");
+  // the roster sits between the count sentence and the Goal-mode sentence
+  expect(t.indexOf("In flight now")).toBeGreaterThan(t.indexOf("no session activity for 300s."));
+  expect(t.indexOf("In flight now")).toBeLessThan(t.indexOf("Goal mode:"));
+  expect(t.endsWith("A user message always overrides this reminder.")).toBe(true);
+  // uncapped (2026-10-21 ruling): every item goes in, no truncation
+  const many = Array.from({ length: 7 }, (_, i) => `sh_x${i} (1s)`);
+  expect(backgroundCheckInText(7, 300, many)).toContain(many.map((m) => `  - ${m}`).join("\n"));
+});
+
 test("providerPauseRetryText: byte-pinned retry wake (2026-10-18 reframe: report-and-stop, the loop auto-retries)", () => {
   const t = providerPauseRetryText("g_abc");
   expect(t).toBe(
