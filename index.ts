@@ -284,6 +284,16 @@ export default Plugin.define({
         return r.value ?? [];
       },
 
+      // §52: hostapi POST /api/session/:id/background (the host's Ctrl+B
+      // server action). A failure throws here — foregroundShellScan catches,
+      // warns, and retries on the next scan.
+      sessionBackground: async (sessionID) => {
+        const r = await hostApi.sessionBackground(sessionID);
+        if (r.state !== "ok") {
+          throw new Error(`session background failed (${r.reason})`);
+        }
+      },
+
       // Host session list (hostapi): GET /api/session, location-scoped like
       // shellList — the goal's project's sessions, each with parentID + time
       // (the in-flight subtask-discovery source; the in-process ctx.session.get

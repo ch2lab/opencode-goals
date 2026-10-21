@@ -339,6 +339,12 @@ export class GoalController {
    * host-side stream death so scripts/verify-heal.ts can exercise the
    * re-subscribe recovery on a real host. No-op unless the env is set. */
   private killStreamProbePending = true;
+  /** §52: shells already sent to background observation (dedupe the POST —
+   * the endpoint is session-level, one call moves all foreground work). */
+  private backgroundedShells = new Set<string>();
+  /** §52: first-observed wall clock for shells without a host start time
+   * (elapsed then counts from observation, not from spawn). */
+  private shellFirstSeen = new Map<string, number>();
   private loopPromise: Promise<void> | undefined;
   private stopped = false;
   /** This instance's live-slot reference (set at the first line of start()). */
@@ -634,6 +640,9 @@ export class GoalController {
       void this.livenessScan().catch((err) => {
         console.warn("opencode-goal: liveness scan failed:", err);
       });
+      void this.foregroundShellScan().catch((err) => {
+        console.warn("opencode-goal: foreground-shell scan failed:", err);
+      });
     }, this.livenessCheckMs());
     return slot.stop;
   }
@@ -787,6 +796,63 @@ export class GoalController {
    * watchdog". */
   private livenessCheckMs(): number {
     return this.deps.livenessCheckMs ?? 30_000;
+  }
+
+  /** §52 (2026-10-21 ruling): a FOREGROUND (blocking) shell in an active-goal
+   * session that outlives `foregroundShellBackgroundMs` is moved to background
+   * observation via the host's session.background endpoint (the Ctrl+B server
+   * action — the work KEEPS RUNNING; the host injects its own synthetic so the
+   * blocked turn is released). Without this, a hung foreground shell freezes
+   * the loop forever: the turn is blocked on the tool call, so no boundary, no
+   * check-in (armed checks wait for idle), and the §50 liveness recheck is
+   * held by the in-flight gate (the shell is still in flight). Runs on the
+   * global 30s timer (NOT gated by the liveness silence condition); one POST
+   * per shell (dedupe); a failed POST retries on the next scan. */
+  private async foregroundShellScan(): Promise<void> {
+    if (this.stopped) return;
+    const cap = this.options.foregroundShellBackgroundMs;
+    if (cap <= 0) return; // disabled
+    const now = Date.now();
+    for (const sessionID of this.turns.keys()) {
+      const goal = await this.loadGoal(sessionID);
+      if (goal === undefined || goal.status !== "active") continue;
+      let directory: string | undefined;
+      try {
+        directory = (await this.probe.sessionGet(sessionID))?.location?.directory;
+      } catch {
+        continue; // host context dead — retry next scan
+      }
+      if (directory === undefined) continue;
+      let shells;
+      try {
+        shells = await this.probe.shellList(directory);
+      } catch {
+        continue; // shell store query failed — retry next scan
+      }
+      for (const sh of shells) {
+        if (sh.sessionID !== sessionID || sh.status !== "running" || sh.background === true) continue;
+        if (this.backgroundedShells.has(sh.id)) continue; // already moved
+        const firstSeen = this.shellFirstSeen.get(sh.id) ?? now;
+        const started = sh.time?.started ?? firstSeen;
+        const elapsed = now - started;
+        if (elapsed < cap) {
+          this.shellFirstSeen.set(sh.id, firstSeen);
+          continue; // still young
+        }
+        try {
+          await this.probe.sessionBackground(sessionID);
+          this.backgroundedShells.add(sh.id); // dedupe (the POST moves ALL the session's foreground work)
+          if (this.backgroundedShells.size > 100) this.backgroundedShells.clear(); // bound
+          console.warn(
+            `opencode-goal: §52 foreground shell ${sh.id} in ${sessionID} ran ${Math.round(elapsed / 60000)}m — ` +
+              `moved to background observation (session.background; work keeps running)`,
+          );
+        } catch (err) {
+          // NOT added to the dedupe set: a failed POST retries on the next scan.
+          console.warn(`opencode-goal: §52 backgrounding ${sh.id} failed (retry next scan):`, err);
+        }
+      }
+    }
   }
 
   /** §50 one scan: if the stream has been silent for livenessMs while a turn we

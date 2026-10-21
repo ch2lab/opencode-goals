@@ -72,6 +72,7 @@ export interface Harness {
   failActiveSessions(on: boolean): void; // 脚本化 active map 查询抛错（fail-open 用例）
   failInboxList(on: boolean): void; // 脚本化 inbox 查询抛错（fail-closed 用例）
   shellListCalls: number; // shell.list 查询次数（活值 getter）
+  backgroundCalls: string[]; // §52: sessionBackground 调用记录（sessionID）
   commands: Map<string, (text: string, sessionID: string) => Promise<void>>;
   commandDescriptions: Map<string, string>; // 命令菜单里的友好描述（宿主 CommandDefinition.description）
   namespaces: Map<string, string>; // 已声明的工具命名空间（宿主 editor.namespace，MCP-server 式）
@@ -288,6 +289,7 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
   let shellStore: ShellEntry[] = [];
   let shellListFail = false;
   let shellListCalls = 0;
+  const backgroundCalls: string[] = []; // §52: sessionBackground probe calls
   let activeMap: Record<string, string> = {};
   let activeMapFail = false;
   let inboxListFail = false;
@@ -404,6 +406,10 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
       if (shellListFail) throw new Error("shell store query failed (scripted)");
       shellListCalls += 1;
       return structuredClone(shellStore);
+    },
+    // §52: POST /api/session/:id/background stand-in — records the call only.
+    sessionBackground: async (sessionID) => {
+      backgroundCalls.push(sessionID);
     },
     registerCommand: (name, description, run) => {
       commands.set(name, run);
@@ -538,6 +544,7 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
     get shellListCalls() {
       return shellListCalls;
     },
+    backgroundCalls,
     setMessages: (sessionID, msgs) => {
       messages.set(sessionID, structuredClone(msgs));
     },

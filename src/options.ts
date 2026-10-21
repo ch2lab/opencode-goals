@@ -18,6 +18,13 @@ export interface Options {
    * (default 300 = 5 minutes). Any session activity cancels it. */
   checkInDelaySec: number;
   timeoutWrap: boolean;
+  /** §52 (2026-10-21 ruling): a FOREGROUND (blocking) shell in an active-goal
+   * session that runs longer than this is moved to background observation via
+   * the host's session.background endpoint (the Ctrl+B server action — the work
+   * keeps running; the host injects its own synthetic so the blocked turn is
+   * released). 0 = disabled. Default 30 min. The only numeric option that
+   * accepts 0. */
+  foregroundShellBackgroundMs: number;
   /** 2026-10-17 ruling (129 "Insufficient account funds" incident): consecutive
    *  boundaries whose last assistant message carries a provider.* error that
    *  arm the provider pause (default 2 — a single transient failure still gets
@@ -46,6 +53,9 @@ const DEFAULT_OPTIONS: Options = {
   watchdogTickMs: 30000,
   checkInDelaySec: 300,
   timeoutWrap: false,
+  // §52: 30 min — long enough for legitimate blocking shells, short enough
+  // that a hung one cannot freeze the goal loop for the rest of the night.
+  foregroundShellBackgroundMs: 30 * 60 * 1000,
   providerFailLimit: 2,
   providerPauseMs: 30 * 60 * 1000,
 };
@@ -68,6 +78,12 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
   const wakeText =
     typeof o.wakeText === "string" && o.wakeText.length > 0 ? o.wakeText : undefined;
   const model = parseModelRef(o.model);
+  // §52: the only numeric option where 0 is a VALID value (0 = disabled).
+  const fbgRaw = o["foregroundShellBackgroundMs"];
+  const foregroundShellBackgroundMs =
+    typeof fbgRaw === "number" && Number.isInteger(fbgRaw) && fbgRaw >= 0
+      ? (fbgRaw as number)
+      : DEFAULT_OPTIONS.foregroundShellBackgroundMs;
 
   return {
     stallLimit: num("stallLimit", DEFAULT_OPTIONS.stallLimit),
@@ -78,6 +94,7 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
     watchdogTickMs: num("watchdogTickMs", DEFAULT_OPTIONS.watchdogTickMs),
     checkInDelaySec: num("checkInDelaySec", DEFAULT_OPTIONS.checkInDelaySec),
     timeoutWrap: bool("timeoutWrap", DEFAULT_OPTIONS.timeoutWrap),
+    foregroundShellBackgroundMs,
     providerFailLimit: num("providerFailLimit", DEFAULT_OPTIONS.providerFailLimit),
     providerPauseMs: num("providerPauseMs", DEFAULT_OPTIONS.providerPauseMs),
     wakeText,

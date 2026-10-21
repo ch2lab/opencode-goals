@@ -57,6 +57,9 @@ export interface HostApi {
   activeSessions(locationDirectory: string): Promise<HostApiResult<Record<string, string>>>;
   inboxList(sessionID: string): Promise<HostApiResult<InboxItem[]>>;
   inboxCancel(sessionID: string, inboxID: string): Promise<HostApiResult<undefined>>;
+  /** §52: the host's Ctrl+B server action (POST /api/session/:id/background,
+   * 204 — verified on v2.1.1 /openapi.json). */
+  sessionBackground(sessionID: string): Promise<HostApiResult<undefined>>;
 }
 
 export interface HostApiDeps {
@@ -149,7 +152,7 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
 
   async function doFetch(
     path: string,
-    method: "GET" | "DELETE" = "GET",
+    method: "GET" | "DELETE" | "POST" = "GET",
     extraHeaders?: Record<string, string>,
   ): Promise<Fetched> {
     const p = await prepare();
@@ -291,7 +294,23 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
     return { state: "ok" };
   }
 
-  return { shellList, sessionList, activeSessions, inboxList, inboxCancel };
+  /** §52: POST /api/session/:id/background — the host's Ctrl+B server action
+   * (2026-10-21, live-verified on v2.1.1 /openapi.json: operationId
+   * `session.background`, 204/400/401/404): moves the session's active
+   * foreground backgroundable tools into background observation (they keep
+   * RUNNING — not killed) and the host injects its own synthetic. Idle
+   * requests are a no-op (204). 404 SessionNotFound = ok, like inboxCancel. */
+  async function sessionBackground(sessionID: string): Promise<HostApiResult<undefined>> {
+    const r = await doFetch(`/api/session/${encodeURIComponent(sessionID)}/background`, "POST");
+    if ("reason" in r) return { state: "unavailable", reason: r.reason };
+    if (!r.ok) {
+      if (r.status === 404 && (await isSessionNotFound(r))) return { state: "ok" };
+      return { state: "unavailable", reason: `http-${r.status}` };
+    }
+    return { state: "ok" };
+  }
+
+  return { shellList, sessionList, activeSessions, inboxList, inboxCancel, sessionBackground };
 }
 
 /**
@@ -325,6 +344,7 @@ function normalizeShells(data: unknown[]): ShellEntry[] {
       status: o.status,
       sessionID: typeof meta.sessionID === "string" ? meta.sessionID : undefined,
       time: typeof t.started === "number" ? { started: t.started } : undefined, // §51: elapsed in the check-in roster
+      background: typeof meta.background === "boolean" ? meta.background : undefined, // §52: foreground vs background
     });
   }
   return out;

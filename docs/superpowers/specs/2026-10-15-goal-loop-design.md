@@ -814,3 +814,25 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 **测试**：wake.test 加 items 形态断言（含时长格式、旧签名零回归）；watchdog.test 加 §51 用例（shell 在飞时 check-in 文本含 shell ID + 时长、不含 command 文本）。
 **验证边界（2026-10-21 已验）**：stub 层先红后绿（wake.test 名单形态钉死 + watchdog §51 用例 + background-gate 四处钉文案改带名单，352/0 + typecheck）；真宿主 `verify-checkin.ts` **7/7 全 PASS**（隔离宿主 2.1.1 + lab LLM，`checkInDelaySec` 注入 15s + `sleep 90` 后台 shell）：K2 shell 入宿主 shell store → K3 prompt turn 边界 arm → K4 check-in 注入，**消息实带名单行 `sh_15bf… (21s)`**（ID + 运行时长）、K4d 无 command 文本（裁定钉死）。首跑 K2/K4b 失败是验证脚本自身 bug（`api.shellList()` 返回宿主原始 JSON，`sessionID` 在 `metadata` 下——非插件视图），非插件问题。
 
+## 52. 2026-10-21 裁定 — 前台 shell 超时自动转后台（堵住"阻塞 shell 挂死 = 永久失声"盲区）
+
+**裁定来源（用户 2026-10-21）**：后台（`background: true`）shell/子任务卡住有 check-in 节奏兜底；但**前台（阻塞式）shell** 挂死时模型 turn 阻塞在工具调用上——turn 永不结束 → 无边界 → check-in 武装了也等不到 idle → 循环永久失声（§50 liveness 重查也被 in-flight 门 hold，因为该 shell 仍在飞）。用户方案（界面 Ctrl+B 实证有对应 API）：非后台 shell 启动后计时 30 分钟，未结束就**转后台 + 唤醒会话检查**。
+
+**宿主端点（活宿主 `GET /openapi.json` + 2.1.1 源码双重实锤，`ba546ec`）**：`POST /api/session/:sessionID/background`（204；TUI `ctrl+b` = `session.background` 命令的服务端动作）：把该会话**所有正在前台阻塞的 backgroundable 工具任务转为后台观察**（`jobs.backgroundAll`——**工作继续运行，不杀**），并**由宿主注入一条 synthetic**（"…moved to the background. … Do not wait, sleep, poll … until a later completion notification…"）——被阻塞的 turn 解除阻塞后模型自然处理它。"唤醒会话去检查"由宿主注入的 synthetic 完成，插件零注入。
+
+**插件实现**：
+- 新 option **`foregroundShellBackgroundMs`**（默认 **30min**，`0` = 关；唯一允许 0 的数值 option，解析特判）
+- 全局 30s 扫描（复用 §50 liveness 定时器，独立方法 `foregroundShellScan`，**不受 liveness 静默条件门控**）：每个有 goal 记录且 **active** 的会话 → shell store 查询 → 筛 `running` + `background !== true` + 本会话归属 → 运行时长（`time.started`，缺省用首见时刻）≥ cap → **调一次端点**（每 shell 去重；POST 是会话级"全部前台工作"语义，转成后该会话余下前台 shell 一并转入——与 Ctrl+B 一致）；POST 失败不记去重（下次扫描重试）。
+- `ShellEntry` 补 `background?: boolean`（hostapi normalize 透传 `metadata.background`——宿主 shell 元数据本就携带）；数据面加 `sessionBackground()`（POST，404 SessionNotFound = ok 语义，同 inboxCancel 族）；probe 面加 `sessionBackground(sessionID)`（失败 throw，扫描侧 catch + 告警）。
+- 转后台之后走既有语义：后台 shell 正常计 in-flight（check-in 节奏 + §51 名单），shell 跑完宿主追加 completion notification → 边界 → 模型核对结果。
+
+**边界（诚实声明）**：① 只覆盖"扫描时仍在 shell store 里"的前台 shell——存量挂死 shell 也能覆盖（store 里 `running` 就在，`time.started` 真实）；② 子任务（subtask session）挂死不在本批（用户裁定先只考虑 shell）——子任务仍靠 check-in 节奏，"无 kill 手段"的局限不变；③ "转换"是宿主动作，插件无法选择只转某一个 shell（会话级全部）。
+
+**测试**：`test/shell-bg.test.ts` T1（超 cap 前台 shell → 恰好一次 POST，去重）/ T2（background shell 不碰）/ T3（cap=0 关）/ T4（未超 cap 不动）。
+**验证边界（2026-10-21 已验）**：stub 357/0 + typecheck（`shell-bg.test.ts` T1–T4：超 cap 恰好一次 POST 且去重 / background shell 不碰 / cap=0 关 / 未超 cap 不动；options 0=valid 解析钉死）。真宿主 `verify-shellbg.ts` **7/7 全 PASS**（隔离宿主 2.1.1 + lab LLM，cap 注入 5s）：G2 模型前台跑 `sleep 120`（shell store `background:false`）→ G3 插件扫描触发 `POST /api/session/:id/background`（宿主 stdout 日志行实锤）→ G4 宿主注入的 "moved to the background" synthetic 落到会话 → **G5 shell 进程仍在运行（转后台 = 保活非杀）** → G6 背景化后新决策行落地（循环恢复边界节奏，hold 行实锤）。
+
+## 53. 2026-10-21 裁定 — 数据面维持 HTTP，不做 ctx 进程内双通道
+
+**裁定来源（用户 2026-10-21）**：查证 2.1.1 插件 `Context`（`packages/plugin/src/promise/plugin.ts`）后发现进程内域可覆盖数据面 6 查中的 2（`ctx.session.list` / `ctx.session.get`+`ctx.location`），另白送 `ctx.session.interrupt`（"turn 挂死"盲区逃生门，待立项）；但 active map / shell store / inbox / background 四个查询 2.1.1 宿主未开放进程内面（ctx Pick 刻意收窄），且官方插件文档描述的 `client`/`$` 签名是旧版模型、与实际 Context 不符（文档滞后）。**用户裁定：数据面维持 HTTP client 面**——`GET /openapi.json`（活宿主自发布、按宿主版本、状态码齐全）作为契约取证入口，比追宿主内部 ctx 面变更更稳。
+**影响**：`hostapi.ts` 数据面零改动；ctx 进程内域（含 interrupt）列为**未来宿主开放更多面时的再评估项**，不排期。
+

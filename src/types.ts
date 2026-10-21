@@ -186,6 +186,10 @@ export interface ShellEntry {
    * elapsed time. Optional: the harness may omit it (roster then shows the
    * bare id). */
   time?: { started?: number };
+  /** §52: true when the shell runs in background observation (the host's
+   * `metadata.background` — Ctrl+B / session.background semantics). Absent
+   * or false = foreground (blocking) shell. */
+  background?: boolean;
 }
 
 /**
@@ -222,6 +226,11 @@ export interface WakeProbe {
   inboxList(sessionID: string): Promise<InboxItem[]>; // hostapi GET /api/session/:id/inbox
   inboxCancel(inboxID: string): Promise<void>; // hostapi DELETE /api/session/:id/inbox/:inboxID
   shellList(locationDirectory: string): Promise<ShellEntry[]>; // hostapi GET /api/shell（宿主 shell store）
+  /** §52: POST /api/session/:sessionID/background（宿主 Ctrl+B 的服务端动作，
+   * 2026-10-21 活宿主 openapi.json 实锤）——把该会话所有前台阻塞的
+   * backgroundable 工具转后台观察（继续运行）+ 宿主注入 synthetic。
+   * 失败 throw（调用方 catch + 下次扫描重试）。 */
+  sessionBackground(sessionID: string): Promise<void>;
   sessionList(locationDirectory: string): Promise<HostSession[]>; // hostapi GET /api/session（按目录限定，同 shellList；parentID 链 = 子任务归属源）
   activeSessions(locationDirectory: string): Promise<Record<string, string>>; // hostapi GET /api/session/active（参考UI 在飞判据，2026-10-20：sessionID→status，"running" = 在飞；缺条目 = idle）
   projectID?: string;

@@ -8,12 +8,16 @@
 
 ## [Unreleased]
 
+### 新增
+- **前台 shell 超时自动转后台**（§52，2026-10-21 裁定）：goal 会话里**前台（阻塞式）** shell 运行超过 `foregroundShellBackgroundMs`（默认 30min，`0` = 关）→ 插件调宿主 `POST /api/session/:id/background`（TUI Ctrl+B 的服务端动作，2.1.1 活宿主 openapi.json + 源码双重实锤）——工作**保活转后台观察**（不杀），宿主自注入 synthetic 解除被阻塞的 turn。堵住"前台 shell 挂死 = turn 无边界 = 无 check-in = 循环永久失声"盲区（此前 §50 liveness 重查也被 in-flight 门 hold）。
+
 ### 优化与设计
 - **check-in 提醒附带在飞任务名单**（2026-10-21 裁定，129 sm70 现场驱动：模型被 check-in 唤醒后要再查一次 shell store 才知道谁在飞）：check-in 触发时新鲜查询一次，把在飞名单写进提醒——**不封顶、只要 ID + 运行时长、不要 command**（用户裁定；宿主 shell store 条目本就携带 `time.started`，`ShellEntry` 扩类型透传，子任务会话列 `subtask ses_x (running)`）。查询失败回退纯计数文案（提醒本身绝不丢）；传统两参调用逐字不变（wake.test 既有断言零回归）。spec §51。
 
 ### 验证
-- stub 352/0 + typecheck；wake.test 名单形态钉死（含"不封顶/无 command/空名单=旧文案逐字不变"）；watchdog §51 用例 + background-gate 四处钉文案改带名单形态。
+- stub 357/0 + typecheck；wake.test 名单形态钉死（含"不封顶/无 command/空名单=旧文案逐字不变"）；watchdog §51 用例 + background-gate 四处钉文案改带名单形态。
 - **隔离真宿主 7/7 全 PASS**（`verify-checkin.ts`，宿主 2.1.1 + lab LLM，`checkInDelaySec` 15s + `sleep 90` 后台 shell）：check-in 注入消息**实带名单行 `sh_… (21s)`**（ID + 运行时长）、无 command 文本（裁定钉死，K4d）。
+- **§52 前台 shell 自动转后台**：`test/shell-bg.test.ts` T1–T4（超 cap 恰好一次 POST + 去重 / background shell 不碰 / cap=0 关 / 未超 cap 不动）+ options 0=valid 解析；真宿主 `verify-shellbg.ts`（cap 注入 5s，模型前台跑 `sleep`）跑完全 PASS 后回填。
 
 ## [1.1.6] - 2026-10-21
 

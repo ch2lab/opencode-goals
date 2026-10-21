@@ -12,6 +12,7 @@ const EXPECTED_DEFAULTS: Options = {
   timeoutWrap: false,
   providerFailLimit: 2,
   providerPauseMs: 30 * 60 * 1000,
+  foregroundShellBackgroundMs: 30 * 60 * 1000, // §52 (0 = disabled is a valid value)
   wakeText: undefined,
 };
 
@@ -27,8 +28,17 @@ test("empty input yields every default exactly", () => {
   expect(o.timeoutWrap).toBe(false);
   expect(o.providerFailLimit).toBe(2);
   expect(o.providerPauseMs).toBe(30 * 60 * 1000);
+  expect(o.foregroundShellBackgroundMs).toBe(30 * 60 * 1000); // §52: 30 min default
   expect(o.wakeText).toBeUndefined();
   expect(o).toEqual(EXPECTED_DEFAULTS);
+});
+
+test("§52: foregroundShellBackgroundMs — 0 is a valid value (disabled); non-integers fall back", () => {
+  expect(resolveOptions({ foregroundShellBackgroundMs: 0 }).foregroundShellBackgroundMs).toBe(0);
+  expect(resolveOptions({ foregroundShellBackgroundMs: 5000 }).foregroundShellBackgroundMs).toBe(5000);
+  expect(resolveOptions({ foregroundShellBackgroundMs: -1 }).foregroundShellBackgroundMs).toBe(30 * 60 * 1000);
+  expect(resolveOptions({ foregroundShellBackgroundMs: 1.5 }).foregroundShellBackgroundMs).toBe(30 * 60 * 1000);
+  expect(resolveOptions({ foregroundShellBackgroundMs: "30000" }).foregroundShellBackgroundMs).toBe(30 * 60 * 1000);
 });
 
 test("partial overrides take effect, the rest stay default", () => {
