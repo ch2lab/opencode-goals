@@ -1,7 +1,7 @@
 {
   "name": "@ch2lab/opencode-goals",
   "version": "1.1.6",
-  "description": "OpenCode v2 goal-loop plugin: set a goal, the model works autonomously until evidence-gated completion or budget exhaustion (目标循环插件：设定目标 → 自主执行 → 证据门控收尾，面向无人值守长任务)",
+  "description": "OpenCode v2 goal-loop plugin: set a goal, the model works autonomously toward evidence-gated completion — wake-on-boundary loop, stall arbitration, opt-in budget caps, built for unattended long-running tasks",
   "type": "module",
   "license": "MIT",
   "repository": "https://github.com/ch2lab/opencode-goals",
