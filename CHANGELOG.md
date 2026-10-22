@@ -23,8 +23,8 @@
 ### 验证
 - stub 366/0 + typecheck；wake.test 名单形态钉死（含"不封顶/无 command/空名单=旧文案逐字不变"）+ §54 立即提醒文案（截断/压平/0=无 command）；watchdog §51 用例 + background-gate 后台用例显式 `background: true`；新增 `fg-block.test.ts` F1–F3（fg 边界 hold 不武装 / 发时防御丢弃 / liveness recheck 跳过 + 对照组）；shell-bg T5（超 cap → POST + 恰一条立即提醒 + 决策行）；options 三个新 option 解析（含 0 合法值）。
 - **隔离真宿主 7/7 全 PASS**（`verify-checkin.ts`，宿主 2.1.1 + lab LLM，`checkInDelaySec` 15s + `sleep 90` 后台 shell）：check-in 注入消息**实带名单行 `sh_… (21s)`**（ID + 运行时长）、无 command 文本（裁定钉死，K4d）。
-- **§52 前台 shell 自动转后台**：`test/shell-bg.test.ts` T1–T5（超 cap 恰好一次 POST + 去重 / background shell 不碰 / cap=0 关 / 未超 cap 不动 / §54 立即提醒）+ options 0=valid 解析；真宿主 `verify-shellbg.ts`（cap 注入 5s，模型前台跑 `sleep`）跑完全 PASS 后回填。
-- **§54 真宿主**（待跑）：verify-shellbg 补立即提醒断言 + 新增前台阻塞抑制用例（前台 shell 长时运行：无 "Background check-in"、无伪造 recheck）。
+- **§52 前台 shell 自动转后台**：`test/shell-bg.test.ts` T1–T5（超 cap 恰好一次 POST + 去重 / background shell 不碰 / cap=0 关 / 未超 cap 不动 / §54 立即提醒）+ options 0=valid 解析；真宿主 `verify-shellbg.ts`（cap 注入 5s，模型前台跑 `sleep 120`）**9/9 ALL PASS**（回填见下行）。
+- **§54 真宿主**（2026-10-22，宿主 2.1.2 + lab LLM）：`verify-shellbg.ts` **9/9 ALL PASS**（cap 5s：G4b 转后台**同一时刻**插件立即提醒落会话——shell id + command + "moved it to background automatically"；G4c 决策行 `watchdog: foreground shell auto-backgrounded (cap 5s)`；G5 进程保活；G6 循环恢复）+ 新 `verify-fgblock.ts` **8/8 ALL PASS**（`sleep 100` 前台阻塞 + `livenessMs` 注入 30s：F4 阻塞 75s **零 "Background check-in"**〔129 截图 bug 形态〕、F5 **零 "liveness recheck"**、F6 未超 cap 零转后台、F7 阻塞结束后边界节奏恢复）。
 
 ## [1.1.6] - 2026-10-21
 

@@ -862,5 +862,5 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
    - 既有相关 option 不变：`checkInDelaySec`（5min）、`foregroundShellBackgroundMs`（30min，`0` = 关）。
 
 **测试**：stub——wake.test（notice 文案形态：带 command / 截断 / 0=无 / 换行压平）；background-gate（fg 边界 → hold 不武装，既有后台用例全部显式 `background: true` 并改带 `(bg)` 标签）；新 `fg-block.test.ts`（F1 fg 边界静默不武装 / F2 发时防御丢弃 / F3 liveness recheck 跳过）；shell-bg T5（超 cap → POST + 立即提醒 + 决策行）；options.test（三个新 option 解析）。
-**验证边界（待 2026-10-22 真宿主补记）**：verify-shellbg 扩展（转后台后立即提醒文案 + `shell-backgrounded` 决策行）+ 新增前台阻塞抑制用例（前台 shell 长时运行：无 "Background check-in" 行、无伪造 recheck）。
+**验证边界（2026-10-22 已验）**：stub 366/0 + typecheck（wake §54 文案形态 / background-gate 后台用例显式 `background:true` + `(bg)` 标签 / 新 `fg-block.test.ts` F1–F3 / shell-bg T5 / options 三新项含 0 合法值）。真宿主两批 **ALL PASS**（隔离宿主 2.1.2 + lab LLM）：`verify-shellbg.ts` **9/9**（cap 注入 5s，模型前台跑 `sleep 120`：G3 转后台日志行 → **G4b 插件立即提醒落会话**（shell id + command + "moved it to background automatically"）→ **G4c 决策行 `watchdog: foreground shell auto-backgrounded (cap 5s)`** → G5 进程保活 → G6 循环恢复边界节奏）；新 `verify-fgblock.ts` **8/8**（模型前台跑 `sleep 100`，`livenessMs` 注入 30s + 扫描 15s——旧行为约 45s 即伪造 recheck：F4 **阻塞 75s 内零 "Background check-in"**〔129 截图 bug 形态〕、F5 **零 "liveness recheck"**（静默=预期）、F6 未超 cap 零转后台、F7 阻塞结束后边界节奏恢复 `wake: boundary (in-flight 0)`）。
 
