@@ -4,6 +4,7 @@
 - 在途版本记 `## [Unreleased]`；发布时（与 version bump 同批提交）把内容移到 `## [X.Y.Z] - YYYY-MM-DD`（日期 = 发布日）。
 - 每个版本章节必须有内容——CI 硬门：打 tag 的版本找不到非空章节 = 发布失败（npm publish 之前，fail fast）。
 - 章节三段结构：`### 新增`（新功能/新工具/新命令）、`### 修复`（修了什么，含 incident 来源）、`### 优化与设计`（架构/行为变更/设计裁定）；可加 `### 验证`。
+- 语言：**英文**（2026-10-22 裁定，适用于此后所有新版本：小节用 `### Added` / `### Fixed` / `### Optimizations & Design` / `### Verification`）；[1.1.7] 及更早章节保留原文。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
 ## [1.1.7] - 2026-10-22
