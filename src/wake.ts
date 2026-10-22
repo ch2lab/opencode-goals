@@ -34,6 +34,32 @@ export function backgroundCheckInText(inFlight: number, waitSec: number, items?:
 }
 
 /**
+ * §54 (2026-10-22 ruling): the §52 IMMEDIATE notice — injected right after the
+ * plugin auto-backgrounds a foreground shell that outlived the goal's max
+ * foreground blocking time. Unlike the §51 periodic roster (which never lists
+ * command text), this is a one-off per-shell event and the model genuinely
+ * needs to know WHAT was moved: `command` is flattened (newlines → spaces)
+ * and truncated to `commandChars` (0 = no command text at all).
+ * `elapsedLabel` / `capLabel` are pre-formatted by the caller ("41m"/"30m",
+ * "90s"/"30s") so sub-minute values stay honest.
+ */
+export function foregroundBackgroundNoticeText(
+  shellID: string,
+  command: string | undefined,
+  commandChars: number,
+  elapsedLabel: string,
+  capLabel: string,
+): string {
+  let cmdPart = "";
+  if (command !== undefined && command !== "" && commandChars > 0) {
+    let flat = command.replace(/\s+/g, " ").trim();
+    if (flat.length > commandChars) flat = `${flat.slice(0, commandChars)}…`;
+    cmdPart = ` (command: "${flat}")`;
+  }
+  return `opencode-goal: shell ${shellID}${cmdPart} ran in the foreground for ${elapsedLabel}, over this goal's max foreground blocking time (${capLabel}) — the goal plugin moved it to background automatically. Check that the shell is still running healthily, then wait for its completion notification before continuing. A user message always overrides this reminder.`;
+}
+
+/**
  * Provider-pause entry notice — ONE per incident (goalControl synthetic,
  * 2026-10-17 ruling): the model is failing with a provider-level error
  * (quota/funds), automatic wakes are suspended, and a watchdog retry fires

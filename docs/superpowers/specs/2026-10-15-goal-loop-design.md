@@ -836,3 +836,31 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 **裁定来源（用户 2026-10-21）**：查证 2.1.1 插件 `Context`（`packages/plugin/src/promise/plugin.ts`）后发现进程内域可覆盖数据面 6 查中的 2（`ctx.session.list` / `ctx.session.get`+`ctx.location`），另白送 `ctx.session.interrupt`（"turn 挂死"盲区逃生门，待立项）；但 active map / shell store / inbox / background 四个查询 2.1.1 宿主未开放进程内面（ctx Pick 刻意收窄），且官方插件文档描述的 `client`/`$` 签名是旧版模型、与实际 Context 不符（文档滞后）。**用户裁定：数据面维持 HTTP client 面**——`GET /openapi.json`（活宿主自发布、按宿主版本、状态码齐全）作为契约取证入口，比追宿主内部 ctx 面变更更稳。
 **影响**：`hostapi.ts` 数据面零改动；ctx 进程内域（含 interrupt）列为**未来宿主开放更多面时的再评估项**，不排期。
 
+## 54. 2026-10-22 裁定 — 前台 shell 阻塞态显式化：check-in 分类 + 阻塞期间静默 + 转后台立即提醒
+
+**裁定来源（用户 2026-10-22，129 sm70 现场截图驱动）**：模型的前台阻塞 shell（维护脚本）运行 >300s 时，会话收到一条 "Background check-in: 1 background item(s) in flight"——(a) 前台 shell 被误报成 "background item"；(b) 该 turn 阻塞中，消息只能排队、模型实际收不到。代码路径溯源（1.1.6 在 129 的活行为）：前台 shell 阻塞 → 宿主事件流静默（预期内）→ §50 liveness recheck 把静默误判为"流死了" → 伪造一次边界 → 边界 hold 路径（markTurnInactive 清活跃位 + 武装 check-in）→ watchdog 判定 idle → 到期照发。三处毛病：不该发的发了、发不出去、文案种类错。
+
+**用户裁定（分层策略，沿用既有设计，不新造机制）**：
+- **后台 shell / 子任务在飞** → 维持 5min（`checkInDelaySec`）check-in 节奏（§46/§51 语义不变）
+- **前台（阻塞）shell** → 不发 periodic check-in（发也发不出去）；从启动计超过 goal 设定的最大前台阻塞时间（`foregroundShellBackgroundMs`，默认 30min）→ 插件 §52 自动转后台（`session.background`），**转后台后立即发一条插件自己的提醒**（用户裁定：不等宿主的 synthetic + 5min 周期）
+
+**实现**：
+1. **fg 维度**：`inFlightSignal` 返回值加 `fg` = 本会话 running 且 `background !== true` 的 shell 数（与 §52 扫描同一判据）。
+2. **阻塞期间静默（三道防线）**：
+   - 边界仲裁：`gate > 0 && fg > 0` → hold，reason `foreground shell blocked (no check-in arm)`（决策日志加 `fg` 字段），**不武装 check-in、不走 (a) 例外**（防伪造边界的 (a) 路径直接唤醒）；
+   - §50 liveness recheck：本会话有 running 前台 shell → 跳过该会话（阻塞期的事件流静默是预期，不是死流）；查询失败 → 照常 recheck（宿主真死时自愈不能失声）；
+   - watchdog 发时防御：check-in 到点时重新查 shell store，仍有本会话前台 shell → 丢弃 deadline 不投递（shell 结束后的边界重新武装）。
+3. **roster 分类（§51 延伸）**：`inFlightRoster` 条目带种类标签——`sh_x (bg, 12m34s)` / `sh_x (fg, 12m34s)`（无 `time.started` 时只标种类）/ `ses_y (subtask)`；"N background item(s)" 计数语义不变（发时防御保证前台 shell 不可能出现在合法 check-in 里）。
+4. **§52 转后台立即提醒**：`foregroundShellScan` POST 成功 → 经 `deliverWatchdogWake` 立即注入 goalControl 唤醒（`delivery: "queue"`——宿主 turn 未释放时按宿主队列机制排在宿主 synthetic 之后，用户裁定可接受）：
+   - 文案 `foregroundBackgroundNoticeText(shellID, command, elapsedLabel, capLabel)`：
+     `opencode-goal: shell sh_xxxx (command: "…") ran in the foreground for 41m, over this goal's max foreground blocking time (30m) — the goal plugin moved it to background automatically. Check that the shell is still running healthily, then wait for its completion notification before continuing. A user message always overrides this reminder.`
+   - **command 含文本**（与 §51 roster"无 command"裁定不冲突——那条针对周期 roster，此处是单一 shell 的一次性事件，模型需要知道跑的是什么）；command 截断 `foregroundNoticeCommandChars`（默认 `300`，`0` = 不带 command），换行压平；无 command = 只列 id；
+   - 每 shell 一条（既有 `backgroundedShells` 去重集，首个超 cap 的 shell 触发）；决策日志补 `decision:"watchdog", reason:"foreground shell auto-backgrounded (cap <n>)"`（console.warn 行保留）。
+5. **option 面（所有默认值可在插件注册 options 修改）**：
+   - 新增 `livenessMs`（默认 `300000` = 5min，§50 自愈静默窗）、`livenessCheckMs`（默认 `30000`，§50/§52 全局扫描周期）——原本硬编码常量，现全部 option 化；
+   - 新增 `foregroundNoticeCommandChars`（默认 `300`，`0` = 提醒不带 command）；
+   - 既有相关 option 不变：`checkInDelaySec`（5min）、`foregroundShellBackgroundMs`（30min，`0` = 关）。
+
+**测试**：stub——wake.test（notice 文案形态：带 command / 截断 / 0=无 / 换行压平）；background-gate（fg 边界 → hold 不武装，既有后台用例全部显式 `background: true` 并改带 `(bg)` 标签）；新 `fg-block.test.ts`（F1 fg 边界静默不武装 / F2 发时防御丢弃 / F3 liveness recheck 跳过）；shell-bg T5（超 cap → POST + 立即提醒 + 决策行）；options.test（三个新 option 解析）。
+**验证边界（待 2026-10-22 真宿主补记）**：verify-shellbg 扩展（转后台后立即提醒文案 + `shell-backgrounded` 决策行）+ 新增前台阻塞抑制用例（前台 shell 长时运行：无 "Background check-in" 行、无伪造 recheck）。
+

@@ -124,6 +124,29 @@ async function main(): Promise<void> {
   }, CHECK_TIMEOUT_MS, "G4: host synthetic");
   check("G4: host-injected 'moved to the background' synthetic in the session", hasSynthetic);
 
+  // G4b (§54): the PLUGIN's own IMMEDIATE notice — same moment, its own
+  // goalControl message: the shell id + its command + the cap, telling the
+  // model to check the shell's health.
+  const hasNotice = await waitUntil(async () => {
+    const msgs = await host.api.context(S);
+    return msgs.some(
+      (m: any) =>
+        String(m?.text ?? "").includes("moved it to background automatically") &&
+        (shell === undefined || String(m?.text ?? "").includes(shell.id)),
+    );
+  }, CHECK_TIMEOUT_MS, "G4b: plugin immediate notice");
+  check("G4b: the plugin's immediate notice landed (shell id + 'moved it to background automatically')", hasNotice, {
+    sample: (await decisions()).map((d) => `${d.decision}:${d.reason}`),
+  });
+
+  // G4c (§54): the notice path is observable in the decision log.
+  const hasNoticeLine = (await decisions()).some(
+    (l) => l.decision === "watchdog" && String(l.reason).includes("auto-backgrounded"),
+  );
+  check("G4c: a 'watchdog / auto-backgrounded' decision line was logged", hasNoticeLine, {
+    decisions: (await decisions()).map((d) => `${d.decision}:${d.reason}`),
+  });
+
   // G5: the shell KEEPS RUNNING (background = observation, not kill).
   const stillRunning = await runningShell();
   check("G5: the shell is still running after backgrounding (work preserved)", stillRunning !== undefined, {

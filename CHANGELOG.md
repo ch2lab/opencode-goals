@@ -10,14 +10,21 @@
 
 ### 新增
 - **前台 shell 超时自动转后台**（§52，2026-10-21 裁定）：goal 会话里**前台（阻塞式）** shell 运行超过 `foregroundShellBackgroundMs`（默认 30min，`0` = 关）→ 插件调宿主 `POST /api/session/:id/background`（TUI Ctrl+B 的服务端动作，2.1.1 活宿主 openapi.json + 源码双重实锤）——工作**保活转后台观察**（不杀），宿主自注入 synthetic 解除被阻塞的 turn。堵住"前台 shell 挂死 = turn 无边界 = 无 check-in = 循环永久失声"盲区（此前 §50 liveness 重查也被 in-flight 门 hold）。
+- **转后台立即提醒**（§54，2026-10-22 裁定，129 sm70 截图驱动）：§52 转后台的**同一时刻**由插件注入一条 goalControl 提醒（不等宿主 synthetic + 5min 周期）——哪个 shell（id）、跑的什么（command 压平截断，`foregroundNoticeCommandChars` 默认 300，`0` = 不带）、跑多久、超的哪个阈值，请模型核对 shell 运行是否正常。每 shell 一条（去重），决策日志补 `watchdog / foreground shell auto-backgrounded` 行（此前该动作只有 console.warn，129 侧无从查证）。
+
+### 修复
+- **前台 shell 阻塞期间误发"background check-in"**（129 sm70 现场截图实锤：模型被前台阻塞 shell 挂住 >300s，却收到一条 "1 background item(s) in flight"——前台 shell 被误报成 background item，且该提醒只能排队、模型根本收不到）：根因链 = 前台阻塞 → 事件流静默 → §50 liveness recheck 误判"流死了" → 伪造边界（hold 路径清活跃位 + 武装 check-in）→ watchdog 判 idle 照发。现按用户裁定的分层策略修复（spec §54）：**后台 shell/子任务**维持 5min check-in 节奏；**前台 shell** 阻塞期间——边界 hold 不武装（reason `foreground shell blocked`）、liveness recheck 跳过该会话（静默是预期）、check-in 发时防御（到点仍有前台 shell 在跑 = 丢弃不投递）；§52 转后台后自然回到 5min 周期。决策日志 in-flight 信号补 `fg` 字段（前台 shell 计数）。
+- **check-in roster 分类标注**（§54）：roster 条目带种类标签——`sh_x (bg, 12m34s)` / `ses_y (subtask)`，不再把一切在飞统称为 "background item"。
 
 ### 优化与设计
-- **check-in 提醒附带在飞任务名单**（2026-10-21 裁定，129 sm70 现场驱动：模型被 check-in 唤醒后要再查一次 shell store 才知道谁在飞）：check-in 触发时新鲜查询一次，把在飞名单写进提醒——**不封顶、只要 ID + 运行时长、不要 command**（用户裁定；宿主 shell store 条目本就携带 `time.started`，`ShellEntry` 扩类型透传，子任务会话列 `subtask ses_x (running)`）。查询失败回退纯计数文案（提醒本身绝不丢）；传统两参调用逐字不变（wake.test 既有断言零回归）。spec §51。
+- **check-in 提醒附带在飞任务名单**（2026-10-21 裁定，129 sm70 现场驱动：模型被 check-in 唤醒后要再查一次 shell store 才知道谁在飞）：check-in 触发时新鲜查询一次，把在飞名单写进提醒——**不封顶、只要 ID + 运行时长、不要 command**（用户裁定；宿主 shell store 条目本就携带 `time.started`，`ShellEntry` 扩类型透传，子任务会话列 `ses_x (subtask)`）。查询失败回退纯计数文案（提醒本身绝不丢）；传统两参调用逐字不变（wake.test 既有断言零回归）。spec §51。
+- **全部默认值 option 化**（2026-10-22 用户裁定）：`livenessMs`（§50 自愈静默窗，默认 5min）、`livenessCheckMs`（全局扫描周期，默认 30s）、`foregroundNoticeCommandChars`（默认 300）三个原本硬编码的常量全部升为插件注册 options——README 选项表补全（含每项用途/作用/边界值语义）。
 
 ### 验证
-- stub 357/0 + typecheck；wake.test 名单形态钉死（含"不封顶/无 command/空名单=旧文案逐字不变"）；watchdog §51 用例 + background-gate 四处钉文案改带名单形态。
+- stub 366/0 + typecheck；wake.test 名单形态钉死（含"不封顶/无 command/空名单=旧文案逐字不变"）+ §54 立即提醒文案（截断/压平/0=无 command）；watchdog §51 用例 + background-gate 后台用例显式 `background: true`；新增 `fg-block.test.ts` F1–F3（fg 边界 hold 不武装 / 发时防御丢弃 / liveness recheck 跳过 + 对照组）；shell-bg T5（超 cap → POST + 恰一条立即提醒 + 决策行）；options 三个新 option 解析（含 0 合法值）。
 - **隔离真宿主 7/7 全 PASS**（`verify-checkin.ts`，宿主 2.1.1 + lab LLM，`checkInDelaySec` 15s + `sleep 90` 后台 shell）：check-in 注入消息**实带名单行 `sh_… (21s)`**（ID + 运行时长）、无 command 文本（裁定钉死，K4d）。
-- **§52 前台 shell 自动转后台**：`test/shell-bg.test.ts` T1–T4（超 cap 恰好一次 POST + 去重 / background shell 不碰 / cap=0 关 / 未超 cap 不动）+ options 0=valid 解析；真宿主 `verify-shellbg.ts`（cap 注入 5s，模型前台跑 `sleep`）跑完全 PASS 后回填。
+- **§52 前台 shell 自动转后台**：`test/shell-bg.test.ts` T1–T5（超 cap 恰好一次 POST + 去重 / background shell 不碰 / cap=0 关 / 未超 cap 不动 / §54 立即提醒）+ options 0=valid 解析；真宿主 `verify-shellbg.ts`（cap 注入 5s，模型前台跑 `sleep`）跑完全 PASS 后回填。
+- **§54 真宿主**（待跑）：verify-shellbg 补立即提醒断言 + 新增前台阻塞抑制用例（前台 shell 长时运行：无 "Background check-in"、无伪造 recheck）。
 
 ## [1.1.6] - 2026-10-21
 

@@ -25,6 +25,19 @@ export interface Options {
    * released). 0 = disabled. Default 30 min. The only numeric option that
    * accepts 0. */
   foregroundShellBackgroundMs: number;
+  /** §54 (2026-10-22 ruling): the §52 immediate-notice command text is
+   * truncated to this many characters (newlines flattened to spaces). 0 = no
+   * command text in the notice (the shell id only). Default 300. */
+  foregroundNoticeCommandChars: number;
+  /** §50 (option ized §54, 2026-10-22): the liveness silence window in
+   * MILLISECONDS — a started turn with no stream events for this long
+   * triggers the §50 self-heal recheck (re-subscribe + re-arbitrate).
+   * Default 300000 (5 min). */
+  livenessMs: number;
+  /** §50 (option ized §54, 2026-10-22): the global liveness/foreground-shell
+   * scan period in MILLISECONDS (one global timer; runs even while no goal
+   * watchdog is armed). Default 30000 (30s). */
+  livenessCheckMs: number;
   /** 2026-10-17 ruling (129 "Insufficient account funds" incident): consecutive
    *  boundaries whose last assistant message carries a provider.* error that
    *  arm the provider pause (default 2 — a single transient failure still gets
@@ -56,6 +69,13 @@ const DEFAULT_OPTIONS: Options = {
   // §52: 30 min — long enough for legitimate blocking shells, short enough
   // that a hung one cannot freeze the goal loop for the rest of the night.
   foregroundShellBackgroundMs: 30 * 60 * 1000,
+  // §54: 300 chars — enough to identify what the shell was doing without
+  // dumping a multi-page script into one message line.
+  foregroundNoticeCommandChars: 300,
+  // §50 windows (now options): a missed boundary must cost at most this much
+  // silence; the scan is coarse (it only LOOKS, never acts between events).
+  livenessMs: 5 * 60_000,
+  livenessCheckMs: 30_000,
   providerFailLimit: 2,
   providerPauseMs: 30 * 60 * 1000,
 };
@@ -84,6 +104,12 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
     typeof fbgRaw === "number" && Number.isInteger(fbgRaw) && fbgRaw >= 0
       ? (fbgRaw as number)
       : DEFAULT_OPTIONS.foregroundShellBackgroundMs;
+  // §54: 0 is a valid value too (0 = no command text in the immediate notice).
+  const fncRaw = o["foregroundNoticeCommandChars"];
+  const foregroundNoticeCommandChars =
+    typeof fncRaw === "number" && Number.isInteger(fncRaw) && fncRaw >= 0
+      ? (fncRaw as number)
+      : DEFAULT_OPTIONS.foregroundNoticeCommandChars;
 
   return {
     stallLimit: num("stallLimit", DEFAULT_OPTIONS.stallLimit),
@@ -95,6 +121,9 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
     checkInDelaySec: num("checkInDelaySec", DEFAULT_OPTIONS.checkInDelaySec),
     timeoutWrap: bool("timeoutWrap", DEFAULT_OPTIONS.timeoutWrap),
     foregroundShellBackgroundMs,
+    foregroundNoticeCommandChars,
+    livenessMs: num("livenessMs", DEFAULT_OPTIONS.livenessMs),
+    livenessCheckMs: num("livenessCheckMs", DEFAULT_OPTIONS.livenessCheckMs),
     providerFailLimit: num("providerFailLimit", DEFAULT_OPTIONS.providerFailLimit),
     providerPauseMs: num("providerPauseMs", DEFAULT_OPTIONS.providerPauseMs),
     wakeText,

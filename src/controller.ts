@@ -40,7 +40,13 @@ import {
   type TranscriptMessage,
 } from "./evidence";
 import type { Judge, JudgeVerdict } from "./judge";
-import { backgroundCheckInText, buildWakeMessage, providerPauseNoticeText, providerPauseRetryText } from "./wake";
+import {
+  backgroundCheckInText,
+  buildWakeMessage,
+  foregroundBackgroundNoticeText,
+  providerPauseNoticeText,
+  providerPauseRetryText,
+} from "./wake";
 import { buildCompactionPrompt, composeCompactionSummary } from "./compact";
 import { decidePermission, GOAL_CONTROL_ACTION } from "./permission";
 import { appendDecision } from "./decisionlog";
@@ -784,18 +790,19 @@ export class GoalController {
   }
 
   /** §50 liveness window (default 5 min — a missed boundary must cost at most
-   * this much silence; tests inject deps.livenessMs). */
+   * this much silence; tests inject deps.livenessMs; §54: option `livenessMs`). */
   private livenessMs(): number {
-    return this.deps.livenessMs ?? 5 * 60_000;
+    return this.deps.livenessMs ?? this.options.livenessMs;
   }
 
-  /** §50 liveness scan period (default 30s; tests inject deps.livenessCheckMs).
+  /** §50 liveness scan period (default 30s; tests inject deps.livenessCheckMs;
+   * §54: option `livenessCheckMs`).
    * A GLOBAL timer — deliberately NOT the per-goal watchdog: the watchdog is
    * disarmed when a turn starts, and the fatal case (129 incident) is exactly
    * "turn started (seen), terminal lost (never seen) → nothing re-arms the
    * watchdog". */
   private livenessCheckMs(): number {
-    return this.deps.livenessCheckMs ?? 30_000;
+    return this.deps.livenessCheckMs ?? this.options.livenessCheckMs;
   }
 
   /** §52 (2026-10-21 ruling): a FOREGROUND (blocking) shell in an active-goal
@@ -847,11 +854,51 @@ export class GoalController {
             `opencode-goal: §52 foreground shell ${sh.id} in ${sessionID} ran ${Math.round(elapsed / 60000)}m — ` +
               `moved to background observation (session.background; work keeps running)`,
           );
+          // §54 (2026-10-22 ruling): the host's own synthetic releases the
+          // blocked turn, but the USER ruled for an IMMEDIATE plugin notice
+          // too — one per shell, via the watchdog wake path (delivery "queue":
+          // if the host's turn is not released yet it simply lines up behind
+          // the host's synthetic — accepted).
+          await this.deliverWatchdogWake(
+            goal,
+            foregroundBackgroundNoticeText(
+              sh.id,
+              sh.command,
+              this.options.foregroundNoticeCommandChars,
+              this.durationLabel(elapsed),
+              this.durationLabel(cap),
+            ),
+            `foreground shell auto-backgrounded (cap ${this.durationLabel(cap)})`,
+          );
         } catch (err) {
           // NOT added to the dedupe set: a failed POST retries on the next scan.
           console.warn(`opencode-goal: §52 backgrounding ${sh.id} failed (retry next scan):`, err);
         }
       }
+    }
+  }
+
+  /** §54: "41m" for >= 1 min, "90s" below that (never "0m"/"0s" — a shell
+   * that ran at all got at least one second/minute of foreground time). */
+  private durationLabel(ms: number): string {
+    const m = Math.floor(ms / 60_000);
+    return m >= 1 ? `${m}m` : `${Math.max(1, Math.round(ms / 1000))}s`;
+  }
+
+  /** §54 (2026-10-22 ruling): this session's RUNNING FOREGROUND (blocking)
+   * shell ids — while any of them is in flight the stream silence is EXPECTED
+   * (the turn is stuck on the tool call), not a dead stream. Query failure
+   * returns [] (callers fail open: the §50 recheck / the delivery proceed). */
+  private async foregroundShellIds(sessionID: string): Promise<string[]> {
+    try {
+      const info = await this.probe.sessionGet(sessionID);
+      const directory = info?.location?.directory;
+      if (directory === undefined) return [];
+      return (await this.probe.shellList(directory))
+        .filter((e) => e.sessionID === sessionID && e.status === "running" && e.background !== true)
+        .map((e) => e.id);
+    } catch {
+      return [];
     }
   }
 
@@ -868,6 +915,13 @@ export class GoalController {
     for (const [sessionID, t] of this.turns) {
       if (!t.active) continue;
       if (now - (this.recheckAt.get(sessionID) ?? 0) <= this.livenessMs()) continue;
+      // §54: a turn blocked on its own foreground shell emits NO stream events
+      // by design — that silence is expected (rechecking would fabricate a
+      // boundary, arm a check-in that cannot be delivered, and clear the
+      // active flag — the 129 2026-10-22 screenshot chain). A failed query
+      // above returned [] → the recheck proceeds (a truly dead host must
+      // still be able to self-heal).
+      if ((await this.foregroundShellIds(sessionID)).length > 0) continue;
       this.recheckAt.set(sessionID, now);
       console.warn(
         `opencode-goal: liveness recheck for ${sessionID} — no events for ` +
@@ -1139,8 +1193,9 @@ export class GoalController {
    * job. warn-once per session. */
   private async inFlightSignal(
     sessionID: string,
-  ): Promise<{ own: number; other: number; queued: number; ownKnown: boolean }> {
+  ): Promise<{ own: number; other: number; queued: number; fg: number; ownKnown: boolean }> {
     let own = 0;
+    let fg = 0; // §54: running FOREGROUND (blocking) shells of THIS session
     let queued = 0;
     let ownKnown = true;
     let directory: string | undefined;
@@ -1148,9 +1203,11 @@ export class GoalController {
       const info = await this.probe.sessionGet(sessionID);
       directory = info?.location?.directory;
       if (directory !== undefined) {
-        own = (await this.probe.shellList(directory)).filter(
+        const running = (await this.probe.shellList(directory)).filter(
           (e) => e.sessionID === sessionID && e.status === "running",
-        ).length;
+        );
+        own = running.length;
+        fg = running.filter((e) => e.background !== true).length; // §54 (same criterion as the §52 scan)
       }
       // 2026-10-20 queued-input ruling: undelivered inbox items (queued user
       // messages, synthetic results, compaction/move control items — all
@@ -1194,7 +1251,7 @@ export class GoalController {
         // query failed: fail open (0 subtasks) — at worst this re-arms the check.
       }
     }
-    return { own, other, queued, ownKnown };
+    return { own, other, queued, fg, ownKnown };
   }
 
   /** Count this session's in-flight subtasks (2026-10-20 reference-UI ruling):
@@ -1259,10 +1316,18 @@ export class GoalController {
         (e) => e.sessionID === sessionID && e.status === "running",
       );
       for (const sh of shells) {
-        items.push(sh.time?.started !== undefined ? `${sh.id} (${elapsed(sh.time.started)})` : sh.id);
+        // §54: label the kind (bg shells by definition here; an fg entry
+        // would mean the fire-time guard let one through — still label it
+        // honestly rather than call it "background").
+        const kind = sh.background === true ? "bg" : "fg";
+        items.push(
+          sh.time?.started !== undefined
+            ? `${sh.id} (${kind}, ${elapsed(sh.time.started)})`
+            : `${sh.id} (${kind})`,
+        );
       }
       for (const id of await this.listSubtasksInFlight(sessionID, directory)) {
-        items.push(`subtask ${id} (running)`);
+        items.push(`${id} (subtask)`);
       }
       return items;
     } catch {
@@ -1471,7 +1536,7 @@ export class GoalController {
     // wake would land in the queue behind it — 2026-10-20 re-review, C1);
     // (b) goal_wait's waitUntil window silences EVERYTHING
     // (record only: no wake, no arm, no stall accounting — "不消耗 stall 预算").
-    const { own, other, queued, ownKnown } = await this.inFlightSignal(sessionID);
+    const { own, other, queued, fg, ownKnown } = await this.inFlightSignal(sessionID);
     // Gate = own running shells + attributed subtask sessions (2026-10-18
     // amended ruling) + queued undelivered inbox input (2026-10-20 ruling: a
     // wake would land IN THE QUEUE behind the pending input). The decision
@@ -1499,6 +1564,32 @@ export class GoalController {
       return;
     }
     if (gate > 0) {
+      // §54 (2026-10-22 ruling): the session is BLOCKED ON ITS OWN FOREGROUND
+      // SHELL — its turn is stuck on the tool call, so a progress check-in
+      // could not be delivered anyway (it would only queue behind the turn,
+      // mislabeled as "background items"). Silence: no check-in arm, and NOT
+      // the (a) exception below (a fabricated boundary must not straight-wake
+      // either). What moves the loop: the shell completing, or the §52 scan
+      // converting it to background at the cap (which delivers its own
+      // immediate notice).
+      if (fg > 0) {
+        bumpGoalDecision(goal, "hold");
+        await appendDecision({
+          ts: new Date().toISOString(),
+          sessionID,
+          goalID: goal.id,
+          own,
+          other,
+          queued,
+          fg,
+          ownKnown: true,
+          decision: "hold",
+          reason: "foreground shell blocked (no check-in arm)",
+        });
+        this.markTurnInactive(sessionID);
+        await this.recordHandled(sessionID, eventID, goal);
+        return;
+      }
       // An ACTIVE provider pause silences the progress check like goal_wait's
       // waitUntil window (a check-in wake during either is a doomed turn).
       const pauseActive = goal.providerPause !== undefined && Date.now() < goal.providerPause.until;
@@ -2085,12 +2176,23 @@ export class GoalController {
     const quiet = (goal.waitUntil !== undefined && now < goal.waitUntil) || pauseActive;
     const due = this.checkinDue.get(sessionID);
     if (due !== undefined && now >= due.due && idle && !quiet) {
-      this.checkinDue.delete(sessionID); // one-shot: consumed on fire
-      await this.deliverWatchdogWake(
-        goal,
-        backgroundCheckInText(due.inFlight, this.options.checkInDelaySec, await this.inFlightRoster(sessionID)),
-        `watchdog check-in (in-flight ${due.inFlight})`,
-      );
+      // §54 defense in depth: if the deadline was armed before a foreground
+      // shell started (an edge the event path makes rare), it STILL cannot be
+      // delivered to a blocked turn — discard it; the shell's end boundary
+      // re-arms a fresh check.
+      if ((await this.foregroundShellIds(sessionID)).length > 0) {
+        this.checkinDue.delete(sessionID);
+        console.warn(
+          `opencode-goal: §54 check-in deadline discarded for ${sessionID} — its turn is blocked on a foreground shell`,
+        );
+      } else {
+        this.checkinDue.delete(sessionID); // one-shot: consumed on fire
+        await this.deliverWatchdogWake(
+          goal,
+          backgroundCheckInText(due.inFlight, this.options.checkInDelaySec, await this.inFlightRoster(sessionID)),
+          `watchdog check-in (in-flight ${due.inFlight})`,
+        );
+      }
     }
     // Provider pause deadline reached → fire ONE retry wake (retrySent: the
     // watchdog may stay alive across the deadline — a surviving pending

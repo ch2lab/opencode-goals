@@ -345,6 +345,7 @@ function normalizeShells(data: unknown[]): ShellEntry[] {
       sessionID: typeof meta.sessionID === "string" ? meta.sessionID : undefined,
       time: typeof t.started === "number" ? { started: t.started } : undefined, // §51: elapsed in the check-in roster
       background: typeof meta.background === "boolean" ? meta.background : undefined, // §52: foreground vs background
+      command: typeof o.command === "string" ? o.command : undefined, // §54: the §52 immediate-notice quotes it (truncated)
     });
   }
   return out;

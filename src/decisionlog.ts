@@ -15,6 +15,8 @@ export interface DecisionEntry {
   other?: number;
   /** Queued undelivered inbox items at the boundary (2026-10-20 queued-input ruling). */
   queued?: number;
+  /** §54: this session's running FOREGROUND shells at the boundary (0/absent = none). */
+  fg?: number;
   ownKnown: boolean;
   decision: "wake" | "hold" | "skip" | "watchdog";
   reason: string;

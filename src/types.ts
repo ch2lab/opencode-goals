@@ -190,6 +190,10 @@ export interface ShellEntry {
    * `metadata.background` — Ctrl+B / session.background semantics). Absent
    * or false = foreground (blocking) shell. */
   background?: boolean;
+  /** §54 (2026-10-22 ruling): the command text (host shell store entry
+   * `command`) — carried so the §52 immediate-notice can quote it (truncated);
+   * the periodic §51 roster NEVER lists it. */
+  command?: string;
 }
 
 /**
