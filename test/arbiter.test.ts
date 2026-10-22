@@ -591,7 +591,7 @@ test("19: in-flight boundary during an active provider pause — quiet: the prog
   const stop = await ctrl.start();
   await armProviderPause(h); // default providerPauseMs (30 min) keeps the pause active
   expect(goalOf(h)!.providerPause).toBeDefined();
-  await h.emit(ev("session.shell.started", "e19c", { sessionID: S, shell: { id: "sh1", status: "running" } }));
+  await h.emit(ev("session.shell.started", "e19c", { sessionID: S, shell: { id: "sh1", status: "running", metadata: { background: true } } })); // §54: background shell
   await h.emit(succeeded("e19d")); // in-flight boundary during the pause
   await sleep(1300); // past checkInDelaySec — if the check-in had been armed, it would have delivered
   expect(h.prompts.length).toBe(1); // only the first wake — no check-in delivery during the pause
@@ -607,7 +607,7 @@ test("20: provider pause retry is ONE per deadline — a surviving pending check
   // (due = now + 300s — it never fires in this test, but its PENDING state
   // blocks the tick's disarm, keeping the watchdog alive across the deadline.)
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "sh1", status: "running", sessionID: S }]);
+  h.setShells([{ id: "sh1", status: "running", sessionID: S, background: true }]); // §54: background shell
   await h.emit(succeeded("e20a")); // in-flight boundary → hold + check-in armed
   expect(h.prompts.length).toBe(0);
   // Provider breaks: the in-flight gate holds the first errored boundary (no wake),

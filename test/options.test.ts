@@ -13,6 +13,9 @@ const EXPECTED_DEFAULTS: Options = {
   providerFailLimit: 2,
   providerPauseMs: 30 * 60 * 1000,
   foregroundShellBackgroundMs: 30 * 60 * 1000, // §52 (0 = disabled is a valid value)
+  foregroundNoticeCommandChars: 300, // §54 (0 = no command text is a valid value)
+  livenessMs: 5 * 60_000, // §54: §50 windows option ized
+  livenessCheckMs: 30_000,
   wakeText: undefined,
 };
 
@@ -29,6 +32,9 @@ test("empty input yields every default exactly", () => {
   expect(o.providerFailLimit).toBe(2);
   expect(o.providerPauseMs).toBe(30 * 60 * 1000);
   expect(o.foregroundShellBackgroundMs).toBe(30 * 60 * 1000); // §52: 30 min default
+  expect(o.foregroundNoticeCommandChars).toBe(300); // §54
+  expect(o.livenessMs).toBe(5 * 60 * 1000); // §54
+  expect(o.livenessCheckMs).toBe(30_000); // §54
   expect(o.wakeText).toBeUndefined();
   expect(o).toEqual(EXPECTED_DEFAULTS);
 });
@@ -39,6 +45,22 @@ test("§52: foregroundShellBackgroundMs — 0 is a valid value (disabled); non-i
   expect(resolveOptions({ foregroundShellBackgroundMs: -1 }).foregroundShellBackgroundMs).toBe(30 * 60 * 1000);
   expect(resolveOptions({ foregroundShellBackgroundMs: 1.5 }).foregroundShellBackgroundMs).toBe(30 * 60 * 1000);
   expect(resolveOptions({ foregroundShellBackgroundMs: "30000" }).foregroundShellBackgroundMs).toBe(30 * 60 * 1000);
+});
+
+test("§54: foregroundNoticeCommandChars — 0 is valid (no command text); non-integers fall back", () => {
+  expect(resolveOptions({ foregroundNoticeCommandChars: 0 }).foregroundNoticeCommandChars).toBe(0);
+  expect(resolveOptions({ foregroundNoticeCommandChars: 50 }).foregroundNoticeCommandChars).toBe(50);
+  expect(resolveOptions({ foregroundNoticeCommandChars: -1 }).foregroundNoticeCommandChars).toBe(300);
+  expect(resolveOptions({ foregroundNoticeCommandChars: "300" }).foregroundNoticeCommandChars).toBe(300);
+});
+
+test("§54: livenessMs / livenessCheckMs — positive integers take effect, invalid fall back", () => {
+  expect(resolveOptions({ livenessMs: 15_000 }).livenessMs).toBe(15_000);
+  expect(resolveOptions({ livenessCheckMs: 5_000 }).livenessCheckMs).toBe(5_000);
+  expect(resolveOptions({ livenessMs: 0 }).livenessMs).toBe(5 * 60 * 1000); // 0 is NOT valid here
+  expect(resolveOptions({ livenessCheckMs: -3 }).livenessCheckMs).toBe(30_000);
+  expect(resolveOptions({ livenessMs: "300000" }).livenessMs).toBe(5 * 60 * 1000);
+  expect(resolveOptions({ livenessCheckMs: 1.5 }).livenessCheckMs).toBe(30_000);
 });
 
 test("partial overrides take effect, the rest stay default", () => {

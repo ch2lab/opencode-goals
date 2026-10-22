@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createGoal, type GoalNextStep, type GoalRecord, type GoalTask } from "../src/state.ts";
-import { backgroundCheckInText, buildWakeMessage, providerPauseRetryText } from "../src/wake.ts";
+import { backgroundCheckInText, buildWakeMessage, foregroundBackgroundNoticeText, providerPauseRetryText } from "../src/wake.ts";
 
 const NOW = 1_700_000_000_000;
 
@@ -343,4 +343,33 @@ test("the wake carries no objective/budget/task detail — tag + trigger only", 
   expect(msg).not.toContain("Budget:");
   expect(msg).not.toContain("1. [");
   expect(msg).not.toContain("2. [doing] 写测试");
+});
+
+// --- §54 (2026-10-22 ruling): the IMMEDIATE notice after the plugin
+// auto-backgrounds a foreground shell that outlived the goal's cap. One-off
+// per-shell — unlike the §51 periodic roster it DOES carry command text
+// (flattened + truncated); the caller pre-formats the duration labels. ---
+
+test("§54 foregroundBackgroundNoticeText: id + command + elapsed + cap, byte-pinned", () => {
+  const t = foregroundBackgroundNoticeText("sh_ab12", "cd /data && run checks", 300, "41m", "30m");
+  expect(t).toBe(
+    'opencode-goal: shell sh_ab12 (command: "cd /data && run checks") ran in the foreground for 41m, ' +
+      "over this goal's max foreground blocking time (30m) — the goal plugin moved it to background automatically. " +
+      "Check that the shell is still running healthily, then wait for its completion notification before continuing. " +
+      "A user message always overrides this reminder.",
+  );
+});
+
+test("§54 notice: command is flattened (newlines → spaces) and truncated with an ellipsis", () => {
+  const t = foregroundBackgroundNoticeText("sh_x", "line1\nline2\n" + "a".repeat(400), 10, "1m", "30s");
+  expect(t).toContain('(command: "line1 line…")');
+  expect(t).not.toContain("line2"); // truncated past the 10-char budget
+  expect(t).toContain("for 1m, over this goal's max foreground blocking time (30s)");
+});
+
+test("§54 notice: commandChars=0 omits the command; absent command = bare id", () => {
+  expect(foregroundBackgroundNoticeText("sh_x", "whatever", 0, "1m", "30m")).not.toContain("command");
+  const noCmd = foregroundBackgroundNoticeText("sh_x", undefined, 300, "1m", "30m");
+  expect(noCmd).toContain("shell sh_x ran in the foreground");
+  expect(noCmd).not.toContain("command");
 });

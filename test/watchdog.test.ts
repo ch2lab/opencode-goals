@@ -79,7 +79,12 @@ function ev(type: string, id: string, properties: Record<string, unknown>): Host
 }
 
 // schema/dist/session-event.d.ts (Shell.Started): data = { shell, sessionID }.
-function shellStarted(id: string, shell: { id: string; command: string; cwd: string }, sessionID = S): HostEvent {
+function shellStarted(
+  id: string,
+  shell: { id: string; command: string; cwd: string },
+  sessionID = S,
+  background?: boolean, // §54: unflagged = foreground shell
+): HostEvent {
   return ev("session.shell.started", id, {
     sessionID,
     shell: {
@@ -89,7 +94,7 @@ function shellStarted(id: string, shell: { id: string; command: string; cwd: str
       cwd: shell.cwd,
       shell: "bash",
       file: "script.sh",
-      metadata: {},
+      metadata: background ? { background: true } : {},
       time: { started: Date.now() },
     },
   });
@@ -144,7 +149,7 @@ test("1: shell in flight — the boundary arms the check (no wake); shell.ended 
   const { h, stop } = await boot(resolveOptions({ watchdogTickMs: 1, checkInDelaySec: 1 }));
   await h.commandExecutor(S, "/goal set Fast");
   h.setSession(S, { location: { directory: "/w" } }); // the shell-store query needs the session's location
-  await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }));
+  await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }, S, true));
   await h.emit(succeeded("b1")); // in-flight boundary → arm the check, no wake
   expect(h.prompts.length).toBe(0);
   expect(goalOf(h)!.lastHandledEventID).toBe("b1");
@@ -173,7 +178,7 @@ test("51: the check-in carries the in-flight roster (shell id + elapsed, no comm
   await h.commandExecutor(S, "/goal set Roster");
   h.setSession(S, { location: { directory: "/w" } });
   // A running shell (with the host-store start time) stays in the store when the check-in fires.
-  h.setShells([{ id: "sh_live", status: "running", sessionID: S, time: { started: Date.now() - 250_000 } }]);
+  h.setShells([{ id: "sh_live", status: "running", sessionID: S, background: true, time: { started: Date.now() - 250_000 } }]); // §54: background
   await h.emit(started("a1"));
   await h.emit(succeeded("b1")); // in-flight boundary → arms the check-in (no wake)
   expect(h.prompts.length).toBe(0);
@@ -181,7 +186,7 @@ test("51: the check-in carries the in-flight roster (shell id + elapsed, no comm
   const text = h.prompts[0].input.text;
   expect(text).toContain("Background check-in");
   expect(text).toContain("In flight now (no need to re-query)");
-  expect(text).toMatch(/sh_live \(\d+m\d+s\)/); // id + elapsed
+  expect(text).toMatch(/sh_live \(bg, \d+m\d+s\)/); // §54: kind label + id + elapsed
   expect(text).not.toContain("cmd"); // no command text (the ruling)
   await stop();
 });
@@ -196,7 +201,7 @@ test("3: progress check replied with pure text → the boundary stalls normally 
   const { h, stop } = await boot(resolveOptions({ watchdogTickMs: 1, checkInDelaySec: 1 }));
   await h.commandExecutor(S, "/goal set Text3");
   h.setSession(S, { location: { directory: "/w" } });
-  await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }));
+  await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }, S, true));
   await h.emit(succeeded("b1")); // in-flight boundary → arm the one-shot check
   await waitFor(() => h.prompts.length === 1, 3000, "progress check-in");
   expect(h.prompts[0].input.text).toContain("Background check-in");
@@ -217,7 +222,7 @@ test("4: cleanup — after stop() the tick is gone (no timer, no further activit
   const { h, ctrl, stop } = await boot(resolveOptions({ watchdogTickMs: 1, checkInDelaySec: 1 }));
   await h.commandExecutor(S, "/goal set Clean");
   h.setSession(S, { location: { directory: "/w" } });
-  await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }));
+  await h.emit(shellStarted("e1", { id: "sh1", command: "cmdA", cwd: "/w" }, S, true));
   await h.emit(succeeded("b1")); // arm → the tick is the deadline's heartbeat
   await waitFor(() => (ctrl as unknown as { wdTimers: Map<string, unknown> }).wdTimers.has(S), 2000, "tick armed");
   const shellCallsAtStop = h.shellListCalls;

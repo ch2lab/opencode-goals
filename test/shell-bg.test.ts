@@ -10,6 +10,8 @@
 //   T4 a young foreground shell (under the cap) is left alone
 
 import { test, expect } from "bun:test";
+import * as fs from "node:fs";
+import { decisionLogPath } from "../src/decisionlog";
 import { createHarness, type Harness } from "./harness";
 import { GoalController } from "../src/controller";
 import { resolveOptions } from "../src/options";
@@ -84,5 +86,56 @@ test("T4: a young foreground shell (under the cap) is left alone", async () => {
   ]);
   await sleep(300); // well under the cap
   expect(h.backgroundCalls.length).toBe(0);
+  await stop();
+});
+
+// --- §54 (2026-10-22 ruling): the auto-background is NOT silent — the plugin
+// delivers its own IMMEDIATE notice (one per shell) so the model knows WHAT was
+// moved, without waiting for the host's synthetic or the 5-minute cycle. ---
+
+test("T5: §54 on cap: exactly ONE immediate notice (goalControl, id + command + cap) + a decision line", async () => {
+  const { h, stop } = await boot(); // cap = 1000ms
+  await h.commandExecutor(S, "/goal set NoticeT5");
+  h.setSession(S, { location: { directory: "/w" } });
+  // The decision log file is shared across tests in this process — count deltas.
+  const countWatchdogLines = (): number => {
+    const raw = fs.readFileSync(decisionLogPath(process.pid), "utf8");
+    return raw
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((l) => l.sessionID === S && l.decision === "watchdog").length;
+  };
+  const before = countWatchdogLines();
+  h.setShells([
+    {
+      id: "sh_fg5",
+      status: "running",
+      sessionID: S,
+      command: "long maintenance script",
+      time: { started: Date.now() - 60_000 }, // a minute over the cap
+    },
+  ]);
+  expect(await until(() => h.backgroundCalls.length >= 1)).toBe(true); // the POST happened
+  expect(await until(() => h.prompts.length >= 1)).toBe(true); // the immediate notice
+  const notice = h.prompts[0];
+  expect(notice.input.metadata?.goalControl).toBe(true); // the watchdog wake channel
+  const text = notice.input.text;
+  expect(text).toContain("sh_fg5");
+  expect(text).toContain('(command: "long maintenance script")');
+  expect(text).toContain("moved it to background automatically");
+  expect(text).toContain("max foreground blocking time");
+  await sleep(400); // several more scans: deduped — still exactly one notice
+  expect(h.prompts.length).toBe(1);
+  expect(countWatchdogLines() - before).toBe(1); // the watchdog path left exactly one line
+  const raw = fs.readFileSync(decisionLogPath(process.pid), "utf8");
+  const mine = raw
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l) as Record<string, unknown>)
+    .filter((l) => l.sessionID === S && l.decision === "watchdog");
+  expect(String(mine[mine.length - 1].reason)).toContain("auto-backgrounded");
   await stop();
 });

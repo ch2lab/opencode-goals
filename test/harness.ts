@@ -455,9 +455,19 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
       // On the real host, model-originated shells get NO events; such entries
       // are injected directly via setShells in tests.
       if (event.type === "session.shell.started") {
-        const p = event.properties as { sessionID?: string; shell?: { id?: string; status?: string } };
+        const p = event.properties as {
+          sessionID?: string;
+          shell?: { id?: string; status?: string; metadata?: { background?: boolean } };
+        };
         if (p?.sessionID !== undefined && p.shell?.id !== undefined) {
-          shellStore.push({ id: p.shell.id, status: p.shell.status ?? "running", sessionID: p.sessionID });
+          shellStore.push({
+            id: p.shell.id,
+            status: p.shell.status ?? "running",
+            sessionID: p.sessionID,
+            // §54: the host store carries metadata.background; the event does
+            // too — a started shell with no flag is a FOREGROUND shell.
+            background: p.shell.metadata?.background,
+          });
         }
       } else if (event.type === "session.shell.ended") {
         const id = (event.properties as { shell?: { id?: string } })?.shell?.id;

@@ -93,7 +93,7 @@ test("in-flight own shell boundary counts decisions.hold (no wake)", async () =>
   const stop = await ctrl.start();
   await setGoalDirect(h);
   h.setSession(S, { location: { directory: "/work" } }); // shellList needs the directory
-  h.setShells([{ id: "sh1", status: "running", sessionID: S }]); // own in-flight shell
+  h.setShells([{ id: "sh1", status: "running", sessionID: S, background: true }]); // own in-flight shell (§54: unflagged = foreground)
   await h.emit(succeeded("e1")); // boundary with in-flight 1 → hold
   expect(h.prompts.length).toBe(0);
   expect(goalDecisions(h)).toEqual({ wake: 0, hold: 1, skip: 0, paused: 0 });

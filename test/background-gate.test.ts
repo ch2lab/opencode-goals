@@ -80,7 +80,7 @@ function usageUpdated(id: string, sid: string): HostEvent {
 }
 
 // schema pinned in watchdog.test.ts (session-event.d.ts Shell.Started)
-function shellStarted(id: string, shellID: string, sid = S): HostEvent {
+function shellStarted(id: string, shellID: string, sid = S, background?: boolean): HostEvent {
   return ev("session.shell.started", id, {
     sessionID: sid,
     shell: {
@@ -90,7 +90,8 @@ function shellStarted(id: string, shellID: string, sid = S): HostEvent {
       cwd: "/w",
       shell: "bash",
       file: "script.sh",
-      metadata: {},
+      // §54: unflagged = FOREGROUND shell; these tests model BACKGROUND work.
+      metadata: background ? { background: true } : {},
       time: { started: Date.now() },
     },
   });
@@ -117,7 +118,7 @@ test("1: regression — boundary with a waiting shell does not wake immediately 
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set ShellGate");
   h.setSession(S, { location: { directory: "/w" } }); // the store query needs the session's location
-  await h.emit(shellStarted("e1", "sh1"));
+  await h.emit(shellStarted("e1", "sh1", S, true)); // §54: background shell
   await h.emit(succeeded("b1", S)); // boundary while in flight → no wake
   expect(h.prompts.length).toBe(0);
   await stop();
@@ -179,7 +180,7 @@ test("5: real session activity (a new turn starting) cancels the timer (no check
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Cancel");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // own-in-flight boundary → timer armed (1s)
   await h.emit(started("c2", S)); // the session goes active again → cancel
@@ -192,7 +193,7 @@ test("6: boundary storm while in flight — every boundary re-arms, no immediate
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Storm");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground
   await h.emit(ev("session.inbox.enqueued", "i1", {
     sessionID: S,
     inboxID: "inbox_6",
@@ -210,7 +211,7 @@ test("7: goal_wait quiet — in-flight boundary arms nothing (no wake, no timer)
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Quiet");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground
   const reply = await h.toolExecutor("goal_wait", { minutes: 1 }, S);
   expect(reply).toContain("will not be woken");
   await modelWorked(h, "a");
@@ -232,12 +233,12 @@ test("9: due fires exactly once - pinned reminder text + goalControl metadata; a
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Fire9");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // own-in-flight boundary → arm (1s)
   await sleep(1500); // past due: the 1ms tick fires the one-shot
   expect(h.prompts.length).toBe(1);
-  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1, ["shX"])); // §51: roster rides along
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1, ["shX (bg)"])); // §51: roster rides along (§54: kind label)
   expect(h.prompts[0].input.metadata?.goalControl).toBe(true);
   await sleep(300); // one-shot: no recurrence before a re-arm
   expect(h.prompts.length).toBe(1);
@@ -253,7 +254,7 @@ test("9: due fires exactly once - pinned reminder text + goalControl metadata; a
   await h.emit(succeeded("b2", S));
   await sleep(1500);
   expect(h.prompts.length).toBe(2);
-  expect(h.prompts[1].input.text).toBe(backgroundCheckInText(1, 1, ["shX"])); // §51: re-arm fires with the roster too
+  expect(h.prompts[1].input.text).toBe(backgroundCheckInText(1, 1, ["shX (bg)"])); // §51: re-arm fires with the roster too
   await stop();
 });
 
@@ -265,7 +266,7 @@ test("11: due passes while the session is ACTIVE (lost-started belt) - held; onc
   const { h, ctrl, stop } = await boot();
   await h.commandExecutor(S, "/goal set Hold11");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // own-in-flight boundary → arm (1s)
   // simulate a lost execution.started: the host is active but we never saw it
@@ -282,7 +283,7 @@ test("12: quiet (goal_wait window) covers the deadline - no reminder is injected
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Quiet12");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground
   await h.toolExecutor("goal_wait", { minutes: 1 }, S); // waitUntil in force
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight boundary inside the window → armed nothing
@@ -295,7 +296,7 @@ test("13: terminal guard - goal cleared after arming: no ghost reminder, checkin
   const { h, ctrl, stop } = await boot();
   await h.commandExecutor(S, "/goal set Guard13");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // own-in-flight boundary → arm (1s)
   // /goal clear is fail-closed: it needs a user clear request in the transcript
@@ -314,12 +315,12 @@ test("14: stale shell (started, no ended) - no self-heal, no permanent silence: 
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Stale14");
   h.setSession(S, { location: { directory: "/w" } }); // the store query needs the session's location
-  await h.emit(shellStarted("e1", "sh1")); // the shell never reports its end
+  await h.emit(shellStarted("e1", "sh1", S, true)); // the shell never reports its end (§54: background)
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in flight (the stale shell) → arm
   await sleep(1500);
   expect(h.prompts.length).toBe(1); // a reminder — never a fabricated "lost"
-  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1, ["sh1"])); // §51: the stale shell is listed
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1, ["sh1 (bg)"])); // §51: the stale shell is listed (§54: kind label)
   expect(h.prompts[0].input.text).not.toContain("lost");
   await stop();
 });
@@ -332,7 +333,7 @@ test("15: store-only shell (no events — the model's background shell) holds th
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Store15");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "shX", status: "running", sessionID: S }]); // store truth, no events
+  h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground // store truth, no events
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // own running shell in the store → hold (no wake)
   expect(h.prompts.length).toBe(0);
@@ -390,7 +391,7 @@ test("18: in-flight boundary logs a hold decision (real counts, ownKnown)", asyn
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Log18");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "shX", status: "running", sessionID: S }]); // store truth, no events
+  h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground // store truth, no events
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // own running shell → hold
   expect(h.prompts.length).toBe(0);
@@ -435,7 +436,7 @@ test("21: late usage.updated / tool.called after a terminal boundary do NOT canc
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Straggler21");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // own-in-flight boundary → arm (1s)
   // the just-ended turn's bookkeeping events arrive AFTER the boundary
@@ -444,7 +445,7 @@ test("21: late usage.updated / tool.called after a terminal boundary do NOT canc
   await h.emit(toolCalled("t1", S));
   await sleep(1500); // past the deadline: the uncancelled check-in fires
   expect(h.prompts.length).toBe(1);
-  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1, ["shX"]));
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1, ["shX (bg)"]));
   await stop();
 });
 
@@ -634,7 +635,7 @@ test("31: reply to OUR check-in wake while user input is queued → HOLD (the §
   h.setSession(S, { location: { directory: "/w" } });
   // Arm the check-in (in-flight boundary) and let the 1ms tick fire it —
   // lastInbox is now our watchdog wake.
-  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight → hold, check-in armed (1s)
   await sleep(1500); // past due: the tick fires the check-in
@@ -662,12 +663,12 @@ test("32: a fired check-in logs a decision line (the watchdog path is observable
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set LogWatchdog32");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "shX", status: "running", sessionID: S }]);
+  h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in flight → hold (logged), check-in armed (1s)
   await sleep(1500); // past due: the 1ms tick fires the one-shot
   expect(h.prompts.length).toBe(1);
-  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1, ["shX"]));
+  expect(h.prompts[0].input.text).toBe(backgroundCheckInText(1, 1, ["shX (bg)"]));
   const line = lastDecision(S);
   expect(line?.decision).toBe("watchdog");
   expect(String(line?.reason)).toContain("check-in");

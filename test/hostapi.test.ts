@@ -181,9 +181,9 @@ test("shellList: GET /api/shell + x-opencode-directory header (URL-encoded) + Ba
   const r = await api.shellList("/proj");
   expect(r.state).toBe("ok");
   expect(r.value).toEqual([
-    { id: "sh1", status: "running", sessionID: "ses_abc" },
-    { id: "sh2", status: "exited", sessionID: undefined },
-    { id: "sh3", status: "running", sessionID: undefined },
+    { id: "sh1", status: "running", sessionID: "ses_abc", command: "sleep 60" }, // §54: command passthrough
+    { id: "sh2", status: "exited", sessionID: undefined, command: "ls" },
+    { id: "sh3", status: "running", sessionID: undefined, command: "npm test" },
   ]);
 });
 
