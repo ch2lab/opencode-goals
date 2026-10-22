@@ -6,7 +6,7 @@
 - 章节三段结构：`### 新增`（新功能/新工具/新命令）、`### 修复`（修了什么，含 incident 来源）、`### 优化与设计`（架构/行为变更/设计裁定）；可加 `### 验证`。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
-## [Unreleased]
+## [1.1.7] - 2026-10-22
 
 ### 新增
 - **前台 shell 超时自动转后台**（§52，2026-10-21 裁定）：goal 会话里**前台（阻塞式）** shell 运行超过 `foregroundShellBackgroundMs`（默认 30min，`0` = 关）→ 插件调宿主 `POST /api/session/:id/background`（TUI Ctrl+B 的服务端动作，2.1.1 活宿主 openapi.json + 源码双重实锤）——工作**保活转后台观察**（不杀），宿主自注入 synthetic 解除被阻塞的 turn。堵住"前台 shell 挂死 = turn 无边界 = 无 check-in = 循环永久失声"盲区（此前 §50 liveness 重查也被 in-flight 门 hold）。
