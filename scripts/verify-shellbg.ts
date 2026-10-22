@@ -129,11 +129,11 @@ async function main(): Promise<void> {
   // model to check the shell's health.
   const hasNotice = await waitUntil(async () => {
     const msgs = await host.api.context(S);
-    return msgs.some(
-      (m: any) =>
-        String(m?.text ?? "").includes("moved it to background automatically") &&
-        (shell === undefined || String(m?.text ?? "").includes(shell.id)),
-    );
+    const sid = shell?.id;
+    return msgs.some((m: any) => {
+      const t = String(m?.text ?? "");
+      return t.includes("moved it to background automatically") && (sid === undefined || t.includes(sid));
+    });
   }, CHECK_TIMEOUT_MS, "G4b: plugin immediate notice");
   check("G4b: the plugin's immediate notice landed (shell id + 'moved it to background automatically')", hasNotice, {
     sample: (await decisions()).map((d) => `${d.decision}:${d.reason}`),
