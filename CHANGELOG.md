@@ -7,6 +7,14 @@
 - 语言：**英文**（2026-10-22 裁定，适用于此后所有新版本：小节用 `### Added` / `### Fixed` / `### Optimizations & Design` / `### Verification`）；[1.1.7] 及更早章节保留原文。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
+## [Unreleased]
+
+### Fixed
+- **Every user message re-wake-injected on a resumed goal** (129 sm70 incident, 2026-10-23: one blocked goal was auto-resumed AND immediately re-woken on every user message — 5 times within an hour; the extra wake queued behind the user's own message): the §15-9 user-message resume path no longer injects an immediate wake — the status flips blocked→active (stalls cleared, stale blocker dropped) and the user message's own turn is the stimulus; the loop resumes at the next boundary under ordinary arbitration (spec §55).
+
+### Optimizations & Design
+- **Resume eligibility pinned (spec §55)**: a user message auto-resumes ONLY an unfinished goal waiting on the user (`blocked`); terminal goals (`completed` / `cleared` / `budget_limited` / `stalled`) are never auto-resumed — previously true in code, now spec-pinned with a regression test. The resume decision-log line is now `decision:"resume"` (was `wake`) — the log invariant "a line = a message actually in the queue" no longer applied once no message is injected. The explicit `/goal resume` command path is unchanged (its result line is the kick).
+
 ## [1.1.7] - 2026-10-22
 
 ### 新增

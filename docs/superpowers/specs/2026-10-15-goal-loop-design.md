@@ -267,7 +267,7 @@ type GoalRecord = {
 - **处置**：
   - JSON 解析失败 / verdict 不合法 → 按 `give_up` 处理（无依据就不延长自主性）；
   - `complete` → evidence 必须过 §9 证据门控，不过则降级为 `continue`；
-  - `needs_human` → `blocked`，blocker 记录裁判 reason。**唤醒条件（用户拍板）：本会话的任意用户消息即 resume**（订阅 `session.inbox.enqueued` 的用户消息事件，status 回 `active`、stalls 清零、注入唤醒），`/goal resume` 显式命令保留作为第二入口。
+  - `needs_human` → `blocked`，blocker 记录裁判 reason。**唤醒条件（用户拍板）：本会话的任意用户消息即 resume**（订阅 `session.inbox.enqueued` 的用户消息事件，status 回 `active`、stalls 清零；**2026-10-24 §55 修订：不再立即注入唤醒**——用户消息自己的 turn 是刺激物，循环在下一边界按正常仲裁恢复），`/goal resume` 显式命令保留作为第二入口。
   - `give_up` → `stalled`，报告含裁判 reason + 最后三轮原文 + 待办状态；
   - `continue` → stalls 归零、`judgeUsed=true`，下次唤醒携带 instruction。
 - **频率**：每个 goal 裁判至多一次（我的决定，防止裁判-唤醒互踢死循环）；
@@ -359,7 +359,7 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 6. 目标版本 2.0.29，从零设计（opencode2-goals 仅作先例）。
 7. 脚本等待策略：不预测脚本命运，只查事实——看门狗主动查 shell 状态/输出："退出→合成唤醒 / check-in 条件未满足→继续等 / check-in 条件满足（零增长超 `shellStallMs` 或有增长但超 `waitCheckInMs`）→ 状态核查唤醒，仅 idle 会话注入"；timeout 包装不强制（opt-in option，默认关）。
 8. goal_* 工具声明专属 `goal.control` 权限动作，沙箱精确自授（仅 active goal + 归属本实例）；无 active goal 不自授。
-9. blocked 唤醒条件：任意用户消息即 resume（保留 `/goal resume` 显式入口）。
+9. blocked 唤醒条件：任意用户消息即 resume（保留 `/goal resume` 显式入口；2026-10-24 §55：消息恢复不再立即注入唤醒，只翻状态）。
 
 **我的决定（评审时请重点看这几条）**：
 1. N=3（stall 阈值），option 可调；
@@ -863,4 +863,16 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 
 **测试**：stub——wake.test（notice 文案形态：带 command / 截断 / 0=无 / 换行压平）；background-gate（fg 边界 → hold 不武装，既有后台用例全部显式 `background: true` 并改带 `(bg)` 标签）；新 `fg-block.test.ts`（F1 fg 边界静默不武装 / F2 发时防御丢弃 / F3 liveness recheck 跳过）；shell-bg T5（超 cap → POST + 立即提醒 + 决策行）；options.test（三个新 option 解析）。
 **验证边界（2026-10-22 已验）**：stub 366/0 + typecheck（wake §54 文案形态 / background-gate 后台用例显式 `background:true` + `(bg)` 标签 / 新 `fg-block.test.ts` F1–F3 / shell-bg T5 / options 三新项含 0 合法值）。真宿主两批 **ALL PASS**（隔离宿主 2.1.2 + lab LLM）：`verify-shellbg.ts` **9/9**（cap 注入 5s，模型前台跑 `sleep 120`：G3 转后台日志行 → **G4b 插件立即提醒落会话**（shell id + command + "moved it to background automatically"）→ **G4c 决策行 `watchdog: foreground shell auto-backgrounded (cap 5s)`** → G5 进程保活 → G6 循环恢复边界节奏）；新 `verify-fgblock.ts` **8/8**（模型前台跑 `sleep 100`，`livenessMs` 注入 30s + 扫描 15s——旧行为约 45s 即伪造 recheck：F4 **阻塞 75s 内零 "Background check-in"**〔129 截图 bug 形态〕、F5 **零 "liveness recheck"**（静默=预期）、F6 未超 cap 零转后台、F7 阻塞结束后边界节奏恢复 `wake: boundary (in-flight 0)`）。
+
+## 55. 2026-10-24 裁定 — user-message 恢复只碰未完成的 goal，且不再立即注入唤醒
+
+**裁定来源（用户 2026-10-24，129 sm70 现场驱动）**：goal `g_mvl7th06_l`（blocked，工作已实际完成、模型 park 在 block 上）在 10-23 晚 17:12–18:03 一个小时内被 §15-9 路径触发 **5 次**——用户每发一条消息，插件就把该 blocked goal 翻回 active 并**立即注入一次额外唤醒**（决策日志 `decision:"wake", reason:"user message resumed blocked goal"` 5 行实锤）。用户裁定两条：
+1. **恢复资格**：用户消息只自动恢复**未完成且在等**的 goal（`blocked`）；`completed` / `cleared` / `budget_limited` / `stalled` 一律不碰（现状代码本就只认 `blocked`——本次是写进 spec 钉死，防未来放宽）。
+2. **不再立即唤醒**：恢复只做状态翻转（blocked→active、stalls 清零、清陈 blocker——§23 不变），**删掉路径里的 `injectWake`**：用户消息自己的 turn 就是刺激物（宿主投递消息即跑模型 turn），循环在下一边界按普通仲裁恢复（active goal 该醒才醒）——不再在队列里多发一发。
+3. **日志语义修正**：该路径的决策行从 `decision:"wake"` 改为 **`decision:"resume"`**——决策行不变式是"行 = 队列里真的有一条消息"（§46），不注入消息却记 "wake" 会破坏 129 侧取证；`bumpGoalDecision` 的 wake 桶也不再被这条路径消耗。用户当轮明确**不加**防呆（如"同一 goal 反复 block→resume N 次后停止自动恢复"）。
+
+**实现**：`src/controller.ts` `onInboxEnqueued` 的 §15-9 分支（去 `injectWake` + `bumpGoalDecision`，appendDecision 改 `decision:"resume"`）；`DecisionEntry.decision` 联合类型加 `"resume"`。`/goal resume` 显式命令面**不变**（§37：命令入口保留注入唤醒——显式动作的 kick 语义，§49-rev 同款）。
+
+**测试**：`judge-integration.test.ts` 既有 blocked-resume 用例改断言（状态翻转保留；`prompts.length` 不增 = 无立即唤醒；决策行 `decision:"resume"`）；`goal-loop.test.ts` 新增钉死"终态 goal（completed）遇用户消息不翻状态、无日志、无注入"。
+**验证边界（待 2026-10-24 真宿主补记）**：verify 批——blocked goal + 用户消息 → 决策行 `resume`（新值实锤新代码在真宿主跑）+ 用户消息与模型回复之间无插件唤醒消息。
 

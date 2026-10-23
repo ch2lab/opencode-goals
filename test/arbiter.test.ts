@@ -387,7 +387,7 @@ test("7: interrupt — user no wake / inactivity wakes (normal boundary) / shutd
 // 8. blocked resume
 // ---------------------------------------------------------------------------
 
-test("8: blocked + user inbox resumes (active, stalls 0, wake); same inboxID never resumes twice", async () => {
+test("8: blocked + user inbox resumes (active, stalls 0) — §55: NO immediate wake; same inboxID never resumes twice", async () => {
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Blocked");
   const reply = await h.toolExecutor("goal_block", { reason: "external dependency down" }, S);
@@ -401,13 +401,13 @@ test("8: blocked + user inbox resumes (active, stalls 0, wake); same inboxID nev
   // 2026-10-18 (129 incident: active goal still carried its stale blocker
   // text after a user-message resume, reading as "still blocked"):
   expect(after.blocker).toBeUndefined();
-  expect(h.prompts.length).toBe(1);
-  expect(h.prompts[0].input.metadata?.goalWake).toBe(true);
-  expect(h.prompts[0].input.metadata?.goalID).toBe(g.id);
-  expect(after.used.turns).toBe(1);
-  expect(after.continuations).toBe(1);
+  // §55 (2026-10-24 ruling): no immediate injected wake — the user message's
+  // own turn is the stimulus; the loop resumes at the next boundary.
+  expect(h.prompts.length).toBe(0);
+  expect(after.used.turns).toBe(0);
+  expect(after.continuations).toBe(0);
   await h.emit(enqueuedUser("i1")); // same inboxID → no second resume
-  expect(h.prompts.length).toBe(1);
+  expect(h.prompts.length).toBe(0);
   expect(goalOf(h)!.status).toBe("active");
   await stop();
 });

@@ -1095,6 +1095,17 @@ export class GoalController {
     this.lastInbox.set(sessionID, entry);
 
     // spec §15-9 blocked resume: blocked goal + user inbox item → active.
+    // §55 (2026-10-24 ruling, 129 incident: one blocked goal was re-resumed
+    // AND re-woken on every user message — 5 times in an hour):
+    //  (1) ONLY an unfinished goal waiting on the user (status "blocked") is
+    //      auto-resumed — terminal goals (completed / cleared / budget_limited
+    //      / stalled) are NEVER touched by a user message;
+    //  (2) NO immediate injected wake: the user message's own turn is the
+    //      stimulus — the loop resumes at the next boundary under ordinary
+    //      arbitration (which injects a wake if and only if the goal still
+    //      needs one). The resume is logged as a state-change line
+    //      (decision "resume"), not a "wake" line (the log invariant "line =
+    //      a message actually in the queue" no longer applies — none is).
     if (itemType === "user") {
       const goal = await this.loadGoal(sessionID);
       if (goal !== undefined && goal.status === "blocked" && !this.resumeInbox.has(inboxID)) {
@@ -1110,9 +1121,6 @@ export class GoalController {
         // /goal view and to the model's own context. The reason lives on
         // in the transcript (the block synthetic), not in the live record.
         goal.blocker = undefined;
-        // §49: the resume re-wake is logged — previously this path re-woke
-        // the goal with no decisions line at all ("有消息无日志").
-        bumpGoalDecision(goal, "wake");
         await appendDecision({
           ts: new Date().toISOString(),
           sessionID,
@@ -1120,12 +1128,9 @@ export class GoalController {
           own: 0,
           other: 0,
           ownKnown: true,
-          decision: "wake",
-          reason: `user message resumed blocked goal (§15-9)`,
+          decision: "resume",
+          reason: "user message resumed blocked goal (§15-9/§55, no immediate wake)",
         });
-        // injectWake bumps used.turns / continuations in memory; the save
-        // below persists everything (status, stalls, usage) in one write.
-        await this.injectWake(goal);
         await this.saveGoal(goal);
       }
     }

@@ -244,14 +244,18 @@ test("4: needs_human — blocked with the judge's reason; a user inbox message r
   expect(notice.text).toContain("blocked");
   expect(notice.resume).toBe(false); // §48: blocked notice = record, not a host auto-wake
   expect(fake.calls).toBe(1);
-  // blocked-resume path (Task 8, spec §15-9): user inbox → active again.
+  // blocked-resume path (Task 8, spec §15-9, §55 2026-10-24 ruling: user inbox
+  // → active again — but NO immediate injected wake; the user message's own
+  // turn is the stimulus, the loop resumes at the next boundary).
+  const promptsBeforeResume = h.prompts.length;
   await h.emit(enqueuedUser("i_resume"));
   const after = goalOf(h)!;
   expect(after.status).toBe("active");
   expect(after.stalls).toBe(0);
-  expect(h.prompts[h.prompts.length - 1].input.metadata?.goalWake).toBe(true);
-  // §49: the resume re-wake is logged — previously "有消息无日志" (the user
-  // message re-woke the goal with no decisions line at all).
+  expect(h.prompts.length).toBe(promptsBeforeResume); // §55: no immediate wake injection
+  // §49/§55: the resume is logged (previously "有消息无日志"; §55 relabels the
+  // line "resume" — no message is in the queue, so "wake" would break the
+  // decision-log invariant).
   const resumeLines = fs
     .readFileSync(decisionLogPath(process.pid), "utf8")
     .trim()
@@ -260,7 +264,7 @@ test("4: needs_human — blocked with the judge's reason; a user inbox message r
     .map((l) => JSON.parse(l) as Record<string, unknown>)
     .filter((l) => l.sessionID === S && l.goalID === after.id && String(l.reason).includes("§15-9"));
   expect(resumeLines.length).toBeGreaterThanOrEqual(1);
-  expect(resumeLines[resumeLines.length - 1]!.decision).toBe("wake");
+  expect(resumeLines[resumeLines.length - 1]!.decision).toBe("resume");
   await stop();
 });
 

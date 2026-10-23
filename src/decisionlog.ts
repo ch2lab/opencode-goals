@@ -18,7 +18,7 @@ export interface DecisionEntry {
   /** §54: this session's running FOREGROUND shells at the boundary (0/absent = none). */
   fg?: number;
   ownKnown: boolean;
-  decision: "wake" | "hold" | "skip" | "watchdog";
+  decision: "wake" | "hold" | "skip" | "watchdog" | "resume";
   reason: string;
 }
 

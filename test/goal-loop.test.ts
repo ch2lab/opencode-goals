@@ -2,6 +2,8 @@
 // through the REAL GoalController.start() against the deterministic harness
 // (test/harness.ts). The 12 behavior groups are the Task 7 brief contract.
 import { expect, test } from "bun:test";
+import * as fs from "node:fs";
+import { decisionLogPath } from "../src/decisionlog.ts";
 import { resolveOptions } from "../src/options.ts";
 import { archivedGoalKey, goalStorageKey, type GoalRecord } from "../src/state.ts";
 import { GoalController } from "../src/controller.ts";
@@ -396,6 +398,38 @@ test("18: /goal resume rejects terminal states (completed stays hard-terminal, n
   await h.commandExecutor(S, "/goal resume");
   expect(goalOf(h)!.status).toBe("completed"); // untouched
   expect(h.prompts.length).toBe(before); // no wake
+  await stop();
+});
+
+test("18b: §55 — a USER MESSAGE does not auto-resume a terminal goal (only unfinished/blocked qualifies)", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set Terminal55");
+  h.setMessages(S, [EVIDENCE_MESSAGE]);
+  await h.toolExecutor("goal_complete", { evidence: EVIDENCE }, S);
+  expect(goalOf(h)!.status).toBe("completed");
+  const before = h.prompts.length;
+  // The decision log is shared across test files in this process — assert the
+  // DELTA for this goal, not global absence.
+  const resumeLineCount = (): number => {
+    const p = decisionLogPath(process.pid);
+    const raw = fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "";
+    const gid = goalOf(h)!.id;
+    return raw
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((l) => l.sessionID === S && l.goalID === gid && String(l.reason ?? "").includes("§15-9")).length;
+  };
+  const linesBefore = resumeLineCount();
+  await h.emit(ev("session.inbox.enqueued", "q_55", {
+    sessionID: S,
+    inboxID: "inbox_55",
+    item: { type: "user", payload: { text: "anything at all" }, delivery: "queue" },
+  }));
+  expect(goalOf(h)!.status).toBe("completed"); // terminal = never auto-resumed by a message
+  expect(h.prompts.length).toBe(before); // and nothing injected
+  expect(resumeLineCount()).toBe(linesBefore); // no §15-9 resume line for this goal
   await stop();
 });
 
