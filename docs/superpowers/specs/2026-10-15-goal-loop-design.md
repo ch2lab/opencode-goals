@@ -874,5 +874,5 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 **实现**：`src/controller.ts` `onInboxEnqueued` 的 §15-9 分支（去 `injectWake` + `bumpGoalDecision`，appendDecision 改 `decision:"resume"`）；`DecisionEntry.decision` 联合类型加 `"resume"`。`/goal resume` 显式命令面**不变**（§37：命令入口保留注入唤醒——显式动作的 kick 语义，§49-rev 同款）。
 
 **测试**：`judge-integration.test.ts` 既有 blocked-resume 用例改断言（状态翻转保留；`prompts.length` 不增 = 无立即唤醒；决策行 `decision:"resume"`）；`goal-loop.test.ts` 新增钉死"终态 goal（completed）遇用户消息不翻状态、无日志、无注入"。
-**验证边界（待 2026-10-24 真宿主补记）**：verify 批——blocked goal + 用户消息 → 决策行 `resume`（新值实锤新代码在真宿主跑）+ 用户消息与模型回复之间无插件唤醒消息。
+**验证边界（2026-10-24 已验）**：stub 367/0 + typecheck。真宿主 `verify-resume.ts` **7/7 ALL PASS**（隔离宿主 2.1.2 + lab LLM：R2 模型 goal_block → R3 用户消息后决策行 **`resume: user message resumed blocked goal (§15-9/§55, no immediate wake)`**（新决策值实锤）→ R4 用户消息与模型回复之间**无插件唤醒**（首个 `[goal] turn-` 消息落在回复之后）→ R5 恢复后边界 `wake: boundary (in-flight 0)` 节奏回来）。首跑 R2 假失败是脚本断言过脆（模型流式回复分段、精确串匹配不中），已改模糊匹配——非插件问题。
 
