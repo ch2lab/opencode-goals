@@ -42,7 +42,15 @@ async function main(): Promise<void> {
     // override the repo-default build).
     config: {
       plugins: [
-        { package: REPO_ROOT, options: { checkInDelaySec: CHECKIN_DELAY_SEC, watchdogTickMs: 2000 } },
+        {
+          package: REPO_ROOT,
+          // stallLimit: 100 — the countdown goal replies with pure text (no
+          // tool calls) and would self-stall after ~3 fast lab-LLM turns
+          // (2026-10-24 flake: the 3rd no-action boundary killed the goal
+          // before K2/K3 even ran — this test exercises the CHECK-IN path,
+          // not the stall ladder).
+          options: { checkInDelaySec: CHECKIN_DELAY_SEC, watchdogTickMs: 2000, stallLimit: 100 },
+        },
       ],
     },
   });

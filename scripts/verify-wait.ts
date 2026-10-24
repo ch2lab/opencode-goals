@@ -42,7 +42,14 @@ async function main(): Promise<void> {
     // Fast watchdog tick (the deadline's heartbeat); the check-in window is
     // irrelevant here (no in-flight work by design — the incident shape).
     config: {
-      plugins: [{ package: REPO_ROOT, options: { watchdogTickMs: 2000 } }],
+      plugins: [
+        {
+          package: REPO_ROOT,
+          // watchdogTickMs 2000 — fast deadline heartbeat; stallLimit 100 — the
+          // countdown goal's pure-text replies must not self-stall mid-test.
+          options: { watchdogTickMs: 2000, stallLimit: 100 },
+        },
+      ],
     },
   });
   console.log(`[verify-wait] isolated host up (port ${host.port}, pid ${host.pid}, dir ${host.directory})`);
