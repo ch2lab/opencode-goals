@@ -825,7 +825,8 @@ export class GoalController {
       if (goal === undefined || goal.status !== "active") continue;
       let directory: string | undefined;
       try {
-        directory = (await this.probe.sessionGet(sessionID))?.location?.directory;
+        const info = await this.probe.sessionGet(sessionID);
+        directory = info?.location?.directory;
       } catch {
         continue; // host context dead — retry next scan
       }
@@ -836,11 +837,19 @@ export class GoalController {
       } catch {
         continue; // shell store query failed — retry next scan
       }
+      // §56: a shell only BLOCKS a turn while the session's own turn is alive
+      // (host active map "running") — an idle session with a running shell is
+      // background work: nothing to rescue, and POSTing session.background
+      // for it would be a no-op with a misleading notice.
+      let active;
+      try {
+        active = await this.probe.activeSessions(directory);
+      } catch {
+        continue; // retry next scan
+      }
+      if (active[sessionID] !== "running") continue;
       for (const sh of shells) {
-        // §56: only a shell that carries `background === false` (an explicit
-        // FOREGROUND marker) blocks a turn and is eligible for backgrounding —
-        // an absent/true flag means the host already runs it in the background.
-        if (sh.sessionID !== sessionID || sh.status !== "running" || sh.background !== false) continue;
+        if (sh.sessionID !== sessionID || sh.status !== "running" || sh.background === true) continue;
         if (this.backgroundedShells.has(sh.id)) continue; // already moved
         const firstSeen = this.shellFirstSeen.get(sh.id) ?? now;
         const started = sh.time?.started ?? firstSeen;
@@ -888,19 +897,28 @@ export class GoalController {
     return m >= 1 ? `${m}m` : `${Math.max(1, Math.round(ms / 1000))}s`;
   }
 
-  /** §54 (2026-10-22 ruling; §56 criterion 2026-10-24): this session's RUNNING
-   * FOREGROUND (blocking) shell ids — a foreground entry carries
-   * `background === false` explicitly; absent/true = background. While any of
-   * them is in flight the stream silence is EXPECTED (the turn is stuck on the
-   * tool call), not a dead stream. Query failure returns [] (callers fail
-   * open: the §50 recheck / the delivery proceed). */
-  private async foregroundShellIds(sessionID: string): Promise<string[]> {
+  /** §54/§56 (2026-10-24 host-contract forensics): this session's running
+   * shells that are ACTUALLY BLOCKING a turn — a shell is blocking only while
+   * the host's ACTIVE MAP says the session's turn is "running" (the UI's own
+   * signal; a turn blocked on a foreground shell IS running) AND the entry is
+   * not an explicit `background: true` (server-fired). Idle session + running
+   * shell = background work, NOT blocking (the §54 "absent flag" misread is
+   * dead — model-shell entries never carry the flag at all). While any of
+   * these is in flight the stream silence is EXPECTED (the turn is stuck on
+   * the tool call), not a dead stream. Query failure returns [] (callers
+   * fail open: the §50 recheck / the delivery proceed). */
+  private async blockingShellIds(sessionID: string): Promise<string[]> {
     try {
       const info = await this.probe.sessionGet(sessionID);
       const directory = info?.location?.directory;
       if (directory === undefined) return [];
-      return (await this.probe.shellList(directory))
-        .filter((e) => e.sessionID === sessionID && e.status === "running" && e.background === false)
+      const [shells, active] = await Promise.all([
+        this.probe.shellList(directory),
+        this.probe.activeSessions(directory),
+      ]);
+      if (active[sessionID] !== "running") return []; // no live turn → nothing is blocking
+      return shells
+        .filter((e) => e.sessionID === sessionID && e.status === "running" && e.background !== true)
         .map((e) => e.id);
     } catch {
       return [];
@@ -926,7 +944,7 @@ export class GoalController {
       // active flag — the 129 2026-10-22 screenshot chain). A failed query
       // above returned [] → the recheck proceeds (a truly dead host must
       // still be able to self-heal).
-      if ((await this.foregroundShellIds(sessionID)).length > 0) continue;
+      if ((await this.blockingShellIds(sessionID)).length > 0) continue;
       this.recheckAt.set(sessionID, now);
       console.warn(
         `opencode-goal: liveness recheck for ${sessionID} — no events for ` +
@@ -1205,7 +1223,7 @@ export class GoalController {
     sessionID: string,
   ): Promise<{ own: number; other: number; queued: number; fg: number; ownKnown: boolean }> {
     let own = 0;
-    let fg = 0; // §54: running FOREGROUND (blocking) shells of THIS session
+    let fg = 0; // §56: running shells that are ACTUALLY BLOCKING a turn (see below)
     let queued = 0;
     let ownKnown = true;
     let directory: string | undefined;
@@ -1217,7 +1235,26 @@ export class GoalController {
           (e) => e.sessionID === sessionID && e.status === "running",
         );
         own = running.length;
-        fg = running.filter((e) => e.background === false).length; // §56: absent flag = BACKGROUND (host contract)
+        // §56 (2026-10-24 host-contract forensics, oc-src + 129): the shell
+        // store's `metadata.background` is UNRELIABLE — the model tool path
+        // never writes it (fg AND bg model shells alike), server-fire writes
+        // `true`, Ctrl+B / session.background never touch the store entry.
+        // A shell BLOCKS the loop only while the session's turn is alive —
+        // the host's own active map (the UI's running badge): blocking =
+        // active map "running" ∧ a non-`background:true` shell of this
+        // session is in the store. Idle session + running shell = background
+        // item (normal 5-minute check-in semantics).
+        // A failed active-map query degrades to "nothing blocking" (fail-open,
+        // like the subtask query) — the shell query above still succeeded, so
+        // this boundary proceeds instead of skipping.
+        let active: Record<string, string> = {};
+        try {
+          active = await this.probe.activeSessions(directory);
+        } catch {
+          // host alive but the active-map query failed — assume not running
+        }
+        const sessionRunning = active[sessionID] === "running";
+        fg = running.filter((e) => e.background !== true && sessionRunning).length;
       }
       // 2026-10-20 queued-input ruling: undelivered inbox items (queued user
       // messages, synthetic results, compaction/move control items — all
@@ -1322,15 +1359,17 @@ export class GoalController {
         return m > 0 ? `${m}m${s % 60}s` : `${s}s`;
       };
       const items: string[] = [];
-      const shells = (await this.probe.shellList(directory)).filter(
-        (e) => e.sessionID === sessionID && e.status === "running",
-      );
+      const [shellsRaw, active] = await Promise.all([
+        this.probe.shellList(directory),
+        this.probe.activeSessions(directory),
+      ]);
+      const shells = shellsRaw.filter((e) => e.sessionID === sessionID && e.status === "running");
       for (const sh of shells) {
-        // §54/§56: label the effective kind — an explicit `background === false`
-        // entry is FOREGROUND; absent/true = background. (An fg entry would
-        // only be listed here if the fire-time guard let one through — the
-        // label stays honest either way.)
-        const kind = sh.background === false ? "fg" : "bg";
+        // §56: kind = effective blocking state — a `background: true` entry
+        // (server-fired) is always bg; anything else blocks only while the
+        // session's own turn is alive (active map). At fire time the session
+        // is idle (the guard discards a blocked turn), so this is normally bg.
+        const kind = sh.background === true || active[sessionID] !== "running" ? "bg" : "fg";
         items.push(
           sh.time?.started !== undefined
             ? `${sh.id} (${kind}, ${elapsed(sh.time.started)})`
@@ -2191,7 +2230,7 @@ export class GoalController {
       // shell started (an edge the event path makes rare), it STILL cannot be
       // delivered to a blocked turn — discard it; the shell's end boundary
       // re-arms a fresh check.
-      if ((await this.foregroundShellIds(sessionID)).length > 0) {
+      if ((await this.blockingShellIds(sessionID)).length > 0) {
         this.checkinDue.delete(sessionID);
         console.warn(
           `opencode-goal: §54 check-in deadline discarded for ${sessionID} — its turn is blocked on a foreground shell`,

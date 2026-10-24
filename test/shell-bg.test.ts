@@ -47,6 +47,7 @@ test("T1: a foreground shell older than the cap is backgrounded — exactly once
   h.setShells([
     { id: "sh_fg", status: "running", sessionID: S, background: false, time: { started: Date.now() - 5000 } },  // §56: explicit false = foreground
   ]);
+  h.setActiveSessions({ [S]: "running" }); // §56: §52 rescues only a BLOCKED turn
   expect(await until(() => h.backgroundCalls.length >= 1)).toBe(true); // the POST happened
   await sleep(300); // several more scans
   expect(h.backgroundCalls).toEqual([S]); // exactly one POST for this shell
@@ -118,6 +119,7 @@ test("T5: §54 on cap: exactly ONE immediate notice (goalControl, id + command +
       time: { started: Date.now() - 60_000 }, // a minute over the cap
     },
   ]);
+  h.setActiveSessions({ [S]: "running" }); // §56: §52 rescues only a BLOCKED turn
   expect(await until(() => h.backgroundCalls.length >= 1)).toBe(true); // the POST happened
   expect(await until(() => h.prompts.length >= 1)).toBe(true); // the immediate notice
   const notice = h.prompts[0];

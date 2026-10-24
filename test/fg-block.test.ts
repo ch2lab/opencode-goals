@@ -87,7 +87,8 @@ test("F1: boundary with a running foreground shell → hold, NO check-in arm; un
   const { h, ctrl, stop } = await boot({ checkInDelaySec: 1 });
   await h.commandExecutor(S, "/goal set FGBlock");
   h.setSession(S, { location: { directory: "/w" } });
-  h.setShells([{ id: "sh_fg", status: "running", sessionID: S, background: false }]); // §56: explicit false = FOREGROUND
+  h.setShells([{ id: "sh_fg", status: "running", sessionID: S }]); // §56: blocking = live turn + non-bg shell
+  h.setActiveSessions({ [S]: "running" }); // the turn is alive (the UI's running badge)
   await h.emit(started("a1"));
   await h.emit(toolCalled("t1"));
   await h.emit(succeeded("b1")); // the blocked turn's (fabricated or real) terminal
@@ -102,6 +103,7 @@ test("F1: boundary with a running foreground shell → hold, NO check-in arm; un
   expect(h.prompts.length).toBe(0);
   // The foreground shell leaves the store → the next boundary resumes the loop.
   h.setShells([]);
+  h.setActiveSessions({});
   await h.emit(started("a2"));
   await h.emit(toolCalled("t2"));
   await h.emit(succeeded("b2"));
@@ -122,8 +124,9 @@ test("F2: an armed (background) check-in is discarded at due when a foreground s
   // The session goes on blocking: a foreground shell appears in the store.
   h.setShells([
     { id: "sh_bg", status: "running", sessionID: S, background: true },
-    { id: "sh_fg", status: "running", sessionID: S, background: false },
+    { id: "sh_fg", status: "running", sessionID: S },
   ]);
+  h.setActiveSessions({ [S]: "running" }); // §56: the guard keys on the live turn
   await sleep(1500); // due passes: the fire-time guard discards, never delivers
   expect(h.prompts.length).toBe(0);
   expect(any.checkinDue.has(S)).toBe(false); // discarded — the end boundary re-arms
@@ -141,13 +144,15 @@ test("F3: the §50 liveness recheck skips a session blocked on a foreground shel
   try {
     await h.commandExecutor(S, "/goal set LivenessSkip");
     h.setSession(S, { location: { directory: "/w" } });
-    h.setShells([{ id: "sh_fg", status: "running", sessionID: S, background: false }]); // blocking
+    h.setShells([{ id: "sh_fg", status: "running", sessionID: S }]); // §56: blocking = live turn + non-bg shell
+    h.setActiveSessions({ [S]: "running" });
     await h.emit(started("a1")); // an active turn whose events stop here (blocked shell)
     await sleep(1200); // many scan periods past the 300ms silence window
     expect(recheckCount()).toBe(0); // SKIPPED: the silence is expected, not a dead stream
     expect(h.prompts.length).toBe(0); // no fabricated boundary, no check-in
     // Control leg: unblock → the scan is alive and rechecks the stranded turn.
     h.setShells([]);
+    h.setActiveSessions({});
     expect(await until(() => recheckCount() > 0, 4000)).toBe(true);
   } finally {
     console.warn = origWarn;

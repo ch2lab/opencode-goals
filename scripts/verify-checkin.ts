@@ -108,7 +108,7 @@ async function main(): Promise<void> {
   check("K4: check-in fired (Background check-in message delivered)", fired, { present: text !== undefined });
   if (runningShell !== undefined && text !== undefined) {
     check("K4b: the roster lists the running shell by ID", text.includes(runningShell.id ?? ""), { text: text.slice(0, 400) });
-    check("K4c: the roster carries an elapsed time", /In flight now[\s\S]*?\(\d+m?\d+s\)/.test(text), { text: text.slice(0, 400) });
+    check("K4c: the roster carries an elapsed time", /In flight now[\s\S]*?\d+(?:m\s?\d+)?s\)/.test(text), { text: text.slice(0, 400) });
     check("K4d: NO command text in the reminder (the ruling)", !text.includes("sleep 90"), { text: text.slice(0, 400) });
   } else if (runningShell === undefined || text === undefined) {
     check("K4b: roster assertions skipped (no shell or no message)", false, { shell: runningShell?.id, message: text });

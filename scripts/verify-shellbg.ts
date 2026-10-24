@@ -97,16 +97,33 @@ async function main(): Promise<void> {
   await host.api.prompt(
     S,
     "Automated goal-loop test. Use your shell tool to run exactly: sleep 120 — in the FOREGROUND " +
-      "(blocking; do NOT use background mode) — then reply with the next countdown integer. " +
+      "(blocking; do NOT use background mode, do NOT set the background parameter to true) — then reply with the next countdown integer. " +
       "Do NOT call any goal_* tool.",
   );
   const sawShell = await waitUntil(async () => (await runningShell()) !== undefined, CHECK_TIMEOUT_MS, "G2: shell running");
   const shell = await runningShell();
+  const rawMeta = shell?.metadata ?? {};
   check("G2: the model's foreground shell is running in the host shell store", sawShell && shell !== undefined, {
-    shell: shell ? { id: shell.id, background: shell.metadata?.background ?? false } : undefined,
+    shell: shell ? { id: shell.id, rawMetadata: rawMeta } : undefined,
   });
-  if (shell?.metadata?.background === true) {
-    check("G2b: the shell is FOREGROUND (the model honored the instruction)", false, { shell });
+
+  // §56 precondition: the shell must actually BLOCK the turn (host active map
+  // "running") for §52 to apply. If the model launched it as background
+  // (turn completes, session goes idle), the plugin is CORRECT to leave it
+  // alone — branch B asserts exactly that instead.
+  const blocked = await waitUntil(async () => (await runningShell()) !== undefined && (await host.api.sessionActive())[S] === "running", 90_000, "G2c: blocking precondition");
+  check("G2c: the shell is actually BLOCKING the turn (active map running)", blocked, {
+    active: await host.api.sessionActive(),
+  });
+  if (!blocked) {
+    // Branch B: non-blocking (background) shell — §56 says §52 must NOT touch it.
+    await sleep(45_000); // several §52 scan periods
+    check("B1: no POST session.background for a NON-blocking shell (§56 — the 129 bug class)", !host.stdoutTail().includes("§52 foreground shell"), {
+      tail: host.stdoutTail().slice(-300),
+    });
+    await host.stop();
+    console.log(failures === 0 ? "\nALL PASS (branch B: background launch, plugin correctly hands off)" : `\n${failures} FAILURE(S)`);
+    process.exit(failures === 0 ? 0 : 1);
   }
 
   // G3: the plugin's scan (30s period) moves it to background after the cap.

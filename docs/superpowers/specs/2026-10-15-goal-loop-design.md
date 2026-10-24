@@ -876,14 +876,19 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 **测试**：`judge-integration.test.ts` 既有 blocked-resume 用例改断言（状态翻转保留；`prompts.length` 不增 = 无立即唤醒；决策行 `decision:"resume"`）；`goal-loop.test.ts` 新增钉死"终态 goal（completed）遇用户消息不翻状态、无日志、无注入"。
 **验证边界（2026-10-24 已验）**：stub 367/0 + typecheck。真宿主 `verify-resume.ts` **7/7 ALL PASS**（隔离宿主 2.1.2 + lab LLM：R2 模型 goal_block → R3 用户消息后决策行 **`resume: user message resumed blocked goal (§15-9/§55, no immediate wake)`**（新决策值实锤）→ R4 用户消息与模型回复之间**无插件唤醒**（首个 `[goal] turn-` 消息落在回复之后）→ R5 恢复后边界 `wake: boundary (in-flight 0)` 节奏回来）。首跑 R2 假失败是脚本断言过脆（模型流式回复分段、精确串匹配不中），已改模糊匹配——非插件问题。
 
-## 56. 2026-10-24 裁定 — shell 前台/后台判据翻转：`background === false` 才是前台（宿主契约实证）
+## 56. 2026-10-24 裁定 — shell 阻塞判据 = active map 交叉（store 的 background 字段不可用，两次误判的收口）
 
-**裁定来源（用户 2026-10-24，129 现场驱动）**：129 上一个"超 5min 的后台任务没触发 check-in"。取证：该 shell 是模型**以 `background: true` 启动**的后台脚本（转录工具调用入参实锤），而 shell store 条目里 **`metadata.background` 字段缺席**；对照 1.1.7 verify-shellbg G2（前台 `sleep 120` 的 store 条目 = `background: false` 显式存在）。宿主契约因此实锤：**前台 shell 条目显式携带 `background: false`；后台 shell（bg 启动或 Ctrl+B / session.background 转入）条目字段缺席**。§54 的判据 `background !== true` = 前台把它读反了——"缺席"被当成前台 → 1.1.8 在 129 上把模型启动的**所有后台 shell** 误判为"前台阻塞"：边界走 `fg=1` 静默分支（决策日志 4 行 `hold fg=1` 实证），5min check-in 全面停摆；且 §52 会在 30min 后对一个本来就在后台的 shell 错发"自动转后台 + 立即提醒"。
+**裁定来源（用户 2026-10-24，129 现场 + 上游源码双重驱动）**：129 上一个"超 5min 的后台脚本没触发 check-in"。取证链：
+1. **129 转录**：该脚本是模型以 `{"background": true}` 启动的后台 shell；其 store 条目 metadata **只有 `sessionID`，无 background 字段**
+2. **上游源码（oc-src 2.1.1）**：模型 shell 工具创建条目时**从不写 background 字段**（fg/bg 启动都一样，`tool/plugin/shell.ts:209` `metadata: { sessionID }`）；`background: true` 仅服务端 fire 路径（`POST /api/session/:id/shell`，`session/shell.ts:17`）会写；**Ctrl+B / `session.background` 走 jobs 层，从不改 store 条目**
+3. 由此 §54（"缺席 = 前台"）与 §56 第一稿（"显式 `background:false` = 前台"）都是错的——模型 shell 的 fg/bg 根本读不出这个字段；之前 verify 脚本里看到的 `background:false` 是脚本自己 `?? false` 填的
 
-**实现（判据四处翻转）**：`inFlightSignal.fg` / `foregroundShellIds`（liveness 跳过 + 发时防御）/ §52 扫描筛选 / roster 标签，统一改为 **`background === false` = 前台**；`true` 或**缺席** = 后台（缺席 = 后台是本条的核心契约钉死）。`ShellEntry.background` 注释同步改写。
-- 推论 1：会话空闲 + store 有 running shell（无 `background:false` 字段）= 后台项 → 边界照常武装 5min check-in（129 现象的修复）；
-- 推论 2：§52 只对"显式 `background: false`"的 shell 转后台——手动 Ctrl+B 过的、模型 bg 启动的都不会再被误转。
+**最终判据（本条钉死）**：一个 shell **阻塞循环** ⟺ 宿主 **active map 说本会话 turn 在飞（"running"，UI 的 running 徽标同源）** ∧ 该 shell 在 store 里 running 且 `background !== true`（排除服务端 fire 的显式后台）。推论：
+- 会话空闲 + store 有 running shell = **后台项** → 边界照常武装 5min check-in（129 现象的修复：手动 Ctrl+B 后 turn 释放、active map 清空，脚本仍在跑 = 后台）
+- turn 在飞 + 非 bg shell 在跑 = **阻塞** → §54 三件套（边界静默 / liveness 跳过 / 发时丢弃）+ §52 到 cap 转后台
+- §52 扫描只在 **active map running** 的会话上做（无阻塞可救时零 POST）
 
-**测试**：`fg-block.test.ts` F1–F3 的前台用例改显式 `background: false`（原"无标记=前台"假设废弃）；新增 **F4**：无标记 shell = 后台 → 边界武装 check-in 且到期投递、roster 标签 `(bg)`（宿主契约钉死）；`shell-bg.test.ts` T1/T3/T4/T5 同改。
-**验证边界（待 2026-10-24 真宿主补记）**：`verify-checkin.ts` 复跑（§54 误判下该用例会挂——模型 bg 启动的 `sleep` 触发不了 check-in——修复后必须复绿，是最直接的回归证明）+ `verify-fgblock.ts` 复跑（显式前台场景不回归）+ `verify-shellbg.ts` 复跑。
+**实现**：`inFlightSignal` 加一次 `activeSessions` 查询，`fg` = 阻塞计数；`foregroundShellIds` 更名 `blockingShellIds`（active-map 交叉）；§52 扫描加 active-map 门 + 过滤回 `background !== true`；roster 标签按 active map 定 fg/bg。`ShellEntry.background` 注释改写为上面的宿主契约。
+**测试**：fg-block F1–F3 的阻塞用例改置 `setActiveSessions({S: "running"})`（F3 对照腿清空）；新增 **F4**：无标记 shell + 会话空闲 → 边界武装 check-in 且到期投递、roster 标签 `(bg)`；shell-bg T1/T5 同样补 active map。
+**验证边界（待 2026-10-24 真宿主补记）**：`verify-checkin` 复跑（模型 bg 启动 `sleep` → check-in 必须照发——§54 误判下该用例必挂，是最直接回归证明；K4c 正则同步放开 `(bg, Ns)` 形态）+ `verify-shellbg`（加阻塞前置：模型真阻塞才走 §52 分支；模型若跑成后台 = 走"插件正确不碰"分支 B）+ `verify-fgblock`（加阻塞前置）。
 

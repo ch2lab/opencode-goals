@@ -186,13 +186,14 @@ export interface ShellEntry {
    * elapsed time. Optional: the harness may omit it (roster then shows the
    * bare id). */
   time?: { started?: number };
-  /** §52: the host's background marker. HOST CONTRACT (2026-10-24 dual real-host
-   * evidence, spec §56): a FOREGROUND (blocking) shell entry carries
-   * `background: false` EXPLICITLY; a BACKGROUND shell entry (launched with
-   * background:true, or moved via Ctrl+B / session.background) has the field
-   * ABSENT. So: `background === false` = foreground; `true` or absent =
-   * background. Treating "absent" as foreground (the §54 mistake) silenced
-   * check-ins for every model-launched background shell on 129. */
+  /** §56 host-contract forensics (2026-10-24, oc-src `tool/plugin/shell.ts` +
+   * 129 real host): ONLY the server-fire path (`POST /api/session/:id/shell`)
+   * writes `background: true` into `metadata`; MODEL tool shells never carry
+   * the field at all (foreground or background launches alike), and Ctrl+B /
+   * `session.background` never touch the store entry (the jobs layer does).
+   * Therefore a shell's EFFECTIVE blocking state is NOT readable from this
+   * flag — the controller derives it from the session's ACTIVE MAP (a turn is
+   * alive) ∩ this entry (non-`true`). */
   background?: boolean;
   /** §54 (2026-10-22 ruling): the command text (host shell store entry
    * `command`) — carried so the §52 immediate-notice can quote it (truncated);

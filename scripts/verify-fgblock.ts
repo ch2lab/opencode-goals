@@ -118,7 +118,13 @@ async function main(): Promise<void> {
   const sawShell = await waitUntil(async () => (await runningShell()) !== undefined, CHECK_TIMEOUT_MS, "F2: shell running");
   const shell = await runningShell();
   check("F2: the model's foreground shell is running in the host shell store", sawShell && shell !== undefined, {
-    shell: shell ? { id: shell.id, background: shell.metadata?.background ?? false } : undefined,
+    shell: shell ? { id: shell.id, rawMetadata: shell.metadata } : undefined,
+  });
+  // §56 precondition: it must actually BLOCK the turn (active map running) —
+  // otherwise there is nothing to suppress and the run is not a §54 test.
+  const blocked = await waitUntil(async () => (await runningShell()) !== undefined && (await host.api.sessionActive())[S] === "running", 60_000, "F2c: blocking");
+  check("F2c: the shell is actually BLOCKING the turn (active map running)", blocked, {
+    active: await host.api.sessionActive(),
   });
   const tBlocked = Date.now(); // the block window starts now
 
