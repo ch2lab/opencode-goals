@@ -498,7 +498,14 @@ function makeApi(baseUrl: string, password: string, project: string): Api {
     },
     context: async (sessionID) => j((await get(`/api/session/${sessionID}/context`)).text)?.data ?? [],
     inbox: async (sessionID) => j((await get(`/api/session/${sessionID}/inbox`)).text)?.data ?? [],
-    sessionActive: async () => j((await get("/api/session/active")).text) ?? {},
+    // GET /api/session/active responds {location, data: {sessionID: status}} —
+    // unwrap to the map (the type is Record<string,string>; the previous
+    // implementation returned the whole wrapper, silently breaking every
+    // `[sessionID]` lookup — idle gates were vacuously true).
+    sessionActive: async () => {
+      const body = j((await get("/api/session/active")).text) as { data?: Record<string, string> } | undefined;
+      return body?.data && typeof body.data === "object" ? body.data : {};
+    },
     modelList: async () => j((await get("/api/model")).text) ?? {},
   };
 }
