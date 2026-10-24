@@ -498,13 +498,19 @@ function makeApi(baseUrl: string, password: string, project: string): Api {
     },
     context: async (sessionID) => j((await get(`/api/session/${sessionID}/context`)).text)?.data ?? [],
     inbox: async (sessionID) => j((await get(`/api/session/${sessionID}/inbox`)).text)?.data ?? [],
-    // GET /api/session/active responds {location, data: {sessionID: status}} —
-    // unwrap to the map (the type is Record<string,string>; the previous
-    // implementation returned the whole wrapper, silently breaking every
-    // `[sessionID]` lookup — idle gates were vacuously true).
+    // GET /api/session/active responds {location, data: {sessionID: {type: "running"}}}
+    // — unwrap the envelope AND normalize the {type} value objects to the plain
+    // status string (mirroring src/hostapi.activeSessions; the plugin's own
+    // queries see the normalized map).
     sessionActive: async () => {
-      const body = j((await get("/api/session/active")).text) as { data?: Record<string, string> } | undefined;
-      return body?.data && typeof body.data === "object" ? body.data : {};
+      const body = j((await get("/api/session/active")).text) as { data?: Record<string, unknown> } | undefined;
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(body?.data ?? {})) {
+        if (typeof v === "string") out[k] = v;
+        else if (v && typeof v === "object" && typeof (v as Record<string, unknown>).type === "string")
+          out[k] = (v as Record<string, unknown>).type as string;
+      }
+      return out;
     },
     modelList: async () => j((await get("/api/model")).text) ?? {},
   };
