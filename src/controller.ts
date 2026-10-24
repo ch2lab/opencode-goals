@@ -44,6 +44,7 @@ import {
   backgroundCheckInText,
   buildWakeMessage,
   foregroundBackgroundNoticeText,
+  goalWaitExpiryText,
   providerPauseNoticeText,
   providerPauseRetryText,
 } from "./wake";
@@ -544,6 +545,8 @@ export class GoalController {
         name: "wait",
         description:
           "Suspend wake-ups for N minutes (integer 1..60) while waiting on something. " +
+          "The wait is a SILENCE window: at the deadline the loop re-wakes you with a " +
+          "'Goal wait period ended' notice (unconditional — it fires even if nothing else happens). " +
           "Gating: goal.control permission; requires an ACTIVE goal.",
         input: {
           type: "object",
@@ -629,10 +632,18 @@ export class GoalController {
     // containment, expressed on the host permission surface (R9 contract).
     this.probe.onPermissionHook((input) => this.permissionHook(input));
 
-    // (2026-10-17: restart reconciliation removed — the watchdog no longer
-    // fact-checks shells; a goal with waiting shells survives the restart as
-    // a persisted fact, and the host's own restart sweep resumes the session,
-    // whose next boundary re-arms the background gate.)
+    // §57 (2026-10-24 — the host reload incident, local desktop 2.1.4): a host
+    // LOCATION RE-INIT re-instantiates this plugin (observed ~hourly:
+    // "location services booted" + watcher reboots + provider/model/agent
+    // updated events). Every RUNNING tick timer dies with the old instance,
+    // and armed check-in deadlines (in-memory) die with it. Persisted goal
+    // deadlines survive (kv) — a pending goal_wait window or a providerPause
+    // retry must still fire. Re-arm the watchdog at start for every such goal:
+    // this is the restart reconciliation that was removed in 2026-10-17,
+    // re-added in its reload form (its old premise — "the host restart sweep
+    // resumes the session, whose next boundary re-arms" — failed on 2026-10-24:
+    // the session stayed idle and no boundary ever came).
+    void this.initRearm();
 
     // Task 8: single event loop (boundary arbiter + wake loop) over
     // probe.eventSubscribe() — spec §6 arbitration, §11 budget,
@@ -1584,8 +1595,11 @@ export class GoalController {
     // nothing is queued — spec §7.1: a check-in replied with pure text counts
     // per the stall ladder; a QUEUED user message always wins over (a) (the
     // wake would land in the queue behind it — 2026-10-20 re-review, C1);
-    // (b) goal_wait's waitUntil window silences EVERYTHING
-    // (record only: no wake, no arm, no stall accounting — "不消耗 stall 预算").
+    // (b) goal_wait's waitUntil window silences the boundary (no wake, no
+    // check-in arm, no stall accounting — "不消耗 stall 预算"). §57 (2026-10-24):
+    // the window's DEADLINE is itself a wake source — the watchdog tick fires
+    // the one-shot "Goal wait period ended" wake at waitUntil (runWatchdogTick);
+    // the window only silences the moments BEFORE it.
     const { own, other, queued, fg, ownKnown } = await this.inFlightSignal(sessionID);
     // Gate = own running shells + attributed subtask sessions (2026-10-18
     // amended ruling) + queued undelivered inbox input (2026-10-20 ruling: a
@@ -2184,6 +2198,35 @@ export class GoalController {
     }
   }
 
+  /**
+   * §57: the reload-tolerant start-time re-arm. Scan the persisted goals and
+   * ensure a running tick for every ACTIVE goal with a pending deadline wake:
+   * a goal_wait window (unfired — including an EXPIRED one that lost its
+   * delivery across the reload) or an unexpired providerPause (the tick is
+   * the retry's heartbeat). Fire-and-forget at start(): a failed scan is
+   * non-fatal — the next boundary re-arms the ordinary way.
+   */
+  private async initRearm(): Promise<void> {
+    try {
+      const entries = await this.probe.storageScan("goal/");
+      const now = Date.now();
+      for (const e of entries) {
+        const goal = e.value as GoalRecord | undefined;
+        if (goal === undefined || goal.status !== "active") continue;
+        const waitPending = goal.waitUntil !== undefined && goal.waitWakeSent !== true;
+        const pausePending = goal.providerPause !== undefined && now < goal.providerPause.until;
+        if (waitPending || pausePending) {
+          this.ensureWatchdog(goal.sessionID);
+          console.warn(
+            `opencode-goal: §57 init re-arm for ${goal.sessionID} — persisted deadline(s) survived the reload (waitUntil: ${goal.waitUntil ?? "-"}, providerPause: ${goal.providerPause?.until ?? "-"})`,
+          );
+        }
+      }
+    } catch (err) {
+      console.warn(`opencode-goal: §57 init re-arm scan failed:`, err);
+    }
+  }
+
   /** One tick per armed goal: at most one in flight (overlap guard). */
   private watchdogTick(sessionID: string): void {
     if (this.wdBusy.has(sessionID)) return;
@@ -2244,6 +2287,18 @@ export class GoalController {
         );
       }
     }
+    // §57 (2026-10-24 ruling): the goal_wait DEADLINE is a wake source. The
+    // one-shot "wait period ended" wake fires UNCONDITIONALLY — no idle gate,
+    // no quiet gate: a fully-idle session is exactly the parked case it must
+    // rescue (the 2026-10-24 local incident: quiet hold + a reload killed the
+    // only running timer, and nothing owned the waitUntil deadline). The
+    // marker is PERSISTED before delivery (providerPause-retry pattern): a
+    // reload cannot double-fire it, and a new goal_wait resets it.
+    if (goal.waitUntil !== undefined && now >= goal.waitUntil && goal.waitWakeSent !== true) {
+      goal.waitWakeSent = true;
+      await this.saveGoal(goal);
+      await this.deliverWatchdogWake(goal, goalWaitExpiryText(goal.id, goal.waitMinutes), "watchdog goal_wait expiry");
+    }
     // Provider pause deadline reached → fire ONE retry wake (retrySent: the
     // watchdog may stay alive across the deadline — a surviving pending
     // check-in blocks the disarm — and every tick must not re-fire). The
@@ -2259,11 +2314,15 @@ export class GoalController {
       await this.saveGoal(goal);
       await this.deliverWatchdogWake(goal, providerPauseRetryText(goal.id), "watchdog provider-pause retry");
     }
-    // Disarm only when nothing is pending: no deadline, and no UNEXPIRED
-    // provider pause (while armed, this tick IS the retry heartbeat).
+    // Disarm only when nothing is pending: no deadline, no UNEXPIRED provider
+    // pause (while armed, this tick IS the retry heartbeat), and no goal_wait
+    // window whose deadline wake has not fired yet (§57 — while armed, this
+    // tick is THAT heartbeat: a future window must still fire, an expired
+    // unfired one must still deliver).
     if (
       this.checkinDue.get(sessionID) === undefined &&
-      (goal.providerPause === undefined || now >= goal.providerPause.until)
+      (goal.providerPause === undefined || now >= goal.providerPause.until) &&
+      (goal.waitUntil === undefined || goal.waitWakeSent === true)
     ) {
       this.disarmWatchdog(sessionID);
     }
@@ -2954,8 +3013,21 @@ export class GoalController {
     if (goal.status !== "active") return `goal ${goal.id} is not active (status: ${goal.status})`;
     const waitUntil = Date.now() + minutes * 60_000;
     goal.waitUntil = waitUntil;
+    // §57: a new window is a NEW one-shot — reset the fired marker so this
+    // window's deadline gets its wake even if a previous one already did.
+    goal.waitWakeSent = false;
+    goal.waitMinutes = minutes;
     await this.saveGoal(goal);
-    return `goal ${goal.id} will not be woken for ${minutes} minutes (until ${new Date(waitUntil).toISOString()})`;
+    // §57: the deadline wake is owned by the TICK — arm it at call time. The
+    // old "record-only" semantics (nothing re-armed a tick for waitUntil) let
+    // a fully-idle session sleep past its own deadline forever (the 2026-10-24
+    // local incident); a quiet boundary arms nothing, and a plugin reload
+    // kills any running timer, so the call itself must own its heartbeat.
+    this.ensureWatchdog(sessionID);
+    return (
+      `goal ${goal.id} will not be woken for ${minutes} minutes (until ${new Date(waitUntil).toISOString()}); ` +
+      `at the deadline the loop re-wakes you with a "Goal wait period ended" notice`
+    );
   }
 
   // ------------------------------------------------------------------

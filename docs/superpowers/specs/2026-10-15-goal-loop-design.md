@@ -892,3 +892,22 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 **测试**：fg-block F1–F3 的阻塞用例改置 `setActiveSessions({S: "running"})`（F3 对照腿清空）；新增 **F4**：无标记 shell + 会话空闲 → 边界武装 check-in 且到期投递、roster 标签 `(bg)`；shell-bg T1/T5 同样补 active map。
 **验证边界（2026-10-24 已验）**：stub 368/0 + typecheck。真宿主三批 **ALL PASS**（隔离宿主 2.1.2 + lab LLM）：`verify-checkin.ts` **8/8**（§56 直接回归：服务端 fire 的后台 shell（rawMetadata 无 background 字段）→ 边界武装 → check-in 如期投递，roster `(bg, 22s)`）；`verify-fgblock.ts` **9/9**（模型真阻塞 `sleep 100`：F2c 阻塞前置过〔active map running〕→ F4 阻塞 75s 零 check-in / F5 零 recheck / F6 未超 cap 零转后台 → F7 边界恢复）；`verify-shellbg.ts` **10/10**（G2c 阻塞前置 → G3 超 cap POST → G4b 立即提醒 → G4c 决策行 `watchdog: foreground shell auto-backgrounded (cap 5s)` → G5 保活 → G6 循环恢复；脚本另加"模型跑成后台 = 插件正确不碰"分支 B）。附带修复：verify 基建 `sessionActive` 两处取值 bug（`{data}` 包装未解 + `{type}` 对象未归一——此前所有 idle 门恒真空过），插件侧 hostapi 归一化经核已正确。
 
+
+## 57. 2026-10-24 裁定 — goal_wait 到期 = 无条件唤醒（"wait 时间到"通知）+ 重载重武装（init re-arm）
+
+**裁定来源（用户 2026-10-24，本机现场驱动）**：用户报"goal_wait(4) 承诺 17:29 自动醒来复查，7 分钟没醒"。只读取证（本机 host 2.1.4 pid 16192 / 会话 ses_eadc5d261ffd…（"ch2.AI dev"）/ goal g_mvm6rnm8_0）：
+- 决策日志全量两行：17:19:23 `hold: in-flight (check-in armed)`（own=2，check-in 武装到 17:24:23）→ 17:25:08 `hold: in-flight, quiet window`（own=1，goal_wait 窗口生效）→ **此后零行**（17:29 到期、17:35 用户报障，均无唤醒无日志）。
+- host 日志实锤：**17:25:02-04 宿主 location 上下文整体重启**（`location services booted` + watcher 全停重建 + provider/model/agent/command updated 事件）→ **插件全部重新实例化**（`loading plugin @ch2lab/opencode-goals` ×4，seed 1.1.9）。此重启**每 ~1 小时一次**（15:22 / 16:24 / 17:25）。内存态全清：武装的 check-in 期限 + watchdog 定时器蒸发。
+- 代码缺口：`waitGoal` 只写 kv `waitUntil`，**不武装任何 tick**；`runWatchdogTick` 对 waitUntil **一无所知**（期限唤醒源不存在——spec §13/§42 "record-only" 的缺口）；quiet 分支不 ensureWatchdog；旧注释（2026-10-17"restart reconciliation 已移除"）假设"宿主重启 sweep 会 resume 会话、其边界重新武装"——本次会话全程空闲，**边界永远没来**。模型承诺"17:29 自动醒来"无任何机制背书（工具返回文本只说了"不会醒"）。
+
+**裁定（用户）**：goal_wait 到点必须触发一条**无条件唤醒**，内容表示 wait 时间到。
+
+**实现（§57 三件套）**：
+1. **waitUntil 期限唤醒**：`runWatchdogTick` 在 `now >= waitUntil && waitWakeSent !== true` 时发一次性 `goalWaitExpiryText`（"Goal wait period ended: …"）——**无 idle 门、无 quiet 门**（全空闲恰是它要救的停车形态；delivery:queue，turn 在飞就排队，到点必发）。`waitWakeSent` **持久化**于 goal 记录（providerPause.retrySent 同模式：重载不重放、不丢失）；新 goal_wait 调用重置旗标 + 记 `waitMinutes`（唤醒文案用）。
+2. **goal_wait 调用即武装 tick**（`ensureWatchdog`）——期限唤醒的心跳由调用方自己拥有，不依赖"恰好有边界武装"。disarm 条件同步收紧：`waitUntil !== undefined && waitWakeSent !== true` 期间 tick 不解武。
+3. **重载重武装（initRearm，D2）**：`start()` 里 storageScan 全部持久化 goal，凡 active 且**有未决期限唤醒**（waitUntil 旗标未发，含已过期未投递；providerPause 未过期——tick 是 retry 心跳）→ ensureWatchdog。这是 2026-10-17 移除的 restart reconciliation 以重载形态回归（旧前提"宿主 sweep resume 会话"已证伪）。
+- 工具描述与返回文本改诚实："期间静默；到点后 loop 会以 'Goal wait period ended' 通知无条件唤醒你"——模型下次承诺"X 分钟后自动复查"就是真的。
+- **边界不变**：quiet 窗口期间（到期前）仍抑制 check-in 与边界唤醒（background-gate 测试 7/12 语义保持）；到点唤醒是**窗口结束后**的独立事件。
+
+**测试**：新增 `test/wait-until.test.ts` W1-W4（W1 到期无条件一次性唤醒 + 调用即武装 + 发后解武；W2 重载后**已过期未投递**仍发——事故形态；W3 重载后**未到期**窗口重武装、不提前发；W4 新 goal_wait 重置一次性）。stub 372/0 + typecheck。
+**验证边界（待 2026-10-24 真宿主补记）**：`verify-wait.ts`（隔离宿主 + lab LLM：goal_wait(1) → ~60s+tick 内必须见到 "Goal wait period ended" 唤醒且仅一条；决策日志 `watchdog: watchdog goal_wait expiry` 行；重载重武装走 stub W2/W3 覆盖——真宿主无法可控触发 location 重启）。

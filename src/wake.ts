@@ -83,6 +83,20 @@ export function providerPauseRetryText(goalID: string): string {
   return `Provider pause retry: model requests were failing with a provider error (quota/funds) — retrying goal ${goalID}. If a request still fails, note it in your reply — the loop auto-pauses and retries at the next deadline; a clean turn resumes. A user message always overrides this reminder.`;
 }
 
+/**
+ * §57 (2026-10-24 ruling): the ONE deadline wake fired when a goal_wait
+ * period elapses — the "wait time is up" notification. Watchdog text family
+ * (no options.wakeText, like the check-in and the provider-pause retry).
+ * UNCONDITIONAL by ruling: it fires at the deadline regardless of in-flight
+ * work or quiet state — delivery is queue semantics, so a busy turn simply
+ * receives it on the next idle. `minutes` is the window length as chosen
+ * (absent = the window predates the field; the text stays honest without it).
+ */
+export function goalWaitExpiryText(goalID: string, minutes?: number): string {
+  const window = typeof minutes === "number" && minutes > 0 ? `${minutes}-minute ` : "";
+  return `Goal wait period ended: the ${window}goal_wait window you set has fully elapsed (goal ${goalID}). Check what you were waiting for — the result it was for is available now — and continue the goal. A user message always overrides this reminder.`;
+}
+
 // (2026-10-20 de-cap ruling: the header shows the bare wake counter only —
 // `turn N`, no cap denominator. See buildWakeMessage's doc.)
 

@@ -83,6 +83,15 @@ export interface GoalRecord {
    *  persisted before the field existed lack it until first decision. */
   decisions?: GoalDecisions;
   waitUntil?: number;
+  /** §57 (2026-10-24 ruling): the waitUntil deadline is a WAKE source — the
+   * watchdog fires ONE "wait period ended" wake at the deadline (unconditional:
+   * a session fully idle is exactly the parked case it must rescue).
+   * `waitWakeSent` = this window's one-shot wake already delivered — persisted,
+   * so a plugin reload neither double-fires nor loses it; a new goal_wait
+   * resets the flag with the fresh window. `waitMinutes` = the window length
+   * as chosen (the wake text names it). */
+  waitWakeSent?: boolean;
+  waitMinutes?: number;
   /** Provider failure pause (2026-10-17 ruling, 129 quota incident): set when
    *  consecutive boundaries whose last assistant message carries a provider.*
    *  error reach `providerFailLimit`. Until `until` the loop is silent (no

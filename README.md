@@ -22,7 +22,7 @@ This plugin gives the host a goal state machine + a wake mechanism, so the model
 | Watchdog | No active checking: a boundary with background work in flight (shells / subtask sessions) does not wake — it arms a one-shot progress check that fires after `checkInDelaySec` of silence, and any activity cancels it. The check-in reminder lists the in-flight items by id and elapsed time (the model never has to re-query). Shell exits are not direct wakes — completion rides the progress check. |
 | Budget | **Unbounded by default**; tokens are stats-only by default — caps are opt-in. |
 | Task list | Tasks per goal are uncapped, `todo / doing / done` states, surfaced in wake messages / stall reports / the compaction `[GOAL STATE]` block. |
-| Wait declaration `goal_wait` | The model declares "I'm waiting" and suspends for N minutes (integer 1–60), without consuming the stall budget. |
+| Wait declaration `goal_wait` | The model declares "I'm waiting" and suspends for N minutes (integer 1–60), without consuming the stall budget. At the deadline the loop re-wakes with an UNCONDITIONAL "Goal wait period ended" notice (spec §57 — a fully-idle session is exactly the case it must rescue). |
 
 ## Install
 
@@ -154,7 +154,7 @@ All 12 tools declare the `goal.control` permission, and each shares the same imp
 | `goal_history` | Read-only; works without a goal. |
 | `goal_add_task` | Requires a non-terminal goal; the task ledger is uncapped. |
 | `goal_update_task` | Requires a non-terminal goal with tasks; `status ∈ todo\|doing\|done`. |
-| `goal_wait` | Requires an active goal; suspends the wake for N minutes (integer 1–60), declares "I'm waiting", does not consume the stall budget. |
+| `goal_wait` | Requires an active goal; suspends the wake for N minutes (integer 1–60), declares "I'm waiting", does not consume the stall budget. At the deadline the loop fires ONE unconditional "Goal wait period ended" wake (persisted one-shot — survives a plugin reload; spec §57). |
 | `goal_pause` | Requires an active goal; suspends the loop (no wakes, no stall counting); resumed via `goal_resume` / `/goal resume`. |
 | `goal_resume` | Resumes from `paused` (silent) / `blocked` (stale blocker cleared + re-wake) / `budget_limited` (re-wake; a one-shot post-resume budget grace lets the resume's own boundary pass — the next over-cap boundary re-limits, spec §49); `completed` / `stalled` / `cleared` are hard-terminal. |
 | `goal_next_step` | No gating (recordable at any time); records the model's own next-step plan, persisted with the goal and replayed at the next wake. **If the session's goal has ended (completed/paused/blocked/stalled), the call re-activates it as a fresh phase** (counters reset, same cap, prior evidence archived); `cleared` / `budget_limited` stay terminal. |
