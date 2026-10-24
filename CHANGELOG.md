@@ -7,6 +7,11 @@
 - 语言：**英文**（2026-10-22 裁定，适用于此后所有新版本：小节用 `### Added` / `### Fixed` / `### Optimizations & Design` / `### Verification`）；[1.1.7] 及更早章节保留原文。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
+## [Unreleased]
+
+### Fixed
+- **Model-launched background shells were misclassified as FOREGROUND — their 5-minute check-ins never fired** (129, 2026-10-24: a background maintenance script ran >5 min with no progress check-in; the decision log showed repeated `hold fg=1` lines). Root cause: the host contract is **foreground entries carry an explicit `metadata.background: false`; background entries have the field ABSENT** (dual real-host evidence: the model's `background: true` tool calls produce unflagged store entries on 129; the foreground `sleep 120` entry carried `background: false` in verify-shellbg G2). §54 read "absent" as foreground. The criterion is now flipped in all four places (in-flight `fg` count, liveness recheck skip, fire-time guard, §52 scan + roster labels): `background === false` = foreground; `true` or absent = background (spec §56). Consequence also fixed: §52 no longer "auto-backgrounds" a shell that is already in the background.
+
 ## [1.1.8] - 2026-10-24
 
 ### Fixed

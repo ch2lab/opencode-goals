@@ -45,7 +45,7 @@ test("T1: a foreground shell older than the cap is backgrounded — exactly once
   await h.commandExecutor(S, "/goal set ShellBG");
   h.setSession(S, { location: { directory: "/w" } });
   h.setShells([
-    { id: "sh_fg", status: "running", sessionID: S, time: { started: Date.now() - 5000 } },
+    { id: "sh_fg", status: "running", sessionID: S, background: false, time: { started: Date.now() - 5000 } },  // §56: explicit false = foreground
   ]);
   expect(await until(() => h.backgroundCalls.length >= 1)).toBe(true); // the POST happened
   await sleep(300); // several more scans
@@ -70,7 +70,7 @@ test("T3: cap = 0 disables the feature entirely", async () => {
   await h.commandExecutor(S, "/goal set Off");
   h.setSession(S, { location: { directory: "/w" } });
   h.setShells([
-    { id: "sh_fg", status: "running", sessionID: S, time: { started: Date.now() - 5000 } },
+    { id: "sh_fg", status: "running", sessionID: S, background: false, time: { started: Date.now() - 5000 } },  // §56: explicit false = foreground
   ]);
   await sleep(400);
   expect(h.backgroundCalls.length).toBe(0);
@@ -82,7 +82,7 @@ test("T4: a young foreground shell (under the cap) is left alone", async () => {
   await h.commandExecutor(S, "/goal set Young");
   h.setSession(S, { location: { directory: "/w" } });
   h.setShells([
-    { id: "sh_young", status: "running", sessionID: S, time: { started: Date.now() - 100 } },
+    { id: "sh_young", status: "running", sessionID: S, background: false, time: { started: Date.now() - 100 } },  // §56
   ]);
   await sleep(300); // well under the cap
   expect(h.backgroundCalls.length).toBe(0);
@@ -113,6 +113,7 @@ test("T5: §54 on cap: exactly ONE immediate notice (goalControl, id + command +
       id: "sh_fg5",
       status: "running",
       sessionID: S,
+      background: false, // §56: explicit false = foreground
       command: "long maintenance script",
       time: { started: Date.now() - 60_000 }, // a minute over the cap
     },

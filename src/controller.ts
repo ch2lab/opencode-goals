@@ -837,7 +837,10 @@ export class GoalController {
         continue; // shell store query failed — retry next scan
       }
       for (const sh of shells) {
-        if (sh.sessionID !== sessionID || sh.status !== "running" || sh.background === true) continue;
+        // §56: only a shell that carries `background === false` (an explicit
+        // FOREGROUND marker) blocks a turn and is eligible for backgrounding —
+        // an absent/true flag means the host already runs it in the background.
+        if (sh.sessionID !== sessionID || sh.status !== "running" || sh.background !== false) continue;
         if (this.backgroundedShells.has(sh.id)) continue; // already moved
         const firstSeen = this.shellFirstSeen.get(sh.id) ?? now;
         const started = sh.time?.started ?? firstSeen;
@@ -885,17 +888,19 @@ export class GoalController {
     return m >= 1 ? `${m}m` : `${Math.max(1, Math.round(ms / 1000))}s`;
   }
 
-  /** §54 (2026-10-22 ruling): this session's RUNNING FOREGROUND (blocking)
-   * shell ids — while any of them is in flight the stream silence is EXPECTED
-   * (the turn is stuck on the tool call), not a dead stream. Query failure
-   * returns [] (callers fail open: the §50 recheck / the delivery proceed). */
+  /** §54 (2026-10-22 ruling; §56 criterion 2026-10-24): this session's RUNNING
+   * FOREGROUND (blocking) shell ids — a foreground entry carries
+   * `background === false` explicitly; absent/true = background. While any of
+   * them is in flight the stream silence is EXPECTED (the turn is stuck on the
+   * tool call), not a dead stream. Query failure returns [] (callers fail
+   * open: the §50 recheck / the delivery proceed). */
   private async foregroundShellIds(sessionID: string): Promise<string[]> {
     try {
       const info = await this.probe.sessionGet(sessionID);
       const directory = info?.location?.directory;
       if (directory === undefined) return [];
       return (await this.probe.shellList(directory))
-        .filter((e) => e.sessionID === sessionID && e.status === "running" && e.background !== true)
+        .filter((e) => e.sessionID === sessionID && e.status === "running" && e.background === false)
         .map((e) => e.id);
     } catch {
       return [];
@@ -1212,7 +1217,7 @@ export class GoalController {
           (e) => e.sessionID === sessionID && e.status === "running",
         );
         own = running.length;
-        fg = running.filter((e) => e.background !== true).length; // §54 (same criterion as the §52 scan)
+        fg = running.filter((e) => e.background === false).length; // §56: absent flag = BACKGROUND (host contract)
       }
       // 2026-10-20 queued-input ruling: undelivered inbox items (queued user
       // messages, synthetic results, compaction/move control items — all
@@ -1321,10 +1326,11 @@ export class GoalController {
         (e) => e.sessionID === sessionID && e.status === "running",
       );
       for (const sh of shells) {
-        // §54: label the kind (bg shells by definition here; an fg entry
-        // would mean the fire-time guard let one through — still label it
-        // honestly rather than call it "background").
-        const kind = sh.background === true ? "bg" : "fg";
+        // §54/§56: label the effective kind — an explicit `background === false`
+        // entry is FOREGROUND; absent/true = background. (An fg entry would
+        // only be listed here if the fire-time guard let one through — the
+        // label stays honest either way.)
+        const kind = sh.background === false ? "fg" : "bg";
         items.push(
           sh.time?.started !== undefined
             ? `${sh.id} (${kind}, ${elapsed(sh.time.started)})`

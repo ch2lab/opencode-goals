@@ -186,9 +186,13 @@ export interface ShellEntry {
    * elapsed time. Optional: the harness may omit it (roster then shows the
    * bare id). */
   time?: { started?: number };
-  /** §52: true when the shell runs in background observation (the host's
-   * `metadata.background` — Ctrl+B / session.background semantics). Absent
-   * or false = foreground (blocking) shell. */
+  /** §52: the host's background marker. HOST CONTRACT (2026-10-24 dual real-host
+   * evidence, spec §56): a FOREGROUND (blocking) shell entry carries
+   * `background: false` EXPLICITLY; a BACKGROUND shell entry (launched with
+   * background:true, or moved via Ctrl+B / session.background) has the field
+   * ABSENT. So: `background === false` = foreground; `true` or absent =
+   * background. Treating "absent" as foreground (the §54 mistake) silenced
+   * check-ins for every model-launched background shell on 129. */
   background?: boolean;
   /** §54 (2026-10-22 ruling): the command text (host shell store entry
    * `command`) — carried so the §52 immediate-notice can quote it (truncated);
