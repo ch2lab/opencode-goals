@@ -7,7 +7,7 @@
 - 语言：**英文**（2026-10-22 裁定，适用于此后所有新版本：小节用 `### Added` / `### Fixed` / `### Optimizations & Design` / `### Verification`）；[1.1.7] 及更早章节保留原文。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
-## [Unreleased]
+## [1.1.10] - 2026-10-24
 
 ### Fixed
 - **`goal_wait` deadlines never woke the loop — a goal waiting on something slept past its own deadline forever** (local host, 2026-10-24: the model called `goal_wait` for 4 minutes and told the user it would "automatically re-check at 17:29"; nothing happened for 7+ minutes). Root cause (decision log + host log forensics): `waitUntil` was a record-only quiet window — **nothing owned the deadline** (no wake source, and the only running watchdog timer had been killed six seconds earlier by a host location re-init that re-instantiates the plugin; the host does this ~hourly on the desktop app). The fix (spec §57): the watchdog now fires ONE unconditional **"Goal wait period ended"** wake at `waitUntil` (no idle/quiet gate — a fully-idle session is exactly the parked case it must rescue); the one-shot marker is persisted (a plugin reload neither double-fires nor loses the wake); the `goal_wait` call arms its own tick; and `start()` re-arms persisted pending deadlines after any reload (init re-arm — the removed 2026-10-17 restart reconciliation, re-added in reload form). The tool description and return text now promise the deadline wake honestly.
