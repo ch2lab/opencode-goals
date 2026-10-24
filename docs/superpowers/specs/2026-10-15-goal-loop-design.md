@@ -890,5 +890,5 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 
 **实现**：`inFlightSignal` 加一次 `activeSessions` 查询，`fg` = 阻塞计数；`foregroundShellIds` 更名 `blockingShellIds`（active-map 交叉）；§52 扫描加 active-map 门 + 过滤回 `background !== true`；roster 标签按 active map 定 fg/bg。`ShellEntry.background` 注释改写为上面的宿主契约。
 **测试**：fg-block F1–F3 的阻塞用例改置 `setActiveSessions({S: "running"})`（F3 对照腿清空）；新增 **F4**：无标记 shell + 会话空闲 → 边界武装 check-in 且到期投递、roster 标签 `(bg)`；shell-bg T1/T5 同样补 active map。
-**验证边界（待 2026-10-24 真宿主补记）**：`verify-checkin` 复跑（模型 bg 启动 `sleep` → check-in 必须照发——§54 误判下该用例必挂，是最直接回归证明；K4c 正则同步放开 `(bg, Ns)` 形态）+ `verify-shellbg`（加阻塞前置：模型真阻塞才走 §52 分支；模型若跑成后台 = 走"插件正确不碰"分支 B）+ `verify-fgblock`（加阻塞前置）。
+**验证边界（2026-10-24 已验）**：stub 368/0 + typecheck。真宿主三批 **ALL PASS**（隔离宿主 2.1.2 + lab LLM）：`verify-checkin.ts` **8/8**（§56 直接回归：服务端 fire 的后台 shell（rawMetadata 无 background 字段）→ 边界武装 → check-in 如期投递，roster `(bg, 22s)`）；`verify-fgblock.ts` **9/9**（模型真阻塞 `sleep 100`：F2c 阻塞前置过〔active map running〕→ F4 阻塞 75s 零 check-in / F5 零 recheck / F6 未超 cap 零转后台 → F7 边界恢复）；`verify-shellbg.ts` **10/10**（G2c 阻塞前置 → G3 超 cap POST → G4b 立即提醒 → G4c 决策行 `watchdog: foreground shell auto-backgrounded (cap 5s)` → G5 保活 → G6 循环恢复；脚本另加"模型跑成后台 = 插件正确不碰"分支 B）。附带修复：verify 基建 `sessionActive` 两处取值 bug（`{data}` 包装未解 + `{type}` 对象未归一——此前所有 idle 门恒真空过），插件侧 hostapi 归一化经核已正确。
 
