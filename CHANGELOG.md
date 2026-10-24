@@ -7,7 +7,7 @@
 - 语言：**英文**（2026-10-22 裁定，适用于此后所有新版本：小节用 `### Added` / `### Fixed` / `### Optimizations & Design` / `### Verification`）；[1.1.7] 及更早章节保留原文。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
-## [Unreleased]
+## [1.1.9] - 2026-10-24
 
 ### Fixed
 - **Model-launched background shells were misclassified as FOREGROUND — their 5-minute check-ins never fired, and §52 threatened to "auto-background" shells already in the background** (129, 2026-10-24: a background maintenance script ran >5 min with no progress check-in; the decision log showed repeated `hold fg=1` lines). Root cause (upstream source + 129 transcript forensics): the shell store's `metadata.background` is **not a usable fg/bg marker** — the model tool path never writes it (fg or bg launches alike), only server-fired shells carry `background: true`, and Ctrl+B / `session.background` never touch the store entry. The blocking state is now derived the way the host UI does it: **a shell blocks the loop only while the session's own turn is alive (host active map `"running"`) and its entry is not an explicit `background: true`** (spec §56). Consequences: an idle session with a running shell is a background item again (check-ins resume — the 129 symptom); §52 rescues only turns that are actually blocked; §54's silence rules (boundary / liveness recheck / fire-time guard) key off the same blocking signal.
