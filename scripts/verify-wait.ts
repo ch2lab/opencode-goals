@@ -10,6 +10,7 @@
 //   bun run scripts/verify-wait.ts
 
 import { join } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
 import { readdirSync, readFileSync } from "node:fs";
 import { startHost, labProvider, REPO_ROOT, type IsolatedHost } from "./host.ts";
 
@@ -54,6 +55,15 @@ async function main(): Promise<void> {
   });
   console.log(`[verify-wait] isolated host up (port ${host.port}, pid ${host.pid}, dir ${host.directory})`);
 
+  // The plugin's HTTP data plane (shell store / active map / inbox) resolves
+  // the host through state/opencode/service.json — a bare `serve` never writes
+  // it. Without it every boundary query fails ("host context dead") and the
+  // boundary is SKIPPED: W6c's "zero wakes" would pass for the WRONG reason
+  // (the quiet-window hold never executes). Write the host's own registration.
+  const svcDir = join(host.directory, "state", "opencode");
+  await mkdir(svcDir, { recursive: true });
+  await writeFile(join(svcDir, "service.json"), JSON.stringify({ url: host.baseUrl, pid: host.pid, password: host.password }));
+
   const S = await host.api.createSession();
   const idle = async (): Promise<boolean> => {
     try {
@@ -72,8 +82,10 @@ async function main(): Promise<void> {
     return out;
   };
 
-  // W0: set the goal (kick turn).
-  const stSet = await host.api.command(S, "goal", "set Endless countdown: each turn reply with the next integer counting DOWN from 100, nothing else. This goal is never completed. --turns 20");
+  // W0: set the goal (kick turn). --turns 1000: with the service.json registry
+  // the boundaries actually arbitrate (no more "host context dead" skips), so
+  // the countdown loop runs autonomously and would burn a 20-turn cap mid-test.
+  const stSet = await host.api.command(S, "goal", "set Endless countdown: each turn reply with the next integer counting DOWN from 100, nothing else. This goal is never completed. --turns 1000");
   check("W0: /goal set accepted", stSet >= 200, { status: stSet });
   check("W1: session idle after the kick turn", await waitUntil(idle, 90_000));
 
