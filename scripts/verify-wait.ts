@@ -124,6 +124,88 @@ async function main(): Promise<void> {
     dir: readdirSync(decDir).filter((f) => f.startsWith(`decisions-${host.pid}`)),
   });
 
+  // W6-W8: the 129 2026-10-25 STORM shape (spec §59): the model calls
+  // goal_wait, its turn ENDS (the gate-0 boundary), and nothing may wake the
+  // loop until the deadline. Pre-fix: every idle boundary WAKE'd the model
+  // (boundary in-flight 0), which re-called goal_wait — 25 continuations in
+  // ~2 minutes. Assert: quiet window silent → exactly one expiry at the
+  // deadline → quiet-window hold line in the decision log.
+  const { Database } = await import("bun:sqlite");
+  const dbPath = join(host.directory, "data", "opencode", "opencode.db");
+  const readGoal = (): { waitUntil?: number } | undefined => {
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const rows = db
+        .query("SELECT value FROM kv WHERE key LIKE ?")
+        .all(`${S}%`) as Array<{ value: string }>;
+      for (const r of rows) {
+        try {
+          const g = JSON.parse(r.value) as { status?: string; waitUntil?: number };
+          if (g.status === "active") return g;
+        } catch {
+          // keep scanning
+        }
+      }
+    } finally {
+      db.close();
+    }
+    return undefined;
+  };
+  const activityCount = async (): Promise<number> => {
+    const msgs = await host.api.context(S);
+    let n = 0;
+    for (const m of msgs) {
+      const t = String(m?.text ?? "");
+      if (t.includes("Goal wait period ended")) continue; // counted separately
+      n++;
+    }
+    return n;
+  };
+  const quietStart = Date.now();
+  await host.api.prompt(
+    S,
+    "Automated goal-loop test. Call the goal_wait tool with minutes set to 2. " +
+      "After the tool returns, reply with exactly: waiting — and stop. " +
+      "Do NOT call any other tool and do NOT call goal_set/goal_complete/goal_block.",
+  );
+  check("W6a: session idle after the goal_wait(2m) turn", await waitUntil(idle, 90_000));
+  const baseActivity = await activityCount(); // baseline AFTER the wait turn's own messages landed
+  const deadline = readGoal()?.waitUntil;
+  check("W6b: persisted goal_wait deadline >= 90s out (test not degenerate)", (deadline ?? 0) - quietStart >= 90_000, {
+    deadline,
+    quietStart,
+  });
+  if (deadline !== undefined) {
+    // Mid-window silence: the session must NOT gain a single message before
+    // the deadline (a storm wake would show up as a model turn here).
+    const midQuiet = await waitUntil(async () => (await activityCount()) > baseActivity, Math.max(2000, deadline - quietStart - 40_000));
+    check("W6c: QUIET — zero loop wakes inside the goal_wait window", !midQuiet, {
+      activity: midQuiet ? (await activityCount()) - baseActivity : 0,
+    });
+    // The deadline wake lands (one-shot, exactly one).
+    const sawExp = await waitUntil(async () => (await expiryMessages()).length >= 1, 30_000);
+    await sleep(20_000);
+    const nExp = (await expiryMessages()).length;
+    check("W6d: ONE expiry wake at the deadline", sawExp && nExp === 1, { count: nExp });
+  }
+  // W7: the decision log shows the quiet-window HOLD (not a storm of wakes).
+  const quietHold = readFileSync(decPath, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => {
+      try {
+        return JSON.parse(l) as Record<string, unknown>;
+      } catch {
+        return undefined;
+      }
+    })
+    .find(
+      (e) =>
+        e?.sessionID === S &&
+        e?.decision === "hold" &&
+        String(e?.reason).startsWith("quiet window (goal_wait"),
+    );
+  check("W7: decision log line 'hold: quiet window (goal_wait …)'", quietHold !== undefined, { line: quietHold });
   await host.stop();
   console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
   process.exit(failures === 0 ? 0 : 1);

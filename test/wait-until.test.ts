@@ -117,3 +117,23 @@ test("W4: a fresh goal_wait RESETS the one-shot — a second window fires its ow
   expect(wdArmed(ctrl, S)).toBe(false);
   await stop();
 });
+
+test("W5: a turn that ENDS inside the goal_wait window is HELD — no wake (the 129 2026-10-25 storm: the model called goal_wait, its turn ended with nothing in flight, and the gate-0 boundary WAKE'd every ~10s — each wake a full LLM turn that re-called goal_wait, 25 continuations in minutes). The window's DEADLINE wake still fires exactly once at waitUntil", async () => {
+  const { h, stop } = await boot();
+  await h.commandExecutor(S, "/goal set W5");
+  h.setSession(S, { location: { directory: "/w" } });
+  await h.toolExecutor("goal_wait", { minutes: 1 }, S);
+  shiftWait(h, 800); // window until +800ms
+  // The goal_wait turn ENDS (idle boundary, gate=0 — nothing in flight).
+  await h.emit({ type: "session.execution.started", id: "w5a", properties: { sessionID: S } });
+  await h.emit({ type: "session.execution.succeeded", id: "w5b", properties: { sessionID: S } });
+  await sleep(500); // mid-window: the storm would have woken by now
+  expect(h.prompts.length).toBe(0); // HELD — no wake inside the window
+  await sleep(900); // past the deadline
+  expect(h.prompts.length).toBe(1); // the §57 deadline wake fired (exactly once)
+  expect(h.prompts[0].input.text).toContain("Goal wait period ended");
+  expect(goalOf(h).waitWakeSent).toBe(true);
+  await sleep(400);
+  expect(h.prompts.length).toBe(1); // one-shot
+  await stop();
+});

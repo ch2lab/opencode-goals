@@ -1103,9 +1103,18 @@ export class GoalController {
     t.toolCalled = false;
     this.contPending.delete(sessionID); // 唤醒已落地 → 关闭 continuationPending 窗口
     this.pendingSkipped.delete(sessionID);
-    // The session went active — stop the watchdog's tick for the whole goal
-    // (止表). Any pending progress check was already cancelled at the top.
-    this.disarmWatchdog(sessionID);
+    // The session went active — stop the watchdog's tick (止表). Any pending
+    // progress check was already cancelled at the top. EXCEPT when a deadline
+    // is pending (goal_wait window / unexpired provider pause): the tick owns
+    // those wakes, and the tick's own disarm rule keeps it alive until the
+    // deadline fires (§57). Disarming here would kill the heartbeat the same
+    // way the 2026-10-24 incident's reload did (parked, no wake source) — and
+    // it re-armed on every boundary, which is what powered the 129 2026-10-25
+    // goal_wait storm.
+    const deadlinePending =
+      goal.waitUntil !== undefined && goal.waitWakeSent !== true ||
+      (goal.providerPause !== undefined && Date.now() < goal.providerPause.until);
+    if (!deadlinePending) this.disarmWatchdog(sessionID);
   }
 
   private async onToolCalled(sessionID: string): Promise<void> {
@@ -1768,6 +1777,32 @@ export class GoalController {
       }
       // (a) reply to OUR watchdog wake with NOTHING queued: normal arbitration
       // (stall ladder). With queued > 0 the hold above already returned.
+    }
+    // §59 (2026-10-25, 129 ruling): the goal_wait window silences the boundary
+    // on EVERY gate shape — gate>0 holds in the branch above, gate=0 is the
+    // STORM shape (the model just called goal_wait and its turn ends with
+    // nothing in flight): it previously fell straight through to the wake,
+    // and every idle boundary re-woke the model, which re-called goal_wait —
+    // 25 continuations in ~2 minutes on 129 (g_mvnd5hk9_2). The window's
+    // DEADLINE owns that moment: the §57 tick fires the one-shot "Goal wait
+    // period ended" wake at waitUntil. Hold: no wake, no stall accounting
+    // (不消耗 stall 预算), no check-in arm.
+    if (gate === 0 && goal.waitUntil !== undefined && Date.now() < goal.waitUntil) {
+      bumpGoalDecision(goal, "hold");
+      await appendDecision({
+        ts: new Date().toISOString(),
+        sessionID,
+        goalID: goal.id,
+        own,
+        other,
+        queued,
+        ownKnown: true,
+        decision: "hold",
+        reason: `quiet window (goal_wait until ${new Date(goal.waitUntil).toISOString()})`,
+      });
+      this.markTurnInactive(sessionID);
+      await this.recordHandled(sessionID, eventID, goal);
+      return;
     }
     // ⑤ attribution (lastInbox) → stall ladder.
     const toolCalled = this.turns.get(sessionID)?.toolCalled === true;
