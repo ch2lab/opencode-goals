@@ -1,6 +1,6 @@
 {
   "name": "@ch2lab/opencode-goals",
-  "version": "1.1.11",
+  "version": "1.1.12",
   "description": "OpenCode v2 goal-loop plugin: set a goal, the model works autonomously toward evidence-gated completion — wake-on-boundary loop, stall arbitration, opt-in budget caps, built for unattended long-running tasks",
   "type": "module",
   "license": "MIT",

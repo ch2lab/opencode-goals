@@ -7,7 +7,7 @@
 - 语言：**英文**（2026-10-22 裁定，适用于此后所有新版本：小节用 `### Added` / `### Fixed` / `### Optimizations & Design` / `### Verification`）；[1.1.7] 及更早章节保留原文。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
-## [Unreleased]
+## [1.1.12] - 2026-10-25
 
 ### Fixed
 - **`goal_wait` storm: during the wait window the loop re-woke the model on every idle boundary (the 129, 2026-10-25 incident: after the model called `goal_wait(3m)` and its turn ended, the goal was woken every 6–15 seconds — 25 continuations in ~2 minutes, each wake a full LLM turn that re-called `goal_wait` and pushed the window back; on top of that, the window's deadline wake fired NEVER: the last `execution.started` had disarmed the watchdog tick that owns the deadline).** Two root causes (spec §59): (1) the waitUntil quiet-window gate only existed in the in-flight branch of the boundary — the gate=0 shape (nothing in flight, exactly what goal_wait produces) fell straight through to a wake; (2) `execution.started` unconditionally stopped the watchdog tick, killing the goal_wait deadline's heartbeat. Now: a gate=0 boundary inside an active wait window is a HOLD (`quiet window (goal_wait until …)` decision line — no wake, no stall accounting, no check-in arm) and the tick keeps running while a deadline is pending, so the one-shot "Goal wait period ended" wake lands exactly at the deadline (verified on an isolated real host: zero session activity inside the window, one expiry, quiet-window hold line in the decision log).
