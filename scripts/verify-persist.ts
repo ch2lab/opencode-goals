@@ -10,7 +10,7 @@
 //   bun run scripts/verify-persist.ts
 
 import { join } from "node:path";
-import { mkdir, unlink, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { startHost, labProvider, REPO_ROOT, type IsolatedHost } from "./host.ts";
 
@@ -143,18 +143,6 @@ async function main(): Promise<void> {
   // plugin kv — survives).
   await h1.stop();
   console.log("[verify-persist] host A killed (the reload)");
-  // The hard-killed host leaves a STALE service descriptor (state/opencode/
-  // service.json → dead A's url/pid). A fresh `serve` in this dir halts in
-  // boot while it holds it (evidence: 2026-10-25 run — host B logged
-  // "cli starting" then nothing: no db bootstrap, no plugin load, no
-  // location boot, while its HTTP surface half-answered). Remove it before
-  // the restart — the real location evict/reboot is host-managed (same
-  // process) and does not strand this file.
-  try {
-    await unlink(join(dir1, "state", "opencode", "service.json"));
-  } catch {
-    // absent = fine
-  }
 
   // P5: restart the host on the SAME data dir (opts.dir — startHost would
   // otherwise mint a fresh one: same state, same sessions, same plugin kv) —
@@ -162,6 +150,15 @@ async function main(): Promise<void> {
   const h2: IsolatedHost = await startHost({ ...hostOpts, dir: dir1 });
   console.log(`[verify-persist] host B up (port ${h2.port}, pid ${h2.pid}, dir ${h2.directory})`);
   check("P5: same data dir (state survived the restart)", h2.directory === dir1, { dir: h2.directory });
+  // B's service registration: the plugin's HTTP data plane resolves the
+  // host through state/opencode/service.json (url + pid self-check). A bare
+  // `serve` does not write it (a `serve --service` artifact), so B's plugin
+  // would see "no-registry" and skip every boundary. Write B's registration
+  // before the location boot below triggers the plugin.
+  await writeFile(
+    join(svcDir, "service.json"),
+    JSON.stringify({ url: h2.baseUrl, pid: h2.pid, password: h2.password }),
+  );
   // P5b: boot B's LOCATION — plugins load when a location boots (first
   // session/agent activity), NOT at process start (2026-10-25 probe evidence:
   // a second serve in the same dir is fully ready — /api/info 200 — but logs
