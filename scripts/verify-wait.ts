@@ -170,6 +170,7 @@ async function main(): Promise<void> {
   );
   check("W6a: session idle after the goal_wait(2m) turn", await waitUntil(idle, 90_000));
   const baseActivity = await activityCount(); // baseline AFTER the wait turn's own messages landed
+  const baseExpiry = (await expiryMessages()).length; // the W2-window expiry is still in context — delta, not absolute
   const deadline = readGoal()?.waitUntil;
   check("W6b: persisted goal_wait deadline >= 90s out (test not degenerate)", (deadline ?? 0) - quietStart >= 90_000, {
     deadline,
@@ -188,9 +189,11 @@ async function main(): Promise<void> {
     const sawExp = await waitUntil(async () => (await expiryMessages()).length >= 1, 20_000);
     await sleep(20_000);
     const nExp = (await expiryMessages()).length;
-    check("W6d: ONE expiry wake at the deadline", sawExp && nExp === 1, { count: nExp });
+    check("W6d: ONE expiry wake at the deadline", sawExp && nExp === baseExpiry + 1, { count: nExp, base: baseExpiry });
   }
-  // W7: the decision log shows the quiet-window HOLD (not a storm of wakes).
+  // W7: the decision log shows a quiet-window HOLD for this window (either
+  // gate shape — gate=0 "quiet window (goal_wait until …)" or gate>0 "in-flight,
+  // quiet window" when the host queued something on the turn).
   const quietHold = readFileSync(decPath, "utf8")
     .split("\n")
     .filter(Boolean)
@@ -205,9 +208,16 @@ async function main(): Promise<void> {
       (e) =>
         e?.sessionID === S &&
         e?.decision === "hold" &&
-        String(e?.reason).startsWith("quiet window (goal_wait"),
+        String(e?.reason).includes("quiet window") &&
+        Date.parse(String(e?.ts)) >= quietStart,
     );
-  check("W7: decision log line 'hold: quiet window (goal_wait …)'", quietHold !== undefined, { line: quietHold });
+  check("W7: decision log line 'hold: … quiet window' (after the goal_wait turn)", quietHold !== undefined, {
+    line: quietHold,
+    holds: readFileSync(decPath, "utf8")
+      .split("\n")
+      .filter((l) => l.includes(`"sessionID":"${S}"`))
+      .slice(-6),
+  });
   await host.stop();
   console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
   process.exit(failures === 0 ? 0 : 1);
