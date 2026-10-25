@@ -162,10 +162,15 @@ async function main(): Promise<void> {
   const h2: IsolatedHost = await startHost({ ...hostOpts, dir: dir1 });
   console.log(`[verify-persist] host B up (port ${h2.port}, pid ${h2.pid}, dir ${h2.directory})`);
   check("P5: same data dir (state survived the restart)", h2.directory === dir1, { dir: h2.directory });
-  // P5b: the plugin actually booted in B and ran the init re-arm scan (the
-  // unconditional summary warn lands in the host stdout).
-  const sawInit = await waitUntil(() => h2.stdoutTail().includes("init re-arm scan"), 30_000);
-  check("P5b: host B plugin booted — init re-arm scan ran", sawInit, { tail: h2.stdoutTail().slice(-400) });
+  // P5b: boot B's LOCATION — plugins load when a location boots (first
+  // session/agent activity), NOT at process start (2026-10-25 probe evidence:
+  // a second serve in the same dir is fully ready — /api/info 200 — but logs
+  // no bootstrap/location/plugin lines until something touches the location).
+  // This mirrors the real incident path: the user OPENING THE APP (08:10) is
+  // what boots the location, loads the plugin, and runs initRearm.
+  await h2.api.prompt(S, "Automated goal-loop test. Reply with exactly: ok — and stop. Do NOT call any tool.");
+  const sawInit = await waitUntil(() => h2.stdoutTail().includes("init re-arm scan"), 60_000);
+  check("P5b: location boot in host B ran the plugin's init re-arm scan", sawInit, { tail: h2.stdoutTail().slice(-500) });
 
   // P6: initRearm restored the persisted deadline → the check-in lands
   // (past-due → first tick; future → within checkInDelaySec).
