@@ -47,7 +47,15 @@ async function main(): Promise<void> {
       },
     ],
   };
-  const hostOpts = { provider, waitMs: 60_000, keepDir: process.env.VERIFY_KEEP_DIR === "1", config: { ...pluginConfig } };
+  const hostOpts = {
+    provider,
+    waitMs: 60_000,
+    // keepDir MUST be true: host A's stop() would otherwise delete the data
+    // dir it created (host.ts "never delete a caller-provided dir" only
+    // protects B) — and the whole test is that host B boots on A's state.
+    keepDir: true,
+    config: { ...pluginConfig },
+  };
 
   const h1: IsolatedHost = await startHost(hostOpts);
   console.log(`[verify-persist] host A up (port ${h1.port}, pid ${h1.pid}, dir ${h1.directory})`);

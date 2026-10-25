@@ -2267,7 +2267,10 @@ export class GoalController {
     try {
       const entries = await this.probe.storageScan("goal/");
       const now = Date.now();
+      let scanned = 0;
+      let rearmed = 0;
       for (const e of entries) {
+        scanned++;
         const goal = e.value as GoalRecord | undefined;
         if (goal === undefined || goal.status !== "active") continue;
         let rearm = false;
@@ -2280,10 +2283,14 @@ export class GoalController {
         if (waitPending || pausePending) rearm = true;
         if (rearm) {
           this.ensureWatchdog(goal.sessionID);
+          rearmed++;
           console.warn(
             `opencode-goal: init re-arm for ${goal.sessionID} — persisted deadline(s) survived the reload (checkinDue: ${goal.checkinDue ? String(goal.checkinDue.due) : "-"}, waitUntil: ${goal.waitUntil ?? "-"}, providerPause: ${goal.providerPause?.until ?? "-"})`,
           );
         }
+      }
+      if (scanned > 0 || rearmed > 0) {
+        console.warn(`opencode-goal: init re-arm scan — ${scanned} persisted goal record(s), ${rearmed} re-armed`);
       }
     } catch (err) {
       console.warn(`opencode-goal: init re-arm scan failed:`, err);
