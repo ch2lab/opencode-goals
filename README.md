@@ -22,7 +22,7 @@ This plugin gives the host a goal state machine + a wake mechanism, so the model
 | Watchdog | No active checking: a boundary with background work in flight (shells / subtask sessions) does not wake — it arms a one-shot progress check that fires after `checkInDelaySec` of silence, and any activity cancels it. The check-in reminder lists the in-flight items by id and elapsed time (the model never has to re-query). Shell exits are not direct wakes — completion rides the progress check. |
 | Budget | **Unbounded by default**; tokens are stats-only by default — caps are opt-in. |
 | Task list | Tasks per goal are uncapped, `todo / doing / done` states, surfaced in wake messages / stall reports / the compaction `[GOAL STATE]` block. |
-| Wait declaration `goal_wait` | The model declares "I'm waiting" and suspends for N minutes (integer 1–60), without consuming the stall budget. At the deadline the loop re-wakes with an UNCONDITIONAL "Goal wait period ended" notice (spec §57 — a fully-idle session is exactly the case it must rescue). |
+| Wait declaration `goal_wait` | The model declares "I'm waiting" and suspends for N minutes (integer 1–60), without consuming the stall budget. Inside the window EVERY boundary is a quiet hold (spec §59 — the gate=0 shape is the one the model produces right after calling the tool, and waking on it is what powered the 129 2026-10-25 storm); at the deadline the loop re-wakes with an UNCONDITIONAL "Goal wait period ended" notice (spec §57 — a fully-idle session is exactly the case it must rescue), delivered by a watchdog tick that stays armed across `execution.started` while the deadline is pending. |
 
 ## Install
 

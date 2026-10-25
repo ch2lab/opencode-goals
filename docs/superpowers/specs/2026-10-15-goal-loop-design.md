@@ -931,3 +931,20 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 
 **测试**：`test/checkin-persist.test.ts` C1–C5（arm 持久化 / 过期期限重载后补发——事故形态 / 消费后不双发 / 孤儿 sweep 自愈 + 工作消失后不重武装 / quiet 窗抑制 sweep）。stub 377/0 + typecheck。
 **验证边界（2026-10-25 真宿主已验）**：`verify-persist.ts` **9/9 全绿**（本机隔离 2.1.4 宿主，lab LLM）：P0–P3（goal + 后台 shell + 边界 arm 决策行）→ 整个宿主进程硬杀（location 重启的可控模拟，更强：进程全死）→ 同目录重启 → P5b（location 首触加载插件 + initRearm 扫描）→ **P6 过期期限补发落地**（"work gone" 分支：check-in 实际进会话）→ P7（后继实例 `watchdog check-in (in-flight 1, late)` 决策行）→ P8（一次性）。测试基建三实证（2026-10-25）：① 插件在 **location 首次被触碰**时才加载（进程启动不加载——P5b 用 prompt 触发，对应真实路径"用户打开应用"）；② 插件 HTTP 数据面经 `state/opencode/service.json` 注册表找宿主（裸 serve 不写——B 需要脚本写入自己的注册，否则 no-registry 边界全 skip）；③ 重启后在飞 shell 随宿主进程死亡 → 走 restore-OR-deliver 的"工作消失→立即补发"分支（孤儿 sweep 只覆盖"工作仍在"，两者互补）。孤儿 sweep 的真宿主路径不可控触发（需机器休眠 + location 重启且工作存活），由 stub C4 覆盖。
+
+## 59. 2026-10-25 裁定 — goal_wait 风暴修复（wait 期间禁止边界唤醒 + 期限心跳不被 started 拆除）
+
+**裁定来源（用户 2026-10-25，129 实机）**："goal wait 好像有 BUG，wait 期间应该不要触发会话 idle 唤醒"。
+
+**129 实证（g_mvnd5hk9_2，全只读）**：模型 goal_wait(3min) 后，其回合以 **gate=0**（无在飞、无排队——goal_wait 的典型形态）结束 → 每个 idle 边界 **WAKE**（决策日志 07:24–07:26，6-15s/次）→ 模型在唤醒回合里再调 goal_wait（waitUntil 不断后推）→ 风暴：~2 分钟 25 continuations（used.turns=25）。第二现场：**07:28:43 的到期唤醒过期未发**（waitWakeSent=False、无 expiry 决策行）——期限心跳被最后一个 `execution.started` 的无条件 disarm 杀掉（§57 的到期唤醒依赖 tick，tick 一拆期限即无人认领）。
+
+**双根因**：
+1. **gate=0 边界无 quiet 窗门控**：§31(b) 裁定"waitUntil 窗口静默边界（no wake / no check-in arm / no stall accounting）"只在 gate>0 分支实现（"in-flight, quiet window" hold）；gate=0（正是 goal_wait 形态）穿过 ⑤ 归因直接 WAKE，且每 10-30s 一轮。
+2. **onExecutionStarted 无条件 disarmWatchdog（"止表"）**：把 goal_wait 期限/未到期 providerPause 的心跳一起拆了——期限到期无人投递（129 第二现场）。
+
+**修法（最小双钉）**：
+1. gate=0 + 活跃 waitUntil 窗 → **hold**（决策行 `quiet window (goal_wait until <ISO>)`，no wake / no stall / no arm）；窗口到期仍由 §57 tick 发一次性 "Goal wait period ended"（窗口的 deadline 拥有那个时刻——spec §31(b) 原文语义补全）。providerPause 不入此门控（其 errored 路径自带 transient-tolerance 与 retry 语义，不在本裁定范围）。
+2. onExecutionStarted 仅在**无 pending 期限**（waitUntil 已发完 + 无未到期 pause）时 disarm；期限 pending 时 tick 保留，由其自身 disarm 规则（nothing pending）在投递后自停。
+
+**测试**：`test/wait-until.test.ts` W5（窗口内 gate=0 边界 → 零 wake；期限唤醒仍恰好一次；stub 378/0 + typecheck）。
+**验证边界（2026-10-25 真宿主已验）**：`scripts/verify-wait.ts` **11/11 全绿**（2.1.4 隔离宿主，lab LLM，宿主自写 service.json 注册表）：W0–W5（§57 原有断言回归：期限准点 + 一次性 + 决策行）+ W6（129 风暴形态：goal_wait(2m) 回合结束 → **窗口内零活动消息** → 期限恰好一条 expiry）+ W7（决策行 `hold: quiet window (goal_wait until …)` 实证——两个窗口各一条 hold + 各一条 expiry，交替出现）。教训：无注册表时边界查询全 skip，"零唤醒"是假绿——quiet hold 从未执行。
