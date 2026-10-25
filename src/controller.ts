@@ -2289,9 +2289,9 @@ export class GoalController {
           );
         }
       }
-      if (scanned > 0 || rearmed > 0) {
-        console.warn(`opencode-goal: init re-arm scan — ${scanned} persisted goal record(s), ${rearmed} re-armed`);
-      }
+      // Always summarize (even 0): silence meant "scan saw nothing" — the
+      // 2026-10-25 P6 failure needed exactly that distinction.
+      console.warn(`opencode-goal: init re-arm scan — ${scanned} persisted goal record(s), ${rearmed} re-armed`);
     } catch (err) {
       console.warn(`opencode-goal: init re-arm scan failed:`, err);
     }

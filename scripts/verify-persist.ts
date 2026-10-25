@@ -10,7 +10,7 @@
 //   bun run scripts/verify-persist.ts
 
 import { join } from "node:path";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { startHost, labProvider, REPO_ROOT, type IsolatedHost } from "./host.ts";
 
@@ -97,8 +97,10 @@ async function main(): Promise<void> {
       }
     });
 
-  // P0: goal + idle.
-  const stSet = await h1.api.command(S, "goal", "set Endless countdown: each turn reply with the next integer counting DOWN from 100, nothing else. This goal is never completed. --turns 30");
+  // P0: goal + idle. --turns 1000: with fast lab turns (~1s each) the
+  // countdown loop burns a 30-turn cap in ~35s — the goal would be
+  // budget_limited before P3's prompt turn even lands (2026-10-25 run).
+  const stSet = await h1.api.command(S, "goal", "set Endless countdown: each turn reply with the next integer counting DOWN from 100, nothing else. This goal is never completed. --turns 1000");
   check("P0: /goal set accepted", stSet >= 200, { status: stSet });
   check("P1: session idle after the kick turn", await waitUntil(idle1, CHECK_TIMEOUT_MS));
 
@@ -141,6 +143,18 @@ async function main(): Promise<void> {
   // plugin kv — survives).
   await h1.stop();
   console.log("[verify-persist] host A killed (the reload)");
+  // The hard-killed host leaves a STALE service descriptor (state/opencode/
+  // service.json → dead A's url/pid). A fresh `serve` in this dir halts in
+  // boot while it holds it (evidence: 2026-10-25 run — host B logged
+  // "cli starting" then nothing: no db bootstrap, no plugin load, no
+  // location boot, while its HTTP surface half-answered). Remove it before
+  // the restart — the real location evict/reboot is host-managed (same
+  // process) and does not strand this file.
+  try {
+    await unlink(join(dir1, "state", "opencode", "service.json"));
+  } catch {
+    // absent = fine
+  }
 
   // P5: restart the host on the SAME data dir (opts.dir — startHost would
   // otherwise mint a fresh one: same state, same sessions, same plugin kv) —
@@ -148,6 +162,10 @@ async function main(): Promise<void> {
   const h2: IsolatedHost = await startHost({ ...hostOpts, dir: dir1 });
   console.log(`[verify-persist] host B up (port ${h2.port}, pid ${h2.pid}, dir ${h2.directory})`);
   check("P5: same data dir (state survived the restart)", h2.directory === dir1, { dir: h2.directory });
+  // P5b: the plugin actually booted in B and ran the init re-arm scan (the
+  // unconditional summary warn lands in the host stdout).
+  const sawInit = await waitUntil(() => h2.stdoutTail().includes("init re-arm scan"), 30_000);
+  check("P5b: host B plugin booted — init re-arm scan ran", sawInit, { tail: h2.stdoutTail().slice(-400) });
 
   // P6: initRearm restored the persisted deadline → the check-in lands
   // (past-due → first tick; future → within checkInDelaySec).
@@ -166,7 +184,7 @@ async function main(): Promise<void> {
         if (visible.includes("archived")) continue;
         const g = JSON.parse(r.value) as Record<string, unknown>;
         console.log(
-          `[verify-persist] P6 diagnostics: goal ${g.id} status=${g.status} ` +
+          `[verify-persist] P6 diagnostics: kv key="${visible}" goal ${g.id} status=${g.status} ` +
             `checkinDue=${JSON.stringify(g.checkinDue)} waitUntil=${g.waitUntil} updatedAt=${new Date(Number(g.updatedAt)).toISOString()}`,
         );
       }
