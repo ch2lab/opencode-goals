@@ -1720,11 +1720,14 @@ export class GoalController {
             inFlight,
           });
           this.ensureWatchdog(sessionID); // the tick is the deadline's heartbeat
-          // §58: mirror the deadline into the goal record — it rides this
-          // hold path's recordHandled save (no extra write). A host reload
-          // kills the in-memory arm; the persisted copy is what initRearm
-          // restores in the successor.
+          // §58: mirror the deadline into the goal record and SAVE IT NOW —
+          // an explicit save: the hold path's recordHandled save is conditional
+          // on the event carrying an ID (session.idle is ID-less / ephemeral on
+          // 2.1.4), so a piggybacked mirror would silently die with the
+          // instance — which is exactly the overnight loss this field exists
+          // to prevent.
           goal.checkinDue = this.checkinDue.get(sessionID);
+          await this.saveGoal(goal);
         }
         bumpGoalDecision(goal, "hold");
         await appendDecision({

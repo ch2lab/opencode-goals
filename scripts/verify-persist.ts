@@ -106,7 +106,24 @@ async function main(): Promise<void> {
   // P3: a prompt turn ends IN FLIGHT → the boundary arms the check-in
   // (deadline persisted with the goal record — §58's arm mirror).
   await h1.api.prompt(S, "Automated goal-loop test. Reply with exactly: ok — and stop. Do NOT call any tool.");
-  check("P3: check-in armed at the in-flight boundary (decision log line)", await waitUntil(sawArmLine, CHECK_TIMEOUT_MS), {
+  const armed = await waitUntil(sawArmLine, CHECK_TIMEOUT_MS);
+  if (!armed) {
+    // Diagnostics: compare the raw global shell list against the
+    // LOCATION-SCOPED query the plugin uses (x-opencode-directory header).
+    try {
+      const auth = { Authorization: "Basic " + Buffer.from(`opencode:${h1.password}`).toString("base64") };
+      const sessBody = (await (await fetch(h1.baseUrl + "/api/session", { headers: auth })).json()) as { data: Array<{ id?: string; location?: { directory?: string } }> };
+      const me = sessBody.data.find((s) => s?.id === S);
+      const raw = (await (await fetch(h1.baseUrl + "/api/shell", { headers: auth })).text());
+      const scoped = me?.location?.directory
+        ? (await (await fetch(h1.baseUrl + "/api/shell", { headers: { ...auth, "x-opencode-directory": encodeURIComponent(me.location.directory) } })).text())
+        : "(no location.directory on the session)";
+      console.log(`[verify-persist] P3 diagnostics: session.location=${JSON.stringify(me?.location)}\n  RAW=${raw.slice(0, 900)}\n  SCOPED=${String(scoped).slice(0, 900)}`);
+    } catch (err) {
+      console.log(`[verify-persist] P3 diagnostics failed:`, err);
+    }
+  }
+  check("P3: check-in armed at the in-flight boundary (decision log line)", armed, {
     tail: decisions(h1.pid).slice(-2),
   });
 
@@ -117,8 +134,10 @@ async function main(): Promise<void> {
   await h1.stop();
   console.log("[verify-persist] host A killed (the reload)");
 
-  // P5: restart the host on the SAME data dir — a fresh plugin instance.
-  const h2: IsolatedHost = await startHost(hostOpts);
+  // P5: restart the host on the SAME data dir (opts.dir — startHost would
+  // otherwise mint a fresh one: same state, same sessions, same plugin kv) —
+  // a fresh plugin instance.
+  const h2: IsolatedHost = await startHost({ ...hostOpts, dir: dir1 });
   console.log(`[verify-persist] host B up (port ${h2.port}, pid ${h2.pid}, dir ${h2.directory})`);
   check("P5: same data dir (state survived the restart)", h2.directory === dir1, { dir: h2.directory });
 
@@ -126,6 +145,28 @@ async function main(): Promise<void> {
   // (past-due → first tick; future → within checkInDelaySec).
   const landed = await waitUntil(async () => (await checkinMessage(h2)) !== undefined, CHECK_TIMEOUT_MS);
   const text = await checkinMessage(h2);
+  if (!landed) {
+    // Diagnostics: (1) the persisted record — was checkinDue actually saved?
+    // (2) host B's stdout — did initRearm log a re-arm / a scan failure?
+    try {
+      const { Database } = require("bun:sqlite");
+      const dbPath = join(dir1, "data", "opencode", "opencode.db");
+      const db = new Database(dbPath, { readonly: true });
+      const rows = db.query("SELECT key, value FROM kv WHERE key LIKE ?").all(`%${S}%`);
+      for (const r of rows as Array<{ key: string; value: string }>) {
+        const visible = [...r.key].filter((c) => c !== "\0").join("");
+        if (visible.includes("archived")) continue;
+        const g = JSON.parse(r.value) as Record<string, unknown>;
+        console.log(
+          `[verify-persist] P6 diagnostics: goal ${g.id} status=${g.status} ` +
+            `checkinDue=${JSON.stringify(g.checkinDue)} waitUntil=${g.waitUntil} updatedAt=${new Date(Number(g.updatedAt)).toISOString()}`,
+        );
+      }
+    } catch (err) {
+      console.log(`[verify-persist] P6 db dump failed:`, err);
+    }
+    console.log(`[verify-persist] P6 diagnostics: host B stdout tail:\n${h2.stdoutTail().slice(-4000)}`);
+  }
   check("P6: the persisted check-in deadline FIRED after the restart (the overnight-incident shape)", landed, {
     text: text?.slice(0, 200),
     tail: landed ? undefined : h2.stdoutTail().slice(-300),

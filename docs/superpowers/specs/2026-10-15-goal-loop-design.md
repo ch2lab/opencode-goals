@@ -923,7 +923,7 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 **裁定（用户）**：仔细审查后落实 Tier1（①②③）+ Tier2。
 
 **实现**：
-1. **check-in 期限持久化**：goal 记录加 `checkinDue: {due, inFlight}`——边界 arm 时镜像进记录（**骑 hold 路径已有的 recordHandled save，零额外写**）；tick 在 fire/discard 时清除（**clear-then-deliver**，providerPause-retry 模式：重载不重放；投递丢失由孤儿 sweep 回填，不双发）。
+1. **check-in 期限持久化**：goal 记录加 `checkinDue: {due, inFlight}`——边界 arm 时镜像进记录并**显式 save**（真宿主实证：2.1.4 的终态边界事件是 `session.idle`（ephemeral、无 event ID），hold 路径的 recordHandled 只在有 ID 时 save——镜像若搭车就会和实例一起死，正是昨夜丢失的形态）；tick 在 fire/discard 时清除（**clear-then-deliver**，providerPause-retry 模式：重载不重放；投递丢失由孤儿 sweep 回填，不双发）。
 2. **initRearm 扩展**：start() 恢复持久化 check-in 期限（已过期未发的**首 tick 即发**——昨夜 00:31:36 期限在 01:03 重载后补发，正是本事故的形态）。
 3. **孤儿 sweep（Tier 2）**：livenessScan 每 livenessCheckMs（30s）加一趟 sweep，**独立于事件流早退**（它的目标恰是"零事件"形态）：active goal 无 live tick + 无 live turn + 无 pending 期限 + 非 quiet 窗 + 实时在飞工作 > 0 → 武装立即 check-in（due=now）+ 镜像记录 + 重武装 tick。quiet 窗（waitUntil/providerPause）抑制它（那是 §57 期限唤醒的地盘）。
 - 事件取消点（新 turn/inbox/tool/usage）**不做镜像**（它们=活动，下一个边界会用新期限重新武装；过期镜像的最坏情形 = 多一条 check-in 提醒，可接受）。
