@@ -924,10 +924,10 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 
 **实现**：
 1. **check-in 期限持久化**：goal 记录加 `checkinDue: {due, inFlight}`——边界 arm 时镜像进记录并**显式 save**（真宿主实证：2.1.4 的终态边界事件是 `session.idle`（ephemeral、无 event ID），hold 路径的 recordHandled 只在有 ID 时 save——镜像若搭车就会和实例一起死，正是昨夜丢失的形态）；tick 在 fire/discard 时清除（**clear-then-deliver**，providerPause-retry 模式：重载不重放；投递丢失由孤儿 sweep 回填，不双发）。
-2. **initRearm 扩展**：start() 恢复持久化 check-in 期限（已过期未发的**首 tick 即发**——昨夜 00:31:36 期限在 01:03 重载后补发，正是本事故的形态）。
+2. **initRearm 扩展（restore-OR-deliver）**：start() 对持久化 check-in 期限二选一——**在飞工作仍可见**（实时 inFlightSignal > 0）→ 恢复进内存，tick 按原期限发；**工作已消失**（重载/休眠期间死了——过夜事故形态：后台进程活不过机器休眠+重启）或不可查询 → **立即补发**（late，但模型必须知道自己等的工作发生了什么）。"工作消失却只恢复"是错的：恢复后循环的普通 gate-0 边界会 WAKE（工作不再 gate），而唤醒的 execution.started 会取消 pending 期限（L1032 取消语义）——期限永远发不出去（2026-10-25 verify 实证：initRearm 恢复后 3 条 `wake: boundary (in-flight 0)` + 零 check-in）。`inFlight: 0` 的期限（queued-input arm）直接清除不投递。
 3. **孤儿 sweep（Tier 2）**：livenessScan 每 livenessCheckMs（30s）加一趟 sweep，**独立于事件流早退**（它的目标恰是"零事件"形态）：active goal 无 live tick + 无 live turn + 无 pending 期限 + 非 quiet 窗 + 实时在飞工作 > 0 → 武装立即 check-in（due=now）+ 镜像记录 + 重武装 tick。quiet 窗（waitUntil/providerPause）抑制它（那是 §57 期限唤醒的地盘）。
 - 事件取消点（新 turn/inbox/tool/usage）**不做镜像**（它们=活动，下一个边界会用新期限重新武装；过期镜像的最坏情形 = 多一条 check-in 提醒，可接受）。
 - 终态记录不恢复（initRearm 按 status 过滤）。
 
 **测试**：`test/checkin-persist.test.ts` C1–C5（arm 持久化 / 过期期限重载后补发——事故形态 / 消费后不双发 / 孤儿 sweep 自愈 + 工作消失后不重武装 / quiet 窗抑制 sweep）。stub 377/0 + typecheck。
-**验证边界（待 2026-10-25 真宿主补记）**：`verify-persist.ts`（隔离宿主：武装 check-in → **整个宿主进程重启**（= location 重启的可控模拟，更强：进程全死）→ 新实例 initRearm 恢复期限 → check-in 实际落地 + 一次性）。孤儿 sweep 的真宿主路径：同目录重启后 shell 随进程死亡 → 在飞=0 → sweep 不武装（期限路径兜底，正是 P 脚本断言的分工）。
+**验证边界（待 2026-10-25 真宿主补记）**：`verify-persist.ts`（隔离宿主：武装 check-in → 整个宿主进程重启（location 重启的可控模拟，更强：进程全死）→ 新实例补发 + 一次性）。测试基建三实证（2026-10-25）：① 插件在 **location 首次被触碰**时才加载（进程启动不加载——P5b 用 prompt 触发，对应真实路径"用户打开应用"）；② 插件 HTTP 数据面经 `state/opencode/service.json` 注册表找宿主（裸 serve 不写——B 需要脚本写入自己的注册，否则 no-registry 边界全 skip）；③ 重启后在飞 shell 随宿主进程死亡 → 走 restore-OR-deliver 的"工作消失→立即补发"分支（孤儿 sweep 只覆盖"工作仍在"，两者互补）。孤儿 sweep 的真宿主路径不可控触发（需机器休眠），由 stub C4 覆盖。

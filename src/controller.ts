@@ -1006,6 +1006,23 @@ export class GoalController {
         (goal.waitUntil !== undefined && now < goal.waitUntil) ||
         (goal.providerPause !== undefined && now < goal.providerPause.until);
       if (quiet) continue; // the window suppresses check-ins until it ends
+      // A turn that is ALIVE but blocked on its own foreground shell is not
+      // parked — the §52/§54 machinery owns it (auto-background at the cap,
+      // whose end boundary re-arms a fresh check). Arming here would churn:
+      // the tick discards the deadline (blocked turn), the next sweep re-arms —
+      // the 2026-10-25 test flake. The §56 active map is the same signal the
+      // blocking gate uses: "running" = turn alive; idle + running work (the
+      // overnight shape) still arms. A failed query fails open (arms — the
+      // tick's §54 discard is the second line).
+      let active: Record<string, string> = {};
+      try {
+        const info = await this.probe.sessionGet(sessionID);
+        const directory = info?.location?.directory;
+        if (directory !== undefined) active = await this.probe.activeSessions(directory);
+      } catch {
+        // dead host context — fail toward waking (the tick re-checks on fire)
+      }
+      if (active[sessionID] === "running") continue;
       const sig = await this.inFlightSignal(sessionID);
       if (!sig.ownKnown) continue; // host context dead — retry next sweep
       const inFlight = sig.own + sig.other;
@@ -2275,8 +2292,37 @@ export class GoalController {
         if (goal === undefined || goal.status !== "active") continue;
         let rearm = false;
         if (goal.checkinDue !== undefined) {
-          this.checkinDue.set(goal.sessionID, goal.checkinDue); // restore (past-due → fires on first tick)
-          rearm = true;
+          // §58 restore-OR-deliver: the deadline's premise is "the session
+          // has been quiet while this work was in flight". After a reload the
+          // work may have DIED in the downtime (the overnight incident — a
+          // background process cannot survive a machine sleep + restart) —
+          // with in-flight work GONE the deadline is stale by definition, and
+          // restoring it would be fatal: the loop's ordinary gate-0 boundary
+          // WAKES (the work is no longer gating), and the wake's
+          // execution.started CANCELS the pending deadline — it could never
+          // fire. So: work still visible → restore (the tick owns the
+          // deadline); work gone (or unknown — fail toward waking) → deliver
+          // the check-in NOW (late, but the model must find out what happened
+          // to what it was waiting on).
+          const cd = goal.checkinDue;
+          if (cd.inFlight === 0) {
+            goal.checkinDue = undefined; // a queued-input arm — nothing to report
+            await this.saveGoal(goal);
+          } else {
+            const sig = await this.inFlightSignal(goal.sessionID);
+            if (sig.ownKnown && sig.own + sig.other > 0) {
+              this.checkinDue.set(goal.sessionID, cd); // work survived — the deadline is meaningful
+              rearm = true;
+            } else {
+              goal.checkinDue = undefined;
+              await this.saveGoal(goal); // consumed (clear-then-deliver)
+              await this.deliverWatchdogWake(
+                goal,
+                backgroundCheckInText(cd.inFlight, this.options.checkInDelaySec, await this.inFlightRoster(goal.sessionID)),
+                `watchdog check-in (in-flight ${cd.inFlight}, late — delivered on reload, work gone or unqueryable)`,
+              );
+            }
+          }
         }
         const waitPending = goal.waitUntil !== undefined && goal.waitWakeSent !== true;
         const pausePending = goal.providerPause !== undefined && now < goal.providerPause.until;
