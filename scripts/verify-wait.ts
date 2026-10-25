@@ -137,7 +137,7 @@ async function main(): Promise<void> {
     try {
       const rows = db
         .query("SELECT value FROM kv WHERE key LIKE ?")
-        .all(`${S}%`) as Array<{ value: string }>;
+        .all(`%${S}%`) as Array<{ value: string }>;
       for (const r of rows) {
         try {
           const g = JSON.parse(r.value) as { status?: string; waitUntil?: number };
@@ -183,7 +183,9 @@ async function main(): Promise<void> {
       activity: midQuiet ? (await activityCount()) - baseActivity : 0,
     });
     // The deadline wake lands (one-shot, exactly one).
-    const sawExp = await waitUntil(async () => (await expiryMessages()).length >= 1, 30_000);
+    const msToDeadline = deadline - Date.now();
+    if (msToDeadline > 0) await sleep(msToDeadline + 5_000); // wait past the deadline (+tick margin)
+    const sawExp = await waitUntil(async () => (await expiryMessages()).length >= 1, 20_000);
     await sleep(20_000);
     const nExp = (await expiryMessages()).length;
     check("W6d: ONE expiry wake at the deadline", sawExp && nExp === 1, { count: nExp });
