@@ -92,6 +92,15 @@ export interface GoalRecord {
    * as chosen (the wake text names it). */
   waitWakeSent?: boolean;
   waitMinutes?: number;
+  /** §58 (2026-10-25 ruling): the PERSISTED one-shot progress-check deadline.
+   * The in-memory armed check-in (tick + deadline) dies with every host
+   * reload (location evict/reboot, machine sleep) — a volatile arm is exactly
+   * what parked the 2026-10-24 overnight goal. The boundary arm mirrors its
+   * deadline into this record (same row, same save); the tick clears it on
+   * fire/discard; initRearm restores it in the successor (a past-due one
+   * fires on the first tick). A lost mirror (best-effort writes) is
+   * backfilled by the §58 orphan sweep. */
+  checkinDue?: { due: number; inFlight: number };
   /** Provider failure pause (2026-10-17 ruling, 129 quota incident): set when
    *  consecutive boundaries whose last assistant message carries a provider.*
    *  error reach `providerFailLimit`. Until `until` the loop is silent (no

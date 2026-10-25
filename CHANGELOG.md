@@ -7,6 +7,11 @@
 - 语言：**英文**（2026-10-22 裁定，适用于此后所有新版本：小节用 `### Added` / `### Fixed` / `### Optimizations & Design` / `### Verification`）；[1.1.7] 及更早章节保留原文。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
+## [Unreleased]
+
+### Fixed
+- **An armed check-in deadline could be lost forever across a machine sleep or host reload — a goal with in-flight background work could park until the next human message** (local host, 2026-10-25 overnight incident: a one-shot 5-minute check-in armed at 00:26 was never delivered — the machine slept across the deadline — and a host location evict/reboot at 01:03 re-instantiated the plugin, wiping the in-memory deadline and its watchdog; the session was fully idle and shell-lifecycle events are not boundaries, so nothing could wake the loop for hours). The fix (spec §58): the armed check-in deadline is now PERSISTED with the goal record (the boundary arm mirrors it into the record on the existing save; the tick clears it on fire/discard — clear-then-deliver, so a reload never double-fires); `start()` restores persisted deadlines (a past-due one fires on the first tick — the exact incident shape); and an ORPHAN SWEEP on the 30-second liveness clock re-arms an immediate check-in for any active goal that has in-flight work but no live watchdog (quiet windows suppress it — the §57 waitUntil deadline wake owns that moment).
+
 ## [1.1.10] - 2026-10-24
 
 ### Fixed

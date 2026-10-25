@@ -945,6 +945,14 @@ export class GoalController {
   private async livenessScan(): Promise<void> {
     if (this.stopped) return;
     const now = Date.now();
+    // §58: the orphan sweep runs on EVERY scan — independent of the event-flow
+    // gate below — because its target is exactly the "no events at all" case:
+    // a parked goal whose armed deadline died in a reload or a machine sleep.
+    try {
+      await this.orphanSweep(now);
+    } catch (err) {
+      console.warn("opencode-goal: §58 orphan sweep failed:", err);
+    }
     if (now - this.lastEventAt <= this.livenessMs()) return;
     for (const [sessionID, t] of this.turns) {
       if (!t.active) continue;
@@ -972,6 +980,43 @@ export class GoalController {
       } catch (err) {
         console.warn(`opencode-goal: liveness recheck failed for ${sessionID}:`, err);
       }
+    }
+  }
+
+  /**
+   * §58 (2026-10-25 — overnight incident): a parked ACTIVE goal with
+   * IN-FLIGHT work but NO live watchdog is an orphan — a host reload
+   * (location evict/reboot) or a machine sleep vaporized its armed check-in,
+   * and nothing else wakes the loop (shell lifecycle events are NOT
+   * boundaries). Re-arm an IMMEDIATE check-in: the model goes and finds out
+   * what happened to the work it was waiting on. Quiet windows suppress it
+   * (window semantics — the waitUntil deadline wake owns that moment); a
+   * dead host context retries on the next sweep. Runs every livenessCheckMs
+   * (30s), independent of event flow.
+   */
+  private async orphanSweep(now: number): Promise<void> {
+    for (const sessionID of [...this.activeGoalSessions]) {
+      if (this.stopped) return;
+      if (this.turns.get(sessionID)?.active === true) continue; // a live turn owns its own boundaries
+      if (this.wdTimers.has(sessionID)) continue; // a live tick owns its deadlines
+      if (this.checkinDue.get(sessionID) !== undefined) continue; // a pending deadline (and its tick)
+      const goal = await this.loadGoal(sessionID);
+      if (goal === undefined || goal.status !== "active") continue;
+      const quiet =
+        (goal.waitUntil !== undefined && now < goal.waitUntil) ||
+        (goal.providerPause !== undefined && now < goal.providerPause.until);
+      if (quiet) continue; // the window suppresses check-ins until it ends
+      const sig = await this.inFlightSignal(sessionID);
+      if (!sig.ownKnown) continue; // host context dead — retry next sweep
+      const inFlight = sig.own + sig.other;
+      if (inFlight === 0) continue;
+      this.checkinDue.set(sessionID, { due: now, inFlight }); // immediate
+      goal.checkinDue = { due: now, inFlight };
+      await this.saveGoal(goal);
+      this.ensureWatchdog(sessionID);
+      console.warn(
+        `opencode-goal: §58 orphan sweep — ${sessionID} parked with ${inFlight} in-flight item(s), no live watchdog: armed an immediate check-in`,
+      );
     }
   }
 
@@ -1675,6 +1720,11 @@ export class GoalController {
             inFlight,
           });
           this.ensureWatchdog(sessionID); // the tick is the deadline's heartbeat
+          // §58: mirror the deadline into the goal record — it rides this
+          // hold path's recordHandled save (no extra write). A host reload
+          // kills the in-memory arm; the persisted copy is what initRearm
+          // restores in the successor.
+          goal.checkinDue = this.checkinDue.get(sessionID);
         }
         bumpGoalDecision(goal, "hold");
         await appendDecision({
@@ -2199,12 +2249,16 @@ export class GoalController {
   }
 
   /**
-   * §57: the reload-tolerant start-time re-arm. Scan the persisted goals and
-   * ensure a running tick for every ACTIVE goal with a pending deadline wake:
-   * a goal_wait window (unfired — including an EXPIRED one that lost its
-   * delivery across the reload) or an unexpired providerPause (the tick is
-   * the retry's heartbeat). Fire-and-forget at start(): a failed scan is
-   * non-fatal — the next boundary re-arms the ordinary way.
+   * §57/§58: the reload-tolerant start-time re-arm. Scan the persisted goals
+   * and ensure a running tick for every ACTIVE goal with a pending deadline
+   * wake: a goal_wait window (unfired — including an EXPIRED one that lost
+   * its delivery across the reload), an unexpired providerPause (the tick is
+   * the retry's heartbeat), and — §58 — a PERSISTED check-in deadline
+   * (restored into memory; a past-due one fires on the first tick: the exact
+   * overnight incident — the deadline armed before the 01:03 location
+   * reboot must still land). Fire-and-forget at start(): a failed scan is
+   * non-fatal — the next boundary re-arms the ordinary way, and the §58
+   * orphan sweep (liveness clock) backfills anything this misses.
    */
   private async initRearm(): Promise<void> {
     try {
@@ -2213,17 +2267,23 @@ export class GoalController {
       for (const e of entries) {
         const goal = e.value as GoalRecord | undefined;
         if (goal === undefined || goal.status !== "active") continue;
+        let rearm = false;
+        if (goal.checkinDue !== undefined) {
+          this.checkinDue.set(goal.sessionID, goal.checkinDue); // restore (past-due → fires on first tick)
+          rearm = true;
+        }
         const waitPending = goal.waitUntil !== undefined && goal.waitWakeSent !== true;
         const pausePending = goal.providerPause !== undefined && now < goal.providerPause.until;
-        if (waitPending || pausePending) {
+        if (waitPending || pausePending) rearm = true;
+        if (rearm) {
           this.ensureWatchdog(goal.sessionID);
           console.warn(
-            `opencode-goal: §57 init re-arm for ${goal.sessionID} — persisted deadline(s) survived the reload (waitUntil: ${goal.waitUntil ?? "-"}, providerPause: ${goal.providerPause?.until ?? "-"})`,
+            `opencode-goal: init re-arm for ${goal.sessionID} — persisted deadline(s) survived the reload (checkinDue: ${goal.checkinDue ? String(goal.checkinDue.due) : "-"}, waitUntil: ${goal.waitUntil ?? "-"}, providerPause: ${goal.providerPause?.until ?? "-"})`,
           );
         }
       }
     } catch (err) {
-      console.warn(`opencode-goal: §57 init re-arm scan failed:`, err);
+      console.warn(`opencode-goal: init re-arm scan failed:`, err);
     }
   }
 
@@ -2275,11 +2335,18 @@ export class GoalController {
       // re-arms a fresh check.
       if ((await this.blockingShellIds(sessionID)).length > 0) {
         this.checkinDue.delete(sessionID);
+        goal.checkinDue = undefined; // §58: persist the discard (no delivery follows)
+        await this.saveGoal(goal);
         console.warn(
           `opencode-goal: §54 check-in deadline discarded for ${sessionID} — its turn is blocked on a foreground shell`,
         );
       } else {
         this.checkinDue.delete(sessionID); // one-shot: consumed on fire
+        // §58: clear-then-deliver (providerPause-retry pattern): the record is
+        // cleared before delivery, so a reload cannot re-fire the consumed
+        // deadline; a delivery LOST mid-reload is backfilled by the §58
+        // orphan sweep (in-flight work is still visible), never double-fired.
+        goal.checkinDue = undefined;
         await this.deliverWatchdogWake(
           goal,
           backgroundCheckInText(due.inFlight, this.options.checkInDelaySec, await this.inFlightRoster(sessionID)),

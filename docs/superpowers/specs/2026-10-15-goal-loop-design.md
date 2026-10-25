@@ -911,3 +911,23 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 
 **测试**：新增 `test/wait-until.test.ts` W1-W4（W1 到期无条件一次性唤醒 + 调用即武装 + 发后解武；W2 重载后**已过期未投递**仍发——事故形态；W3 重载后**未到期**窗口重武装、不提前发；W4 新 goal_wait 重置一次性）。stub 372/0 + typecheck。
 **验证边界（2026-10-24 已验）**：stub 372/0 + typecheck。真宿主 `verify-wait.ts` **6/6 ALL PASS**（隔离宿主 **2.1.4** + lab LLM）：W3 全空闲形态下到期唤醒如期到达（goal_wait(1) → ~62s，tick 2s），文案 = `goalWaitExpiryText`；W4 一次性（20s 窗口内无第二条）；W5 决策行 `watchdog: watchdog goal_wait expiry`。`verify-checkin` **8/8** 回归绿（§56/§54 check-in 路径不受 §57 影响）。首跑 verify-checkin 红（K4）经取证**不是回归**：location-scoped `/api/shell` 在 2.1.4 正常（`scripts/forensic-shellscope.ts` 实证 raw 与 scoped 查询同返条目），决策日志 + stall ladder 证明 countdown goal 在 lab LLM 快速回合下 ~4 轮内自杀（stallLimit=3）——K2/K3 还没跑 goal 已 stalled；测试侧修复 = verify-checkin/verify-wait 的 plugin options 加 `stallLimit: 100`（此类测试验 check-in/唤醒路径，不验 stall ladder）。重载重武装（initRearm）走 stub W2/W3 覆盖——真宿主无法可控触发 location 重启（1h 一次的 host 行为，只能等）。
+
+## 58. 2026-10-25 裁定 — check-in 期限持久化 + 重载恢复 + 孤儿自愈（orphan sweep）
+
+**裁定来源（用户 2026-10-25，本机过夜事故）**："ch2.AI dev" goal 卡一整夜。取证链（全只读）：
+- 决策日志：末行 00:26:36 `hold: in-flight (check-in armed)`（own=1，后台 shell 在飞）→ 武装一次性 5min check-in（期限 00:31:36）→ 此后零行。
+- host log：**00:32→01:03 断档 31min（机器休眠）**——期限在休眠中没发出去；**01:03:18 `location services evicted`（C:\Users\Adminstrator）→ 插件全量重实例化**——武装期限 + tick 随内存蒸发。
+- 1.1.10 的 initRearm 只恢复**持久化期限**（waitUntil/providerPause）——check-in 期限是内存态（§57 的 scoping 决定）不在恢复范围；会话全空闲（shell 生命周期事件不是边界——事件表封闭集实证）、无用户消息 → **零事件零定时器 → 停摆一整夜**。
+- 根源三因素：① 定时唤醒义务非持久化（状态模型缺陷，主责在我们）② 宿主可随时无预警重建插件（evict/reboot，~1h 一次 + 按需）③ 边界封闭集（shell 死了无边界，check-in 是唯一看门人）。
+
+**裁定（用户）**：仔细审查后落实 Tier1（①②③）+ Tier2。
+
+**实现**：
+1. **check-in 期限持久化**：goal 记录加 `checkinDue: {due, inFlight}`——边界 arm 时镜像进记录（**骑 hold 路径已有的 recordHandled save，零额外写**）；tick 在 fire/discard 时清除（**clear-then-deliver**，providerPause-retry 模式：重载不重放；投递丢失由孤儿 sweep 回填，不双发）。
+2. **initRearm 扩展**：start() 恢复持久化 check-in 期限（已过期未发的**首 tick 即发**——昨夜 00:31:36 期限在 01:03 重载后补发，正是本事故的形态）。
+3. **孤儿 sweep（Tier 2）**：livenessScan 每 livenessCheckMs（30s）加一趟 sweep，**独立于事件流早退**（它的目标恰是"零事件"形态）：active goal 无 live tick + 无 live turn + 无 pending 期限 + 非 quiet 窗 + 实时在飞工作 > 0 → 武装立即 check-in（due=now）+ 镜像记录 + 重武装 tick。quiet 窗（waitUntil/providerPause）抑制它（那是 §57 期限唤醒的地盘）。
+- 事件取消点（新 turn/inbox/tool/usage）**不做镜像**（它们=活动，下一个边界会用新期限重新武装；过期镜像的最坏情形 = 多一条 check-in 提醒，可接受）。
+- 终态记录不恢复（initRearm 按 status 过滤）。
+
+**测试**：`test/checkin-persist.test.ts` C1–C5（arm 持久化 / 过期期限重载后补发——事故形态 / 消费后不双发 / 孤儿 sweep 自愈 + 工作消失后不重武装 / quiet 窗抑制 sweep）。stub 377/0 + typecheck。
+**验证边界（待 2026-10-25 真宿主补记）**：`verify-persist.ts`（隔离宿主：武装 check-in → **整个宿主进程重启**（= location 重启的可控模拟，更强：进程全死）→ 新实例 initRearm 恢复期限 → check-in 实际落地 + 一次性）。孤儿 sweep 的真宿主路径：同目录重启后 shell 随进程死亡 → 在飞=0 → sweep 不武装（期限路径兜底，正是 P 脚本断言的分工）。
