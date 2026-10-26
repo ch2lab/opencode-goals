@@ -967,7 +967,7 @@ goal_wait(minutes, background=false)   [codemode: true —— 12 个 goal 工具
 **事件集封闭**（期限/用户消息/其它 shell 结束/等待 shell 被杀——不接 provider/usage/子任务：子任务执行事件不达本宿主（§56 实证），v1 不承诺）。
 
 **实现**：
-1. **shell 当年钟**：处理器经 hostapi 发射本会话 `sleep <N*60>`（`POST /api/session/:id/shell`——2.1.4 openapi 实证，同族端点 `DELETE /api/shell/:id` = kill 逃生、`GET /api/shell/:id` = 可查）；metadata 打 goalWait 标记。等待状态活在宿主 shell store，不落在插件内存。
+1. **shell 当年钟**：处理器经 hostapi 发射本会话 `sleep <N*60>`（`POST /api/session/:id/shell`——2.1.4 openapi 实证，同族端点 `DELETE /api/shell/:id` = kill 逃生、`GET /api/shell/:id` = 可查）。**POST 响应时序（2026-10-26 活宿主探针实证，`scripts/probe-shell-post.ts`）：宿主把 204 空体响应握到 shell 跑完才回**（`sleep 3` → 3.7s 应答）——因此发射必须 fire-and-forget（不 await 响应、不设超时），发射后轮询 store 认领（entry ~0.5s 可见，`metadata.sessionID` 由 server-fire 路径写入，同 §56 实证）。等待状态活在宿主 shell store，不落在插件内存。
 2. **处理器挂起** `Promise.race{ 期限 timer, 事件 resolver }`；controller 持 `pendingWaits: Map<sessionID,{resolve,shellID,due}>`。事件处理器检查 pendingWaits → resolve（一次性）。**插件重载/宿主重启**：await 随进程死（宿主 `awaitSettlement` 结算），持久化 waitUntil（§57 现成）由 initRearm/tick 在新回合补发同一语义——双保险。
 3. **codemode**：`goal_wait` 工具注册 `codemode: true`（其余 11 个 goal 工具保持 `codemode: false` 原生暴露——它们无需挂起语义）。
 4. **tick 期限投递避让**：turn 活跃（阻塞等待中）时，tick 不投递期限 wake（工具返回本身就是唤醒）；turn 非活跃时照投（§57 parked 形态不变）。
@@ -979,6 +979,7 @@ goal_wait(minutes, background=false)   [codemode: true —— 12 个 goal 工具
 2. location `idleTimeToLive: Duration.infinity`——长挂起工具不触发空闲驱逐；显式 evict 时 `interrupt(inactivity, awaitSettlement: true)` 结算 in-flight 工具 → 走持久化期限兜底。
 3. 插件事件订阅 = host 实例级长订阅，工具挂起期间事件持续到达（同进程并发）→ 事件提前返回复用现有事件处理器，零新订阅基建。
 4. Code Mode：编目 = 全部工具除 `codemode:false`（`core/src/tool.ts:236`）；`execute` 默认无超时（`codemode.ts:25`）；JS 内 `await tools.<ns>.<tool>()` 即挂起。
+5. `POST /api/session/:id/shell`（server-fired）**把 204 空体响应握到 shell 进程跑完才回**（2026-10-26 活宿主探针：`sleep 3` → 3.4-3.8s 应答；进程本身在请求接收时即 spawn，store entry ~0.5s 可见，`metadata.sessionID` + `background:true` 由该路径写入）→ 插件侧发射必须 fire-and-forget，完成感知走 store 轮询（勿 await 响应，勿套短超时——5s 默认 fetch 超时会把 `sleep 60` 误判为发射失败）。
 
 **测试**：stub（挂起/期限返回/用户消息提前/其它 shell 提前/killed 提前/background 回归/重载兜底不双发）+ `verify-wait.ts` 真宿主扩展（2.1.4 隔离宿主：goal_wait(1) 挂起 60s 实测 + 等待中用户消息提前返回 + 决策指纹行）。
 **发布**：1.1.13（含 §59 遗留的 sweep waitUntil 回填，若同批落地）。
