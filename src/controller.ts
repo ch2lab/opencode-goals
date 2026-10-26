@@ -51,7 +51,7 @@ import {
 import { buildCompactionPrompt, composeCompactionSummary } from "./compact";
 import { decidePermission, GOAL_CONTROL_ACTION } from "./permission";
 import { appendDecision } from "./decisionlog";
-import type { HostEvent, PermissionDecision, PermissionHookInput, SessionMessage, WakeProbe } from "./types";
+import type { HostEvent, PermissionDecision, PermissionHookInput, SessionMessage, ShellEntry, WakeProbe } from "./types";
 
 // ---------------------------------------------------------------------------
 // Single-instance guard — v2 (2026-10-17 field follow-up, aiserver5/129).
@@ -227,7 +227,7 @@ type LastInboxEntry =
   // watchdog?: true marks OUR watchdog wakes (check-in / shell exit / lost —
   // Task 10). The boundary fast path (spec §7.1: a pure-text check-in reply
   // counts per the stall ladder) keeps normal arbitration exactly for these.
-  | { id: string; kind: "wake"; goalID: string; watchdog?: true }
+  | { id: string; kind: "wake"; goalID?: string; watchdog?: true }
   | { id: string; kind: "user" }
   | { id: string; kind: "control" }
   // compaction / move / unmarked synthetic / untracked — pinned in
@@ -1226,6 +1226,21 @@ export class GoalController {
         const reentry: LastInboxEntry = { id: inboxID, kind: "wake", goalID: wake.goalID };
         if (wake.watchdog === true) reentry.watchdog = true;
         entry = reentry;
+      } else if (
+        typeof payload.metadata === "object" &&
+        payload.metadata !== null &&
+        !Array.isArray(payload.metadata) &&
+        (payload.metadata as Record<string, unknown>).goalWake === true
+      ) {
+        // §60 (2026-10-26 verify incident): the PAYLOAD marker is authoritative
+        // (same discipline as the goalControl signal above) — the wakeInbox
+        // slot is single-per-session and a wake STORM (each countdown boundary
+        // injects a wake every ~1s) overwrites it: a stale own-wake's enqueued
+        // event no longer matched the slot and was classified "user", which
+        // resolved an in-flight BLOCKING goal_wait early. goalWake items are
+        // OUR loop traffic, never user input (slot match kept as fallback).
+        const wakeMeta = payload.metadata as Record<string, unknown>;
+        entry = { id: inboxID, kind: "wake", goalID: typeof wakeMeta.goalID === "string" ? wakeMeta.goalID : undefined };
       } else {
         entry = { id: inboxID, kind: "user" };
       }
@@ -3426,12 +3441,21 @@ export class GoalController {
       if (directory !== undefined) {
         const before = new Set((await this.probe.shellList(directory)).map((s) => s.id));
         await this.probe.shellFire(sessionID, `sleep ${minutes * 60}`);
-        const after = await this.probe.shellList(directory);
-        const fired = after.find((s) => !before.has(s.id) && s.sessionID === sessionID);
+        // The POST returns BEFORE the store entry exists (empty body on 2.1.4)
+        // — poll the claim for a couple of seconds (2026-10-26 verify: an
+        // immediate single query raced the store write and silently degraded
+        // to timer-only, losing the kill/clock semantics).
+        let fired: ShellEntry | undefined;
+        for (let attempt = 0; attempt < 6 && fired === undefined; attempt++) {
+          const after = await this.probe.shellList(directory);
+          fired = after.find((s) => !before.has(s.id) && s.sessionID === sessionID);
+          if (fired === undefined) await new Promise((r) => setTimeout(r, 500));
+        }
         shellID = fired?.id ?? "";
         // Tracked = every OTHER session shell at arm: the tick scan turns
         // their disappearance into the early "shell" return.
-        shells = new Set(after.filter((s) => s.sessionID === sessionID && s.id !== shellID).map((s) => s.id));
+        const afterFinal = await this.probe.shellList(directory);
+        shells = new Set(afterFinal.filter((s) => s.sessionID === sessionID && s.id !== shellID).map((s) => s.id));
         if (shellID === "") {
           console.warn(`opencode-goal: §60 wait clock shell not found in the store (timer-only fallback)`);
         }

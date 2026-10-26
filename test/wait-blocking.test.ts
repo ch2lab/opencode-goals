@@ -238,3 +238,42 @@ test("B9: an INACTIVITY interrupt (explicit evict) keeps the reload fallback —
   // window keeps its heartbeat — the §57 invariant).
   await stop();
 });
+
+test("B10: incident regression — an OWN injectWake enqueued mid-wait (the wakeInbox slot already overwritten by a newer wake) must NOT resolve the wait as a user message (payload goalWake marker is authoritative, §50 discipline)", async () => {
+  const { h, stop } = await boot();
+  await armGoal(h);
+  const p = fireWait(h);
+  await sleep(100);
+  // A stale own-wake: its id no longer sits in the single wakeInbox slot
+  // (a newer wake overwrote it) — but its payload carries goalWake: true.
+  // Pre-fix this was classified kind "user" and killed the wait (the 2026-10-26
+  // verify incident: a countdown wake storm resolved a 1-min wait in 15s).
+  await h.emit({
+    type: "session.inbox.enqueued",
+    id: "b10a",
+    properties: {
+      sessionID: S,
+      inboxID: "inbox_stale_wake",
+      item: {
+        type: "user",
+        payload: { text: "wake", metadata: { goalWake: true, goalID: "g_x", goalTurn: 3 } },
+        delivery: "queue",
+      },
+    },
+  });
+  await sleep(150);
+  expect(h.shellKillCalls).toEqual([]); // still hanging — the own-wake did NOT interrupt it
+  // A REAL user message still interrupts.
+  await h.emit({
+    type: "session.inbox.enqueued",
+    id: "b10b",
+    properties: {
+      sessionID: S,
+      inboxID: "inbox_b10_user",
+      item: { type: "user", payload: { text: "real user" }, delivery: "now" },
+    },
+  });
+  const reply = await p;
+  expect(reply).toContain("user message");
+  await stop();
+});
