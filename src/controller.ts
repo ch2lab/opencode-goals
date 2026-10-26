@@ -1254,8 +1254,20 @@ export class GoalController {
 
     // §60: a REAL user message resolves an in-flight BLOCKING wait early.
     // kind "user" excludes our own injected wakes and goalControl traffic —
-    // only a human-typed message interrupts the wait.
-    if (entry.kind === "user") void this.resolveWait(sessionID, { reason: "user" });
+    // only a human-typed message interrupts the wait. The resolving item's
+    // identity rides the decision line (2026-10-26: three verify runs died
+    // on an unidentified "user" resolution — the fingerprint must name it).
+    if (entry.kind === "user") {
+      const textPreview =
+        typeof payload.text === "string" && payload.text !== ""
+          ? payload.text.slice(0, 80)
+          : JSON.stringify(item).slice(0, 120);
+      void this.resolveWait(
+        sessionID,
+        { reason: "user" },
+        `item type=${itemType ?? "?"} goalControl=${isControl} text="${textPreview}"`,
+      );
+    }
 
     // spec §15-9 blocked resume: blocked goal + user inbox item → active.
     // §55 (2026-10-24 ruling, 129 incident: one blocked goal was re-resumed
@@ -3322,6 +3334,7 @@ export class GoalController {
   private async resolveWait(
     sessionID: string,
     r: { reason: "deadline" | "user" | "shell" | "cancelled"; shellID?: string; exit?: number },
+    detail?: string,
   ): Promise<void> {
     const wait = this.pendingWaits.get(sessionID);
     if (wait === undefined) return; // another resolution won the race
@@ -3360,7 +3373,7 @@ export class GoalController {
       sessionID,
       ownKnown: true,
       decision: "wait",
-      reason: `resolved (${r.reason}${r.shellID !== undefined ? `; shell ${r.shellID}` : ""}${r.exit !== undefined ? `; exit ${r.exit}` : ""})`,
+      reason: `resolved (${r.reason}${r.shellID !== undefined ? `; shell ${r.shellID}` : ""}${r.exit !== undefined ? `; exit ${r.exit}` : ""}${detail ? `; ${detail}` : ""})`,
     });
     wait.resolve(r);
   }
