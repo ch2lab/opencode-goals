@@ -61,7 +61,8 @@ export interface HostApi {
    * 204 — verified on v2.1.1 /openapi.json). */
   sessionBackground(sessionID: string): Promise<HostApiResult<undefined>>;
   /** §60: server-fired shell (POST /api/session/:id/shell, body {command}).
-   * The 2.1.4 response body is EMPTY — the fired shell is identified via
+   * The host holds the 204 response until the shell COMPLETES — the call is
+   * fire-and-forget (resolves immediately); the fired shell is claimed via
    * shellList afterward. */
   shellFire(sessionID: string, command: string): Promise<HostApiResult<undefined>>;
   /** §60: kill a shell (DELETE /api/shell/:id). Best-effort. */
@@ -319,20 +320,30 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
   }
 
   /** §60: POST /api/session/:id/shell {command} — server-fired shell (the
-   * goal_wait clock). Empty response body on 2.1.4: the caller identifies the
-   * fired shell via shellList (metadata.sessionID + command + newest started). */
+   * goal_wait clock). FIRE-AND-FORGET: the host holds the response (204,
+   * empty body) until the SHELL COMPLETES (verified 2026-10-26: `sleep 3`
+   * answered in ~3.7s) — awaiting it would block the wait for its whole
+   * duration and trip the fetch timeout. The server spawns the process on
+   * request receipt (store entry appears within ~0.5s), so the caller proceeds
+   * to claim the shell via shellList. The background fetch outlives this call;
+   * its outcome only warns (the claim poll is the arbiter). */
   async function shellFire(sessionID: string, command: string): Promise<HostApiResult<undefined>> {
-    const r = await doFetch(
-      `/api/session/${encodeURIComponent(sessionID)}/shell`,
-      "POST",
-      { "content-type": "application/json" },
-      JSON.stringify({ command }),
-    );
-    if ("reason" in r) return { state: "unavailable", reason: r.reason };
-    if (!r.ok) {
-      if (r.status === 404 && (await isSessionNotFound(r))) return { state: "ok" };
-      return { state: "unavailable", reason: `http-${r.status}` };
-    }
+    const p = await prepare();
+    if ("state" in p) return { state: "unavailable", reason: p.reason ?? "unknown" };
+    void fetchFn(p.base + `/api/session/${encodeURIComponent(sessionID)}/shell`, {
+      method: "POST",
+      headers: { ...p.headers, "content-type": "application/json" },
+      body: JSON.stringify({ command }),
+      // no timeout: the 204 arrives at shell completion (up to 60 min)
+    })
+      .then((r) => {
+        if (!r.ok && r.status !== 404) {
+          console.warn(`opencode-goal: shell fire (${command}) responded http-${r.status}`);
+        }
+      })
+      .catch((err: unknown) => {
+        console.warn(`opencode-goal: shell fire (${command}) request failed (${String(err).slice(0, 120)}) — claim polling decides`);
+      });
     return { state: "ok" };
   }
 

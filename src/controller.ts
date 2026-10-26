@@ -3441,12 +3441,11 @@ export class GoalController {
       if (directory !== undefined) {
         const before = new Set((await this.probe.shellList(directory)).map((s) => s.id));
         await this.probe.shellFire(sessionID, `sleep ${minutes * 60}`);
-        // The POST returns BEFORE the store entry exists (empty body on 2.1.4)
-        // — poll the claim for a couple of seconds (2026-10-26 verify: an
-        // immediate single query raced the store write and silently degraded
-        // to timer-only, losing the kill/clock semantics).
+        // The POST is fire-and-forget (the 204 only arrives at shell
+        // completion) — poll the claim: the store entry appears within
+        // ~0.5s on 2.1.4, allow up to ~5s for a slow host.
         let fired: ShellEntry | undefined;
-        for (let attempt = 0; attempt < 6 && fired === undefined; attempt++) {
+        for (let attempt = 0; attempt < 10 && fired === undefined; attempt++) {
           const after = await this.probe.shellList(directory);
           fired = after.find((s) => !before.has(s.id) && s.sessionID === sessionID);
           if (fired === undefined) await new Promise((r) => setTimeout(r, 500));

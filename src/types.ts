@@ -244,9 +244,11 @@ export interface WakeProbe {
   activeSessions(locationDirectory: string): Promise<Record<string, string>>; // hostapi GET /api/session/active（参考UI 在飞判据，2026-10-20：sessionID→status，"running" = 在飞；缺条目 = idle）
   /** §60: POST /api/session/:id/shell — server-fired shell (the goal_wait clock:
    * `sleep N` runs as a HOST process — survives plugin reload / machine sleep,
-   * visible + killable in the shell store). The response body is EMPTY on 2.1.4
-   * (verified 2026-10-26) — the caller identifies the shell via shellList.
-   * Failure throws (caller degrades to timer-only wait). */
+   * visible + killable in the shell store). The host holds the 204 response
+   * until the shell COMPLETES (verified 2026-10-26), so the call is
+   * fire-and-forget and resolves immediately — the caller claims the fired
+   * shell via shellList polling. Failure throws (caller degrades to
+   * timer-only wait). */
   shellFire(sessionID: string, command: string): Promise<void>;
   /** §60: DELETE /api/shell/:id — kill the wait shell (best-effort; caller catches). */
   shellKill(shellID: string): Promise<void>;
