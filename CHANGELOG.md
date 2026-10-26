@@ -7,6 +7,19 @@
 - 语言：**英文**（2026-10-22 裁定，适用于此后所有新版本：小节用 `### Added` / `### Fixed` / `### Optimizations & Design` / `### Verification`）；[1.1.7] 及更早章节保留原文。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
+## [Unreleased]
+
+### Added
+- **`goal_wait` is now an async wait primitive — BLOCKING by default (spec §60, 2026-10-26 ruling)**: a bare `goal_wait(minutes)` call now **hangs the calling turn** and returns only when the deadline is reached OR an event returns it early — a user message arrives ("respond to it now"), another shell of the session ends (server-fired shells via `shell.created`/`shell.exited` events; model-originated shells emit no events at all, so their completion is sensed by the watchdog tick's shell-store scan), or the wait is cancelled (its wait shell is killed). The result says which happened. The old non-blocking loop-held window is preserved as the `background: true` escape hatch (§57/§59 semantics — quiet window + one-shot deadline re-wake — unchanged). The wait clock is a **host-side `sleep` shell** (POST /api/session/:id/shell): it survives plugin reload and machine sleep, is visible in the shell store, and is killable (the kill IS the cancellation). The persisted `waitUntil` stays the reload fallback: while a blocking wait is in flight the watchdog tick skips its deadline delivery (the tool return is the wake itself), and after a reload it backfills the same "Goal wait period ended" wake. `goal_wait` is now the ONLY goal tool catalogued for Code Mode (`codemode: true`) — the model composes `await tools.goal.wait(...)` / `Promise.race` in `execute()` (host Code Mode has no default timeout); the other eleven tools stay native-only. The decision log gains `wait: armed blocking (…)` / `wait: resolved (deadline|user|shell|cancelled)` fingerprint lines (the 2026-10-26 04:18 129 "silent tick death" leaves no blind spot for the wait state anymore).
+
+### Optimizations & Design
+- The tool description and return texts now promise the blocking semantics honestly: no polling needed, `minutes` = the real expected duration, and the early-return text names the event (user / shell / cancelled / complete).
+- The early-return event set is closed by ruling: deadline, user message, other-shell end, wait-killed — provider/usage/subtask events are deliberately NOT wired (subtask execution events do not reach this host, §56).
+
+### Verification
+- Stub layer: 9 new `wait-blocking` tests (deadline via clock-shell exit / killed / other-shell early return / user-message early return (with goalControl-no-op) / clock-fire degradation / one-shot race / tick skip + no double-fire / non-inactivity interrupt abandons / inactivity interrupt preserves the reload fallback).
+- Real host (isolated 2.1.4, `verify-wait`): W8 — a bare `goal_wait(1)` turn really stays RUNNING ~60s with the clock shell live in the shell store, then "wait complete" + both fingerprint lines; W9 — a user message enqueued mid-wait returns a 5-minute wait in ~20s, the clock shell is killed, `resolved (user…)` line present.
+
 ## [1.1.12] - 2026-10-25
 
 ### Fixed

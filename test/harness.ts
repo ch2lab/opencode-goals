@@ -73,6 +73,8 @@ export interface Harness {
   failInboxList(on: boolean): void; // 脚本化 inbox 查询抛错（fail-closed 用例）
   shellListCalls: number; // shell.list 查询次数（活值 getter）
   backgroundCalls: string[]; // §52: sessionBackground 调用记录（sessionID）
+  shellFireCalls: Array<{ sessionID: string; command: string }>; // §60: shellFire 调用记录；fired 的 store 条目 id = `sh_wait_<n>`（n = 调用序号）
+  shellKillCalls: string[]; // §60: shellKill 调用记录（shellID）
   commands: Map<string, (text: string, sessionID: string) => Promise<void>>;
   commandDescriptions: Map<string, string>; // 命令菜单里的友好描述（宿主 CommandDefinition.description）
   namespaces: Map<string, string>; // 已声明的工具命名空间（宿主 editor.namespace，MCP-server 式）
@@ -290,6 +292,9 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
   let shellListFail = false;
   let shellListCalls = 0;
   const backgroundCalls: string[] = []; // §52: sessionBackground probe calls
+  let shellFireSeq = 0; // §60: server-fired shell id counter (`sh_wait_<n>`)
+  const shellFireCalls: Array<{ sessionID: string; command: string }> = [];
+  const shellKillCalls: string[] = [];
   let activeMap: Record<string, string> = {};
   let activeMapFail = false;
   let inboxListFail = false;
@@ -411,6 +416,25 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
     sessionBackground: async (sessionID) => {
       backgroundCalls.push(sessionID);
     },
+    // §60: POST /api/session/:id/shell stand-in — records the call and puts
+    // the server-fired entry into the store (id = `sh_wait_<n>`,
+    // metadata.sessionID + background, like the real server-fire path).
+    shellFire: async (sessionID, command) => {
+      shellFireCalls.push({ sessionID, command });
+      shellStore.push({
+        id: `sh_wait_${++shellFireSeq}`,
+        status: "running",
+        sessionID,
+        background: true,
+        command,
+        time: { started: Date.now() },
+      });
+    },
+    // §60: DELETE /api/shell/:id stand-in — records the call, prunes the store.
+    shellKill: async (shellID) => {
+      shellKillCalls.push(shellID);
+      shellStore = shellStore.filter((e) => e.id !== shellID);
+    },
     registerCommand: (name, description, run) => {
       commands.set(name, run);
       commandDescriptions.set(name, description);
@@ -471,6 +495,22 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
         }
       } else if (event.type === "session.shell.ended") {
         const id = (event.properties as { shell?: { id?: string } })?.shell?.id;
+        if (id !== undefined) shellStore = shellStore.filter((e) => e.id !== id);
+      } else if (event.type === "shell.created") {
+        // §60: server-fired store event — the host keeps the store from it
+        // (the ONLY shell path that emits these events).
+        const info = (event.properties as { info?: { id?: string; metadata?: { sessionID?: string } } })?.info;
+        if (info?.id !== undefined) {
+          shellStore.push({
+            id: info.id,
+            status: "running",
+            sessionID: info.metadata?.sessionID,
+            background: true,
+            time: { started: Date.now() },
+          });
+        }
+      } else if (event.type === "shell.exited" || event.type === "shell.deleted") {
+        const id = (event.properties as { id?: string })?.id;
         if (id !== undefined) shellStore = shellStore.filter((e) => e.id !== id);
       }
       return stream.emit(event);
@@ -555,6 +595,8 @@ export async function createHarness(overrides?: Record<string, unknown>): Promis
       return shellListCalls;
     },
     backgroundCalls,
+    shellFireCalls,
+    shellKillCalls,
     setMessages: (sessionID, msgs) => {
       messages.set(sessionID, structuredClone(msgs));
     },

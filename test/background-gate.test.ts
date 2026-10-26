@@ -212,7 +212,7 @@ test("7: goal_wait quiet — in-flight boundary arms nothing (no wake, no timer)
   await h.commandExecutor(S, "/goal set Quiet");
   h.setSession(S, { location: { directory: "/w" } });
   h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground
-  const reply = await h.toolExecutor("goal_wait", { minutes: 1 }, S);
+  const reply = await h.toolExecutor("goal_wait", { minutes: 1, background: true }, S);
   expect(reply).toContain("will not be woken");
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight boundary inside the waitUntil window
@@ -284,7 +284,7 @@ test("12: quiet (goal_wait window) covers the deadline - no reminder is injected
   await h.commandExecutor(S, "/goal set Quiet12");
   h.setSession(S, { location: { directory: "/w" } });
   h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]); // §54: unflagged = foreground
-  await h.toolExecutor("goal_wait", { minutes: 1 }, S); // waitUntil in force
+  await h.toolExecutor("goal_wait", { minutes: 1, background: true }, S); // waitUntil in force
   await modelWorked(h, "a");
   await h.emit(succeeded("b1", S)); // in-flight boundary inside the window → armed nothing
   await sleep(1500); // the due moment passes inside the quiet window

@@ -46,7 +46,7 @@ function wdArmed(ctrl: GoalController, sessionID: string): boolean {
 test("W1: goal_wait arms its OWN deadline wake — at the expiry the tick fires ONE unconditional 'Goal wait period ended' (session fully idle, nothing in flight — the incident shape)", async () => {
   const { h, ctrl, stop } = await boot();
   await h.commandExecutor(S, "/goal set W1");
-  const reply = await h.toolExecutor("goal_wait", { minutes: 1 }, S);
+  const reply = await h.toolExecutor("goal_wait", { minutes: 1, background: true }, S);
   expect(reply).toContain("will not be woken for 1 minutes"); // the silence window is still promised
   expect(reply).toContain("Goal wait period ended"); // ...and so is the deadline wake
   expect(goalOf(h).waitWakeSent).toBe(false);
@@ -68,7 +68,7 @@ test("W2: reload — an EXPIRED but undelivered waitUntil still wakes (the 2026-
   const c1 = new GoalController(h.probe, OPTS, { tickMs: 1 });
   const stop1 = await c1.start();
   await h.commandExecutor(S, "/goal set W2");
-  await h.toolExecutor("goal_wait", { minutes: 1 }, S);
+  await h.toolExecutor("goal_wait", { minutes: 1, background: true }, S);
   shiftWait(h, -1000); // the deadline has passed; instance 1 never got to fire it
   expect(h.prompts.length).toBe(0);
   await stop1(); // the reload: instance 1 dies with its timers
@@ -88,7 +88,7 @@ test("W3: reload — a PENDING (not yet expired) window is re-armed and fires at
   const c1 = new GoalController(h.probe, OPTS, { tickMs: 1 });
   const stop1 = await c1.start();
   await h.commandExecutor(S, "/goal set W3");
-  await h.toolExecutor("goal_wait", { minutes: 1 }, S);
+  await h.toolExecutor("goal_wait", { minutes: 1, background: true }, S);
   shiftWait(h, 500); // still 0.5s in the future
   await stop1();
   const c2 = new GoalController(h.probe, OPTS, { tickMs: 1 });
@@ -104,12 +104,12 @@ test("W3: reload — a PENDING (not yet expired) window is re-armed and fires at
 test("W4: a fresh goal_wait RESETS the one-shot — a second window fires its own wake", async () => {
   const { h, ctrl, stop } = await boot();
   await h.commandExecutor(S, "/goal set W4");
-  await h.toolExecutor("goal_wait", { minutes: 1 }, S);
+  await h.toolExecutor("goal_wait", { minutes: 1, background: true }, S);
   shiftWait(h, 30);
   await sleep(400);
   expect(h.prompts.length).toBe(1); // the first window fired
   expect(goalOf(h).waitWakeSent).toBe(true);
-  await h.toolExecutor("goal_wait", { minutes: 1 }, S); // the model waits again
+  await h.toolExecutor("goal_wait", { minutes: 1, background: true }, S); // the model waits again
   expect(goalOf(h).waitWakeSent).toBe(false); // the marker is reset with the window
   shiftWait(h, 30);
   await sleep(400);
@@ -122,7 +122,7 @@ test("W5: a turn that ENDS inside the goal_wait window is HELD — no wake (the 
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set W5");
   h.setSession(S, { location: { directory: "/w" } });
-  await h.toolExecutor("goal_wait", { minutes: 1 }, S);
+  await h.toolExecutor("goal_wait", { minutes: 1, background: true }, S);
   shiftWait(h, 800); // window until +800ms
   // The goal_wait turn ENDS (idle boundary, gate=0 — nothing in flight).
   await h.emit({ type: "session.execution.started", id: "w5a", properties: { sessionID: S } });

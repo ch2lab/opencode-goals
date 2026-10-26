@@ -18,7 +18,10 @@ export interface DecisionEntry {
   /** §54: this session's running FOREGROUND shells at the boundary (0/absent = none). */
   fg?: number;
   ownKnown: boolean;
-  decision: "wake" | "hold" | "skip" | "watchdog" | "resume";
+  /** §60: "wait" = a blocking goal_wait lifecycle line (armed / resolved) —
+   * the fingerprint for the wait state (the 2026-10-26 04:18 tick death was
+   * invisible precisely because the wait state left no line). */
+  decision: "wake" | "hold" | "skip" | "watchdog" | "resume" | "wait";
   reason: string;
 }
 

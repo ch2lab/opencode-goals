@@ -20,6 +20,7 @@
 
 ## 发布通道（2026-10-18 起：tag 触发 CI/OIDC）
 - 流程：main 开发（version 停在最后已发布版本）→ 发布时切 `publish` 分支 bump version + 把 `CHANGELOG.md` 的 `## [Unreleased]` 移到 `## [X.Y.Z] - 日期` → 打 `vX.Y.Z` tag → push → `publish.yml` 自动发布（版本门 tag==package.json → changelog 门 → typecheck/test → 双硬门 → npm publish → 自动创建 GitHub Release，零 token；provenance 自动附加 sigstore 日志）
+- **播种不等待 CI（用户 2026-10-25 裁定）**：push tag 后 CI 异步跑，**立即**用本地 `bun run scripts/publish.mjs pack`（同一套双硬门：strip 残留 + 文件清单，产物与 CI 同源）开始双机播种，不等发布结果。CI 结果事后核对（失败才回滚重播）
 - **版本说明（2026-10-20 裁定）**：每个版本必须带版本说明（更新了什么 / 修复了什么 / 优化与设计）。载体 = 仓库根 `CHANGELOG.md`（不进 tarball）：在途版本记 `## [Unreleased]`，三段 `### 新增` / `### 修复` / `### 优化与设计`（+ 可选 `### 验证`）；章节缺失/空 = CI 发布失败（npm publish 之前，fail fast）；publish 成功后 CI 自动创建 GitHub Release（标题 `vX.Y.Z`，正文 = 章节内容；重跑幂等 edit）。**语言 = 英文（2026-10-22 裁定：版本更新说明一律英文描述，小节用 `### Added` / `### Fixed` / `### Optimizations & Design`（+ 可选 `### Verification`）；[1.1.7] 及更早章节保留中文原文，不回填）**
 - 禁令不变：bump 与推 tag 都须用户当轮明令，CI 只执行
 - 仓库防护（bypass 均仅 ch2lab；agent push 日志出现 "Bypassed rule violations" 属正常）：`main-gate`（PR 1 审批 + `test` 检查必过 + 禁 force push）、`tag-gate`（`v*` tag 创建/删除受限）

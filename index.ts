@@ -294,6 +294,23 @@ export default Plugin.define({
         }
       },
 
+      // §60: hostapi shell fire/kill — the goal_wait clock is a HOST process
+      // (survives plugin reload / machine sleep; visible + killable in the
+      // shell store). Fire failure throws (the tool degrades to timer-only
+      // wait); kill is best-effort (the caller catches and warns).
+      shellFire: async (sessionID, command) => {
+        const r = await hostApi.shellFire(sessionID, command);
+        if (r.state !== "ok") {
+          throw new Error(`shell fire failed (${r.reason})`);
+        }
+      },
+      shellKill: async (shellID) => {
+        const r = await hostApi.shellKill(shellID);
+        if (r.state !== "ok") {
+          throw new Error(`shell kill failed (${r.reason})`);
+        }
+      },
+
       // Host session list (hostapi): GET /api/session, location-scoped like
       // shellList — the goal's project's sessions, each with parentID + time
       // (the in-flight subtask-discovery source; the in-process ctx.session.get

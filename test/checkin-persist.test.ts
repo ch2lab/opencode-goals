@@ -133,7 +133,7 @@ test("C5: quiet windows suppress the sweep — a goal_wait window with in-flight
   await h.commandExecutor(S, "/goal set C5");
   h.setSession(S, { location: { directory: "/w" } });
   h.setShells([{ id: "shX", status: "running", sessionID: S, background: true }]);
-  await h.toolExecutor("goal_wait", { minutes: 1 }, S); // future waitUntil window
+  await h.toolExecutor("goal_wait", { minutes: 1, background: true }, S); // future waitUntil window
   await sleep(700); // several sweep passes inside the window
   expect(checkins(h).length).toBe(0); // suppressed (the expiry wake is a different text family)
   await stop();

@@ -95,7 +95,8 @@ async function main(): Promise<void> {
   // the deadline must now wake the loop on its own).
   await host.api.prompt(
     S,
-    "Automated goal-loop test. Call the goal_wait tool with minutes set to 1. " +
+    "Automated goal-loop test. Call the goal_wait tool with minutes set to 1 AND set the background flag to true " +
+      "(this keeps the call non-blocking). " +
       "After the tool returns, reply with exactly: wait armed — and stop. " +
       "Do NOT call any other tool and do NOT call goal_set/goal_complete/goal_block.",
   );
@@ -176,7 +177,8 @@ async function main(): Promise<void> {
   const quietStart = Date.now();
   await host.api.prompt(
     S,
-    "Automated goal-loop test. Call the goal_wait tool with minutes set to 2. " +
+    "Automated goal-loop test. Call the goal_wait tool with minutes set to 2 AND set the background flag to true " +
+      "(this keeps the call non-blocking). " +
       "After the tool returns, reply with exactly: waiting — and stop. " +
       "Do NOT call any other tool and do NOT call goal_set/goal_complete/goal_block.",
   );
@@ -230,6 +232,97 @@ async function main(): Promise<void> {
       .filter((l) => l.includes(`"sessionID":"${S}"`))
       .slice(-6),
   });
+  // W8/W9: §60 BLOCKING default (2026-10-26 ruling) — a bare goal_wait call
+  // BLOCKS the turn: W8 the full window (host-side sleep clock visible in the
+  // shell store mid-wait), W9 an early return on a user message enqueued
+  // mid-wait (NOT the 5-minute deadline).
+  const readDecisions = (): Array<Record<string, unknown>> =>
+    readFileSync(decPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => {
+        try {
+          return JSON.parse(l) as Record<string, unknown>;
+        } catch {
+          return undefined as unknown as Record<string, unknown>;
+        }
+      })
+      .filter((e) => e !== undefined);
+
+  const t8 = Date.now();
+  await host.api.prompt(
+    S,
+    "Automated goal-loop test. Call the goal_wait tool with minutes set to 1 and NO other parameters " +
+      "(do NOT set background). This call BLOCKS until it returns — wait for it. " +
+      "After it returns, reply with exactly: blocking wait complete — and stop. " +
+      "Do NOT call any other tool and do NOT call goal_set/goal_complete/goal_block.",
+  );
+  // Mid-wait (~15s): the turn is still RUNNING (blocked inside the tool call)
+  // and the clock shell (`sleep 60`) is live in the host shell store.
+  while (Date.now() - t8 < 15_000) await sleep(1000);
+  const t8active = (await host.api.sessionActive())[S];
+  const t8shells = (await host.api.shellList()) as Array<Record<string, unknown>>;
+  const t8clock = t8shells.find((s) => String(s?.command ?? "").includes("sleep"));
+  check("W8a: turn STILL RUNNING mid-wait (blocking goal_wait)", t8active === "running", { active: t8active });
+  check("W8b: host-side clock shell live in the shell store mid-wait", t8clock !== undefined, {
+    shells: t8shells.map((s) => `${s?.id}:${s?.command}`),
+  });
+  const t8saw = await waitUntil(async () => {
+    const msgs = (await host.api.context(S)) as Array<Record<string, unknown>>;
+    return msgs.some((m) => String(m?.text ?? "").includes("blocking wait complete"));
+  }, WAIT_TIMEOUT_MS);
+  const t8secs = (Date.now() - t8) / 1000;
+  check("W8c: the wait really blocked ~60s before the turn finished", t8saw && t8secs >= 55, {
+    seconds: Math.round(t8secs),
+    tail: t8saw ? undefined : host.stdoutTail().slice(-300),
+  });
+  const t8armed = readDecisions().find(
+    (e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("armed blocking"),
+  );
+  const t8resolved = readDecisions().find(
+    (e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("resolved (deadline"),
+  );
+  check("W8d: decision log fingerprint — 'armed blocking' + 'resolved (deadline…)'", t8armed !== undefined && t8resolved !== undefined, {
+    armed: t8armed?.reason,
+    resolved: t8resolved?.reason,
+  });
+
+  const t9 = Date.now();
+  await host.api.prompt(
+    S,
+    "Automated goal-loop test. Call the goal_wait tool with minutes set to 5 and NO other parameters. " +
+      "It BLOCKS — wait for its return, then reply with exactly: <the tool's result text> — and stop. " +
+      "Do NOT call any other tool and do NOT call goal_set/goal_complete/goal_block.",
+  );
+  // ~20s in: still blocked. Then a USER message arrives — the enqueued event
+  // must return the wait IMMEDIATELY (the tool returns "wait interrupted").
+  while (Date.now() - t9 < 20_000) await sleep(1000);
+  const t9active = (await host.api.sessionActive())[S];
+  await host.api.prompt(
+    S,
+    "Automated test user message: reply with exactly: user interrupted the wait — and stop. Do not call any tool.",
+  );
+  const t9saw = await waitUntil(async () => {
+    const msgs = (await host.api.context(S)) as Array<Record<string, unknown>>;
+    return msgs.some((m) => String(m?.text ?? "").includes("user interrupted the wait"));
+  }, 120_000);
+  const t9secs = (Date.now() - t9) / 1000;
+  check("W9a: turn was RUNNING (blocked in goal_wait(5m)) when the user message was sent", t9active === "running", {
+    active: t9active,
+  });
+  check("W9b: the user message returned the wait EARLY — the turn finished in well under 5 minutes", t9saw && t9secs < 150, {
+    seconds: Math.round(t9secs),
+    tail: t9saw ? undefined : host.stdoutTail().slice(-300),
+  });
+  const t9resolved = readDecisions().find(
+    (e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("resolved (user"),
+  );
+  check("W9c: decision log fingerprint — 'wait: resolved (user…)'", t9resolved !== undefined, { line: t9resolved?.reason });
+  const t9shells = (await host.api.shellList()) as Array<Record<string, unknown>>;
+  check("W9d: the clock shell was killed (no 'sleep 300' left in the store)", !t9shells.some((s) => String(s?.command ?? "").includes("sleep 300")), {
+    shells: t9shells.map((s) => `${s?.id}:${s?.command}`),
+  });
+
   await host.stop();
   console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
   process.exit(failures === 0 ? 0 : 1);

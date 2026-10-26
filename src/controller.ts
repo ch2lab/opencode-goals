@@ -293,6 +293,21 @@ export class GoalController {
    * watchdog tick.
    */
   private checkinDue = new Map<string, { due: number; inFlight: number }>();
+  /** §60: in-flight BLOCKING goal_wait — the tool handler's await state. The
+   * host-side `sleep` shell is the clock; the persisted waitUntil is the
+   * reload fallback; resolve() comes from an event handler (user input /
+   * shell exit) or the JS fallback timer. One per session (a turn holds at
+   * most one tool call). */
+  private pendingWaits = new Map<
+    string,
+    {
+      shellID: string; // "" = timer-only (shell fire failed)
+      due: number;
+      timer: ReturnType<typeof setTimeout>;
+      shells: Set<string>; // session shells created during the wait (shell.created)
+      resolve: (r: { reason: "deadline" | "user" | "shell" | "cancelled"; shellID?: string; exit?: number }) => void;
+    }
+  >();
   /** warn-once set: shell-store query failures (safe direction keeps the gate armed). */
   private shellQueryWarned = new Set<string>();
   /** continuationPending window: value = arm time (ms) at wake injection,
@@ -537,23 +552,36 @@ export class GoalController {
         // goal_next_step = the model's mid-work recorder (the only tool the
         // model is expected to call spontaneously during work); the other
         // eleven are lifecycle/management — all twelve share
-        // GOAL_TOOL_OPTIONS (gate + native exposure + goal namespace).
+        // GOAL_TOOL_OPTIONS (gate + goal namespace). §60: goal_wait is the
+        // one exception to native-only exposure (codemode:true, its
+        // registration below).
         ...GOAL_TOOL_OPTIONS,
         run: (input, sessionID) => this.guarded("goal_next_step", () => this.toolNextStep(sessionID, input)),
       },
       {
         name: "wait",
         description:
-          "Suspend wake-ups for N minutes (integer 1..60) while waiting on something. " +
-          "The wait is a SILENCE window: at the deadline the loop re-wakes you with a " +
-          "'Goal wait period ended' notice (unconditional — it fires even if nothing else happens). " +
+          "Wait up to N minutes (integer 1..60) — a BLOCKING call by default: it does not return until the " +
+          "deadline OR an event returns it early: a user message arrives, another shell of this session ends, " +
+          "or the wait is cancelled (its wait shell is killed). The result says which happened. " +
+          "No polling: set minutes to your real expected duration and let the call hang. " +
+          "background=true keeps the classic non-blocking window (returns immediately; the loop re-wakes you " +
+          "at the deadline with a 'Goal wait period ended' notice). " +
           "Gating: goal.control permission; requires an ACTIVE goal.",
         input: {
           type: "object",
-          properties: { minutes: { type: "number" } },
+          properties: {
+            minutes: { type: "number" },
+            background: { type: "boolean" },
+          },
           required: ["minutes"],
         },
+        // §60: the ONLY goal tool catalogued for Code Mode (codemode:true) —
+        // the model composes `await tools.goal.wait(...)` / Promise.race in
+        // execute() (host Code Mode has no default timeout). The other eleven
+        // lifecycle tools stay GOAL_TOOL_OPTIONS (codemode:false, native).
         ...GOAL_TOOL_OPTIONS,
+        codemode: true,
         run: (input, sessionID) => this.guarded("goal_wait", () => this.toolWait(sessionID, input)),
       },
       {
@@ -1039,6 +1067,14 @@ export class GoalController {
 
   private async handleEvent(event: HostEvent): Promise<void> {
     if (this.stopped) return; // displaced mid-flight: in-flight event no-ops
+    // §60: shell.* events serve the BLOCKING wait clock and carry no top-level
+    // sessionID (shell.exited / shell.deleted data = { id, ... }; shell.created
+    // = { info } with the session on info.metadata.sessionID) — they must be
+    // handled BEFORE the attribution guard below.
+    if (event.type === "shell.created" || event.type === "shell.exited" || event.type === "shell.deleted") {
+      await this.onShellEvent(event);
+      return;
+    }
     const sessionID = event.properties?.sessionID;
     if (typeof sessionID !== "string" || sessionID === "") return; // 无归属：无 sessionID
     if (!(await this.sessionBelongs(sessionID))) return; // 无归属：非本实例 project
@@ -1066,10 +1102,12 @@ export class GoalController {
       case "session.execution.interrupted":
         await this.onInterrupted(sessionID, event);
         return;
-      // session.shell.* / shell.* are no longer consumed (2026-10-19): in-flight
-      // shells are discovered by the gate's shell-store query, not by events
-      // (model-originated shells emit none); completion is the one-shot
-      // progress check or a goal resume. They fall through to default.
+      // session.shell.* (session-scoped model shells) are no longer consumed
+      // (2026-10-19): in-flight shells are discovered by the gate's shell-store
+      // query, not by events; completion is the one-shot progress check or a
+      // goal resume. shell.* (service-level store events) are consumed BEFORE
+      // the switch (see onShellEvent) for the §60 blocking wait only. They
+      // fall through to default here.
       default:
         // session.compaction.* (Task 11), session.inbox.delivered — not
         // consumed by this task.
@@ -1199,6 +1237,11 @@ export class GoalController {
     }
     this.lastInbox.set(sessionID, entry);
 
+    // §60: a REAL user message resolves an in-flight BLOCKING wait early.
+    // kind "user" excludes our own injected wakes and goalControl traffic —
+    // only a human-typed message interrupts the wait.
+    if (entry.kind === "user") void this.resolveWait(sessionID, { reason: "user" });
+
     // spec §15-9 blocked resume: blocked goal + user inbox item → active.
     // §55 (2026-10-24 ruling, 129 incident: one blocked goal was re-resumed
     // AND re-woken on every user message — 5 times in an hour):
@@ -1254,6 +1297,20 @@ export class GoalController {
   private async onInterrupted(sessionID: string, event: HostEvent): Promise<void> {
     const props = event.properties;
     const reason = typeof props.reason === "string" ? props.reason : undefined;
+    // §60: a turn interrupted while a BLOCKING wait hangs. Inactivity (explicit
+    // evict) keeps the persisted waitUntil + the host-side clock shell ALIVE
+    // — the reloaded instance's init re-arm / tick backfills the same wake;
+    // any other interrupt (user Esc) ABANDONS the wait outright (kill the
+    // clock shell, close the window).
+    const wait = this.pendingWaits.get(sessionID);
+    if (wait !== undefined) {
+      if (reason === "inactivity") {
+        this.pendingWaits.delete(sessionID);
+        clearTimeout(wait.timer);
+      } else {
+        await this.resolveWait(sessionID, { reason: "cancelled" });
+      }
+    }
     if (reason === "inactivity") {
       await this.arbitrateBoundary(sessionID, event);
       return;
@@ -2445,14 +2502,57 @@ export class GoalController {
         );
       }
     }
+    // §60: BLOCKING wait in flight — sense its completion from the host shell
+    // store (the event path covers server-fired shells immediately; MODEL-
+    // originated shells emit no events at all, §56, so the store scan is
+    // THEIR completion sensor). Tracked shell gone → early "shell" return;
+    // clock shell gone off-schedule → killed. (JS timer + persisted
+    // waitUntil remain the fallbacks; a store-query failure skips the scan.)
+    const pendingWait = this.pendingWaits.get(sessionID);
+    if (pendingWait !== undefined) {
+      let current: Set<string> | undefined;
+      try {
+        const session = await this.probe.sessionGet(sessionID);
+        const directory = session?.location?.directory ?? this.probe.locationDirectory;
+        if (directory !== undefined) {
+          current = new Set((await this.probe.shellList(directory)).map((s) => s.id));
+        }
+      } catch {
+        current = undefined;
+      }
+      if (current !== undefined) {
+        if (pendingWait.shellID !== "" && !current.has(pendingWait.shellID)) {
+          void this.resolveWait(sessionID, {
+            reason: now >= pendingWait.due - 2000 ? "deadline" : "cancelled",
+            shellID: pendingWait.shellID,
+          });
+        } else {
+          for (const id of pendingWait.shells) {
+            if (!current.has(id)) {
+              void this.resolveWait(sessionID, { reason: "shell", shellID: id });
+              break;
+            }
+          }
+        }
+      }
+    }
     // §57 (2026-10-24 ruling): the goal_wait DEADLINE is a wake source. The
     // one-shot "wait period ended" wake fires UNCONDITIONALLY — no idle gate,
     // no quiet gate: a fully-idle session is exactly the parked case it must
     // rescue (the 2026-10-24 local incident: quiet hold + a reload killed the
     // only running timer, and nothing owned the waitUntil deadline). The
     // marker is PERSISTED before delivery (providerPause-retry pattern): a
-    // reload cannot double-fire it, and a new goal_wait resets it.
-    if (goal.waitUntil !== undefined && now >= goal.waitUntil && goal.waitWakeSent !== true) {
+    // reload cannot double-fire it, and a new goal_wait resets it. §60: while
+    // a BLOCKING wait is in flight the tick SKIPS this delivery — the tool
+    // return itself is the wake (its resolution persists waitWakeSent=true,
+    // or clears the window on early exit). After a reload pendingWaits is
+    // empty and this line is exactly the backfill.
+    if (
+      goal.waitUntil !== undefined &&
+      now >= goal.waitUntil &&
+      goal.waitWakeSent !== true &&
+      this.pendingWaits.get(sessionID) === undefined
+    ) {
       goal.waitWakeSent = true;
       await this.saveGoal(goal);
       await this.deliverWatchdogWake(goal, goalWaitExpiryText(goal.id, goal.waitMinutes), "watchdog goal_wait expiry");
@@ -2808,7 +2908,10 @@ export class GoalController {
     if (typeof minutes !== "number" || !Number.isInteger(minutes) || minutes < 1 || minutes > 60) {
       return `goal_wait: "minutes" must be an integer between 1 and 60 (got ${String(minutes)})`;
     }
-    return this.waitGoal(sessionID, minutes);
+    // §60: default = BLOCKING (the call hangs this turn until the deadline or
+    // an early-return event); background = the §57/§59 loop-held window
+    // (returns immediately; the loop re-wakes at the deadline).
+    return rec.background === true ? this.waitGoal(sessionID, minutes) : this.waitGoalBlocking(sessionID, minutes);
   }
 
   // ------------------------------------------------------------------
@@ -3186,6 +3289,191 @@ export class GoalController {
       `goal ${goal.id} will not be woken for ${minutes} minutes (until ${new Date(waitUntil).toISOString()}); ` +
       `at the deadline the loop re-wakes you with a "Goal wait period ended" notice`
     );
+  }
+
+  // ------------------------------------------------------------------
+  // §60 (2026-10-26 ruling): goal_wait is an ASYNC wait primitive. The
+  // default (background=false) BLOCKS the calling turn: the handler hangs
+  // on a promise that resolves from an EVENT (user message / shell exit /
+  // kill) or the JS fallback timer, while a host-side `sleep` shell ticks
+  // away in the shell store (survives plugin reload + machine sleep,
+  // visible and killable — the kill IS the cancellation). The persisted
+  // waitUntil (§57) is the reload fallback for the same deadline.
+  // ------------------------------------------------------------------
+
+  /** §60: one-shot resolution of a pending BLOCKING wait. Safe to call from
+   * event handlers, the tick store scan, the fallback timer, and interrupts:
+   * whoever deletes the entry first wins, later calls are no-ops. */
+  private async resolveWait(
+    sessionID: string,
+    r: { reason: "deadline" | "user" | "shell" | "cancelled"; shellID?: string; exit?: number },
+  ): Promise<void> {
+    const wait = this.pendingWaits.get(sessionID);
+    if (wait === undefined) return; // another resolution won the race
+    this.pendingWaits.delete(sessionID);
+    clearTimeout(wait.timer);
+    // Persistence settlement: the BLOCKING wait's clock is the HOST shell; the
+    // persisted waitUntil is only the RELOAD fallback. Early exit → the window
+    // is over (clear waitUntil: releases the quiet gate, no ghost deadline).
+    // Deadline → the one-shot marker CONSUMES the tick's deadline delivery
+    // (the tool return itself is the wake — a tick delivery would double-stimulus).
+    try {
+      const goal = await this.loadGoal(sessionID);
+      if (goal !== undefined && goal.waitUntil !== undefined) {
+        if (r.reason === "deadline") {
+          goal.waitWakeSent = true;
+        } else {
+          goal.waitUntil = undefined;
+          goal.waitWakeSent = undefined;
+        }
+        await this.saveGoal(goal);
+      }
+    } catch (err) {
+      console.warn(`opencode-goal: §60 wait settlement save failed for ${sessionID}:`, err);
+    }
+    // End the clock shell when we leave the wait EARLY (at the deadline the
+    // sleep already ran out; killing it would 404). Best-effort.
+    if (wait.shellID !== "" && r.reason !== "deadline") {
+      try {
+        await this.probe.shellKill(wait.shellID);
+      } catch (err) {
+        console.warn(`opencode-goal: §60 clock shell kill failed (${wait.shellID}):`, err);
+      }
+    }
+    void appendDecision({
+      ts: new Date().toISOString(),
+      sessionID,
+      ownKnown: true,
+      decision: "wait",
+      reason: `resolved (${r.reason}${r.shellID !== undefined ? `; shell ${r.shellID}` : ""}${r.exit !== undefined ? `; exit ${r.exit}` : ""})`,
+    });
+    wait.resolve(r);
+  }
+
+  /** §60: shell store events — the wait clock's sensors. Server-fired shells
+   * (our clock, other server-fired) emit these; MODEL-originated shells emit
+   * NONE (§56 forensics) — their completion is sensed by the tick store scan
+   * in runWatchdogTick. */
+  private async onShellEvent(event: HostEvent): Promise<void> {
+    const props = (event.properties ?? {}) as Record<string, unknown>;
+    if (event.type === "shell.created") {
+      const info = (typeof props.info === "object" && props.info !== null ? props.info : {}) as Record<string, unknown>;
+      const meta = (typeof info.metadata === "object" && info.metadata !== null ? info.metadata : {}) as Record<string, unknown>;
+      const sessionID = typeof meta.sessionID === "string" ? meta.sessionID : undefined;
+      const shellID = typeof info.id === "string" ? info.id : undefined;
+      if (sessionID === undefined || shellID === undefined) return;
+      const wait = this.pendingWaits.get(sessionID);
+      if (wait === undefined || wait.shellID === shellID) return; // own clock: tracked at arm
+      if (!(await this.sessionBelongs(sessionID))) return;
+      wait.shells.add(shellID);
+      return;
+    }
+    const shellID = typeof props.id === "string" ? props.id : undefined;
+    if (shellID === undefined) return;
+    const status = typeof props.status === "string" ? props.status : undefined;
+    const exit = typeof props.exit === "number" ? props.exit : undefined;
+    for (const [sessionID, wait] of this.pendingWaits) {
+      if (wait.shellID === shellID) {
+        // The clock shell left the store. shell.exited carries the exit
+        // status: killed = CANCELLED (the user's escape hatch); a natural
+        // exit/timeout = the sleep ran out = DEADLINE. shell.deleted carries
+        // no status (store cleanup may also delete a just-finished clock
+        // shell) → due heuristic.
+        const reason: "deadline" | "cancelled" =
+          event.type === "shell.deleted"
+            ? Date.now() >= wait.due - 2000
+              ? "deadline"
+              : "cancelled"
+            : status === "killed"
+              ? "cancelled"
+              : "deadline";
+        void this.resolveWait(sessionID, { reason, shellID, exit });
+        return;
+      }
+      if (wait.shells.has(shellID)) {
+        void this.resolveWait(sessionID, { reason: "shell", shellID, exit });
+        return;
+      }
+    }
+  }
+
+  /** §60: the BLOCKING goal_wait — hang the calling turn on the wait promise
+   * until the deadline or an early-return event. Returns the model-facing text. */
+  private async waitGoalBlocking(sessionID: string, minutes: number): Promise<string> {
+    const goal = await this.loadGoal(sessionID);
+    if (goal === undefined) return "no active goal for this session";
+    if (goal.status !== "active") return `goal ${goal.id} is not active (status: ${goal.status})`;
+    const due = Date.now() + minutes * 60_000;
+    // Persist FIRST: the §57 reload fallback — if this instance dies while
+    // the wait hangs (host restart, explicit evict), the fresh instance's
+    // init re-arm / tick delivers the SAME "wait period ended" wake at `due`.
+    goal.waitUntil = due;
+    goal.waitWakeSent = false;
+    goal.waitMinutes = minutes;
+    await this.saveGoal(goal);
+    // The call owns its heartbeat (the §57 lesson): the tick is the store
+    // scan sensor + the deadline backfill owner.
+    this.ensureWatchdog(sessionID);
+
+    // The clock is a HOST process: `sleep` in this session's shell store —
+    // survives plugin reload and machine sleep, visible and killable (the
+    // kill IS the cancellation). Fire/claim failure degrades to timer-only.
+    let shellID = "";
+    let shells = new Set<string>();
+    try {
+      const session = await this.probe.sessionGet(sessionID);
+      const directory = session?.location?.directory ?? this.probe.locationDirectory;
+      if (directory !== undefined) {
+        const before = new Set((await this.probe.shellList(directory)).map((s) => s.id));
+        await this.probe.shellFire(sessionID, `sleep ${minutes * 60}`);
+        const after = await this.probe.shellList(directory);
+        const fired = after.find((s) => !before.has(s.id) && s.sessionID === sessionID);
+        shellID = fired?.id ?? "";
+        // Tracked = every OTHER session shell at arm: the tick scan turns
+        // their disappearance into the early "shell" return.
+        shells = new Set(after.filter((s) => s.sessionID === sessionID && s.id !== shellID).map((s) => s.id));
+        if (shellID === "") {
+          console.warn(`opencode-goal: §60 wait clock shell not found in the store (timer-only fallback)`);
+        }
+      }
+    } catch (err) {
+      shellID = "";
+      shells = new Set();
+      console.warn(`opencode-goal: §60 wait clock shell fire failed (timer-only fallback):`, err);
+    }
+
+    let resolve!: (r: { reason: "deadline" | "user" | "shell" | "cancelled"; shellID?: string; exit?: number }) => void;
+    const result = new Promise<{ reason: "deadline" | "user" | "shell" | "cancelled"; shellID?: string; exit?: number }>(
+      (res) => {
+        resolve = res;
+      },
+    );
+    // Fallback timer: due + 5s slack — covers a LOST clock-shell event; the
+    // persisted waitUntil (tick) covers a dead process.
+    const timer = setTimeout(() => {
+      void this.resolveWait(sessionID, { reason: "deadline" });
+    }, minutes * 60_000 + 5_000);
+    this.pendingWaits.set(sessionID, { shellID, due, timer, shells, resolve });
+    void appendDecision({
+      ts: new Date().toISOString(),
+      sessionID,
+      goalID: goal.id,
+      ownKnown: true,
+      decision: "wait",
+      reason: `armed blocking (${minutes} min, clock ${shellID === "" ? "timer-only" : shellID}, until ${new Date(due).toISOString()})`,
+    });
+
+    const r = await result;
+    switch (r.reason) {
+      case "deadline":
+        return `wait complete: ${minutes} min elapsed (goal ${goal.id}).`;
+      case "user":
+        return `wait interrupted: a user message arrived — respond to it now (the wait window is closed).`;
+      case "shell":
+        return `wait interrupted: shell ${r.shellID ?? "?"} in this session ended (exit ${r.exit ?? "n/a"}) before the ${minutes}-min deadline — check its result.`;
+      case "cancelled":
+        return `wait cancelled (the wait shell was killed). The wait window is closed — re-arm with goal_wait if you still need to wait.`;
+    }
   }
 
   // ------------------------------------------------------------------

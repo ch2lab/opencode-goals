@@ -663,7 +663,7 @@ test("9: goal_wait writes waitUntil for 1..60 minutes; bad minutes and a missing
   const { h, stop } = await boot();
   await h.commandExecutor(S, "/goal set Batch run");
   const before = Date.now();
-  const reply = await h.toolExecutor("goal_wait", { minutes: 5 }, S);
+  const reply = await h.toolExecutor("goal_wait", { minutes: 5, background: true }, S);
   const after = Date.now();
   const w = goalOf(h)!.waitUntil;
   expect(w).toBeDefined();
@@ -714,10 +714,18 @@ test("10: all twelve goal_* tools register with permission goal.control", async 
   // (codemode:false) and grouped under the `goal` namespace (MCP-server
   // style) — registration names are prefix-free; the host flattens to
   // goal_<name>, so the model-visible names (the map keys above) are unchanged.
+  // §60 revision (2026-10-26): goal_wait is the SOLE Code Mode catalogued
+  // tool (codemode:true) — the model composes its blocking await in
+  // execute(); the other eleven stay native-only.
   for (const name of names) {
-    expect(h.tools.get(name)!.spec.codemode, `${name} must be native`).toBe(false);
+    const expectedCodemode = name === "goal_wait";
+    expect(h.tools.get(name)!.spec.codemode, `${name} codemode must be ${expectedCodemode}`).toBe(expectedCodemode);
     expect(h.tools.get(name)!.spec.namespace, `${name} must sit in the goal namespace`).toBe("goal");
   }
+  expect(
+    (h.tools.get("goal_wait")!.spec.input as { properties: Record<string, unknown> }).properties.background,
+    "goal_wait must carry the §60 background flag",
+  ).toBeDefined();
   expect(h.namespaces.get("goal"), "the goal namespace must be declared").toBeDefined();
   await stop();
 });

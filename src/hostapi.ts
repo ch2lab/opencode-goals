@@ -60,6 +60,12 @@ export interface HostApi {
   /** §52: the host's Ctrl+B server action (POST /api/session/:id/background,
    * 204 — verified on v2.1.1 /openapi.json). */
   sessionBackground(sessionID: string): Promise<HostApiResult<undefined>>;
+  /** §60: server-fired shell (POST /api/session/:id/shell, body {command}).
+   * The 2.1.4 response body is EMPTY — the fired shell is identified via
+   * shellList afterward. */
+  shellFire(sessionID: string, command: string): Promise<HostApiResult<undefined>>;
+  /** §60: kill a shell (DELETE /api/shell/:id). Best-effort. */
+  shellKill(shellID: string): Promise<HostApiResult<undefined>>;
 }
 
 export interface HostApiDeps {
@@ -154,6 +160,7 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
     path: string,
     method: "GET" | "DELETE" | "POST" = "GET",
     extraHeaders?: Record<string, string>,
+    body?: string,
   ): Promise<Fetched> {
     const p = await prepare();
     if ("state" in p) return { reason: p.reason ?? "unknown" };
@@ -161,6 +168,7 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
       return await fetchFn(p.base + path, {
         method,
         headers: extraHeaders ? { ...p.headers, ...extraHeaders } : p.headers,
+        body,
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
@@ -310,7 +318,32 @@ export function createHostApi(deps?: HostApiDeps): HostApi {
     return { state: "ok" };
   }
 
-  return { shellList, sessionList, activeSessions, inboxList, inboxCancel, sessionBackground };
+  /** §60: POST /api/session/:id/shell {command} — server-fired shell (the
+   * goal_wait clock). Empty response body on 2.1.4: the caller identifies the
+   * fired shell via shellList (metadata.sessionID + command + newest started). */
+  async function shellFire(sessionID: string, command: string): Promise<HostApiResult<undefined>> {
+    const r = await doFetch(
+      `/api/session/${encodeURIComponent(sessionID)}/shell`,
+      "POST",
+      { "content-type": "application/json" },
+      JSON.stringify({ command }),
+    );
+    if ("reason" in r) return { state: "unavailable", reason: r.reason };
+    if (!r.ok) {
+      if (r.status === 404 && (await isSessionNotFound(r))) return { state: "ok" };
+      return { state: "unavailable", reason: `http-${r.status}` };
+    }
+    return { state: "ok" };
+  }
+
+  async function shellKill(shellID: string): Promise<HostApiResult<undefined>> {
+    const r = await doFetch(`/api/shell/${encodeURIComponent(shellID)}`, "DELETE");
+    if ("reason" in r) return { state: "unavailable", reason: r.reason };
+    if (!r.ok) return { state: "unavailable", reason: `http-${r.status}` };
+    return { state: "ok" };
+  }
+
+  return { shellList, sessionList, activeSessions, inboxList, inboxCancel, sessionBackground, shellFire, shellKill };
 }
 
 /**

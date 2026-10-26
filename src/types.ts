@@ -242,6 +242,14 @@ export interface WakeProbe {
   sessionBackground(sessionID: string): Promise<void>;
   sessionList(locationDirectory: string): Promise<HostSession[]>; // hostapi GET /api/session（按目录限定，同 shellList；parentID 链 = 子任务归属源）
   activeSessions(locationDirectory: string): Promise<Record<string, string>>; // hostapi GET /api/session/active（参考UI 在飞判据，2026-10-20：sessionID→status，"running" = 在飞；缺条目 = idle）
+  /** §60: POST /api/session/:id/shell — server-fired shell (the goal_wait clock:
+   * `sleep N` runs as a HOST process — survives plugin reload / machine sleep,
+   * visible + killable in the shell store). The response body is EMPTY on 2.1.4
+   * (verified 2026-10-26) — the caller identifies the shell via shellList.
+   * Failure throws (caller degrades to timer-only wait). */
+  shellFire(sessionID: string, command: string): Promise<void>;
+  /** §60: DELETE /api/shell/:id — kill the wait shell (best-effort; caller catches). */
+  shellKill(shellID: string): Promise<void>;
   projectID?: string;
   locationDirectory?: string;
   // —— 注册面（adapter 转真实 ctx；harness 记录供断言；hook 载荷字段以 2.0.29 .d.ts 为准）——

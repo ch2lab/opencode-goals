@@ -948,3 +948,37 @@ tests/diagnostics/  # 回调丢失诊断实验：后台跑必然失败的脚本�
 
 **测试**：`test/wait-until.test.ts` W5（窗口内 gate=0 边界 → 零 wake；期限唤醒仍恰好一次；stub 378/0 + typecheck）。
 **验证边界（2026-10-25 真宿主已验）**：`scripts/verify-wait.ts` **11/11 全绿**（2.1.4 隔离宿主，lab LLM，宿主自写 service.json 注册表）：W0–W5（§57 原有断言回归：期限准点 + 一次性 + 决策行）+ W6（129 风暴形态：goal_wait(2m) 回合结束 → **窗口内零活动消息** → 期限恰好一条 expiry）+ W7（决策行 `hold: quiet window (goal_wait until …)` 实证——两个窗口各一条 hold + 各一条 expiry，交替出现）。教训：无注册表时边界查询全 skip，"零唤醒"是假绿——quiet hold 从未执行。
+
+## 60. 2026-10-26 裁定 — goal_wait 重定义为异步等待原语（默认阻塞 + codemode + shell 当年钟）
+
+**裁定来源（用户 2026-10-26，129 观察）**：模型把 goal_wait 当成"会真等待的调用"（129 转录：模型推理原文 "the wait seems to be returning almost immediately"，随后以 1 分钟最小窗轮询）。裁定链：① 做成**异步回调等待**——事件发生立即返回，或到时间返回；② **默认前台（阻塞）**；③ 不能是裸 JS sleep——**用 shell 执行**（宿主侧进程时钟：插件重载/机器休眠杀不死、可见、可 kill、有生命周期事件）；④ 工具须 **codemode=true** 进 Code Mode 编目——模型在 `execute` 里 `await tools.goal.wait(...)`，JS 原生提供 await/race/回调组合（宿主 Code Mode 默认无超时，`codemode.ts:25` 实证）。
+
+**原语定义**：
+```
+goal_wait(minutes, background=false)   [codemode: true —— 12 个 goal 工具中唯一]
+  background=false（默认）：挂起当前回合（工具调用 in-flight），race 返回：
+     ① 期限到            → "wait complete (N min elapsed)"
+     ② 用户消息到达       → 立即返回 "wait interrupted by user input — respond to it now"
+     ③ 本会话其它 shell 结束 → 立即返回 "the shell you may have been waiting on ended (id, exit code)"
+     ④ 等待 shell 被 kill  → 立即返回 "your wait was cancelled (shell killed)"（用户逃生）
+     ⑤ 强停/interrupt     → 宿主语义，turn 死，无需插件处理
+  background=true：现有 §57/§59 路径（循环持有等待：持久化静默窗 + 期限唤醒，模型继续干活）
+```
+**事件集封闭**（期限/用户消息/其它 shell 结束/等待 shell 被杀——不接 provider/usage/子任务：子任务执行事件不达本宿主（§56 实证），v1 不承诺）。
+
+**实现**：
+1. **shell 当年钟**：处理器经 hostapi 发射本会话 `sleep <N*60>`（`POST /api/session/:id/shell`——2.1.4 openapi 实证，同族端点 `DELETE /api/shell/:id` = kill 逃生、`GET /api/shell/:id` = 可查）；metadata 打 goalWait 标记。等待状态活在宿主 shell store，不落在插件内存。
+2. **处理器挂起** `Promise.race{ 期限 timer, 事件 resolver }`；controller 持 `pendingWaits: Map<sessionID,{resolve,shellID,due}>`。事件处理器检查 pendingWaits → resolve（一次性）。**插件重载/宿主重启**：await 随进程死（宿主 `awaitSettlement` 结算），持久化 waitUntil（§57 现成）由 initRearm/tick 在新回合补发同一语义——双保险。
+3. **codemode**：`goal_wait` 工具注册 `codemode: true`（其余 11 个 goal 工具保持 `codemode: false` 原生暴露——它们无需挂起语义）。
+4. **tick 期限投递避让**：turn 活跃（阻塞等待中）时，tick 不投递期限 wake（工具返回本身就是唤醒）；turn 非活跃时照投（§57 parked 形态不变）。
+5. **决策日志指纹**（治 2026-10-26 04:18 tick 死亡不可见）：`wait armed (shell sh_x, until …)` / `wait resolved (user|shell|killed|deadline)` / 期限 late-backfill 行——进 decisions 文件（129 持久可读）。
+6. **工具描述/返回文本重写**：阻塞语义 + "无需轮询、minutes=真实预期"；background 模式保留 §59 契约（调完结束回合）。
+
+**宿主契约（2026-10-26 只读取证，oc-src v2.1.1 + 2.1.4 openapi）**：
+1. 工具执行**无宿主超时**（timeout 仅在模型流式层；shell 工具 timeout:0 同构）→ 阻塞等待 60min 上限内安全。
+2. location `idleTimeToLive: Duration.infinity`——长挂起工具不触发空闲驱逐；显式 evict 时 `interrupt(inactivity, awaitSettlement: true)` 结算 in-flight 工具 → 走持久化期限兜底。
+3. 插件事件订阅 = host 实例级长订阅，工具挂起期间事件持续到达（同进程并发）→ 事件提前返回复用现有事件处理器，零新订阅基建。
+4. Code Mode：编目 = 全部工具除 `codemode:false`（`core/src/tool.ts:236`）；`execute` 默认无超时（`codemode.ts:25`）；JS 内 `await tools.<ns>.<tool>()` 即挂起。
+
+**测试**：stub（挂起/期限返回/用户消息提前/其它 shell 提前/killed 提前/background 回归/重载兜底不双发）+ `verify-wait.ts` 真宿主扩展（2.1.4 隔离宿主：goal_wait(1) 挂起 60s 实测 + 等待中用户消息提前返回 + 决策指纹行）。
+**发布**：1.1.13（含 §59 遗留的 sweep waitUntil 回填，若同批落地）。
