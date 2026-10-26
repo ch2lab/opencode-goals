@@ -114,6 +114,7 @@ async function main(): Promise<void> {
   // session is FULLY IDLE: no in-flight shells, no subtasks, no queue.
   // This is the parked shape of the 2026-10-24 incident (plus the §57 fix:
   // the deadline must now wake the loop on its own).
+  const t2sent = Date.now();
   await host.api.prompt(
     S,
     "Automated goal-loop test. Call the goal_wait tool with minutes set to 1 AND set the background flag to true " +
@@ -123,29 +124,51 @@ async function main(): Promise<void> {
   );
   check("W2: session idle after the goal_wait turn", await waitUntil(idle, 90_000));
 
+  // Decision-log evidence (2026-10-26 r5: the countdown storm makes the host
+  // COMPACT the transcript — old wake messages disappear from context(), but
+  // the decision log is the plugin's own durable record: exactly one
+  // "watchdog goal_wait expiry" line per fired deadline).
+  const decDir = join(process.env.TEMP ?? "C:\\Windows\\Temp", "opencode-goal");
+  const decPath = join(decDir, `decisions-${host.pid}.jsonl`);
+  const readDecisions = (): Array<Record<string, unknown>> =>
+    readFileSync(decPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => {
+        try {
+          return JSON.parse(l) as Record<string, unknown>;
+        } catch {
+          return undefined as unknown as Record<string, unknown>;
+        }
+      })
+      .filter((e) => e !== undefined);
+  const expiryLogLines = (sinceMs?: number): number =>
+    readDecisions().filter(
+      (e) =>
+        e.sessionID === S &&
+        e.decision === "watchdog" &&
+        String(e.reason).includes("goal_wait expiry") &&
+        (sinceMs === undefined || Date.parse(String(e.ts)) >= sinceMs),
+    ).length;
+
   // W3: the deadline wake lands on its own — ~60s window + 2s tick.
   const saw = await waitUntil(async () => (await expiryMessages()).length >= 1, WAIT_TIMEOUT_MS);
   const first = (await expiryMessages())[0] ?? "";
-  check("W3: 'Goal wait period ended' wake fired at the deadline (unconditional — session fully idle)", saw, {
-    text: first.slice(0, 300),
-    tail: saw ? undefined : host.stdoutTail().slice(-300),
-  });
+  // Primary: the wake text in context. Fallback: the decision line (the
+  // transcript may already be compacted — r5: W3's own message was gone by W4).
+  check(
+    "W3: 'Goal wait period ended' wake fired at the deadline (unconditional — session fully idle)",
+    saw || expiryLogLines(t2sent) >= 1,
+    { text: first.slice(0, 300), expiryLines: expiryLogLines(t2sent), tail: saw ? undefined : host.stdoutTail().slice(-300) },
+  );
   await sleep(ONE_SHOT_GRACE_MS);
-  // Sample the grace window several times: the count must NEVER exceed 1. A
-  // single sample can race the host's message store (2026-10-26 run read 0
-  // right after reading 1) — the invariant is "no second expiry", not "this
-  // exact read saw the first one".
-  let maxCount = 0;
-  for (let i = 0; i < 5; i++) {
-    maxCount = Math.max(maxCount, (await expiryMessages()).length);
-    await sleep(4_000);
-  }
-  check("W4: ONE-SHOT — no second expiry wake within the grace window", maxCount === 1, { maxCount });
+  // ONE-SHOT from the LOG (immune to compaction and to context-read races):
+  // exactly one expiry line for the W2 window must exist, no more.
+  const w4count = expiryLogLines(t2sent);
+  check("W4: ONE-SHOT — no second expiry wake within the grace window", w4count === 1, { maxCount: w4count });
 
   // W5: the decision log carries the watchdog line (the 129 "silent no-op"
   // anti-pattern: a line = a decision actually made).
-  const decDir = join(process.env.TEMP ?? "C:\\Windows\\Temp", "opencode-goal");
-  const decPath = join(decDir, `decisions-${host.pid}.jsonl`);
   let line: unknown = undefined;
   try {
     const lines = readFileSync(decPath, "utf8").split("\n").filter(Boolean);
@@ -213,7 +236,6 @@ async function main(): Promise<void> {
   );
   check("W6a: session idle after the goal_wait(2m) turn", await waitUntil(idle, 90_000));
   const baseActivity = await activityCount(); // baseline AFTER the wait turn's own messages landed
-  const baseExpiry = (await expiryMessages()).length; // the W2-window expiry is still in context — delta, not absolute
   const deadline = readGoal()?.waitUntil;
   check("W6b: persisted goal_wait deadline >= 90s out (test not degenerate)", (deadline ?? 0) - quietStart >= 90_000, {
     deadline,
@@ -226,13 +248,13 @@ async function main(): Promise<void> {
     check("W6c: QUIET — zero loop wakes inside the goal_wait window", !midQuiet, {
       activity: midQuiet ? (await activityCount()) - baseActivity : 0,
     });
-    // The deadline wake lands (one-shot, exactly one).
+    // The deadline wake lands (one-shot, exactly one) — from the DECISION LOG
+    // (r5: the transcript is compacted by the countdown storm, so the wake
+    // text is no longer in context() — the log line is the durable truth).
     const msToDeadline = deadline - Date.now();
     if (msToDeadline > 0) await sleep(msToDeadline + 5_000); // wait past the deadline (+tick margin)
-    const sawExp = await waitUntil(async () => (await expiryMessages()).length >= 1, 20_000);
-    await sleep(20_000);
-    const nExp = (await expiryMessages()).length;
-    check("W6d: ONE expiry wake at the deadline", sawExp && nExp === baseExpiry + 1, { count: nExp, base: baseExpiry });
+    const w6exp = expiryLogLines(quietStart);
+    check("W6d: ONE expiry wake at the deadline (decision log — compaction-proof)", w6exp === 1, { count: w6exp });
   }
   // W7: the decision log shows a quiet-window HOLD for this window (either
   // gate shape — gate=0 "quiet window (goal_wait until …)" or gate>0 "in-flight,
@@ -265,19 +287,6 @@ async function main(): Promise<void> {
   // BLOCKS the turn: W8 the full window (host-side sleep clock visible in the
   // shell store mid-wait), W9 an early return on a user message enqueued
   // mid-wait (NOT the 5-minute deadline).
-  const readDecisions = (): Array<Record<string, unknown>> =>
-    readFileSync(decPath, "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => {
-        try {
-          return JSON.parse(l) as Record<string, unknown>;
-        } catch {
-          return undefined as unknown as Record<string, unknown>;
-        }
-      })
-      .filter((e) => e !== undefined);
-
   const t8 = Date.now();
   await host.api.prompt(
     S,
