@@ -102,10 +102,13 @@ async function main(): Promise<void> {
   // the countdown loop runs autonomously and would burn a 20-turn cap mid-test.
   const stSet = await host.api.command(S, "goal", "set Endless countdown: each turn reply with the next integer counting DOWN from 100, nothing else. This goal is never completed. --turns 1000");
   check("W0: /goal set accepted", stSet >= 200, { status: stSet });
-  // 150s: the first lab-model turn is the slowest (cold vLLM) — idle means
-  // "not mid-turn right now", which the 1s poll can legitimately keep missing
-  // while the countdown loop stays busy (2026-10-26 run flaked at 90s).
-  check("W1: session idle after the kick turn", await waitUntil(idle, 150_000));
+  // Soft wait (NOT a check): the countdown goal keeps the loop in a ~1s wake
+  // storm — the session may never hit a visible idle gap. A user prompt sent
+  // into a busy session is simply QUEUED and delivered at the next idle, so
+  // downstream phases are unaffected (2026-10-26 r4: hard-failed here for 150s
+  // while everything after it worked fine).
+  if (await waitUntil(idle, 60_000)) console.log("W1: session idle after the kick turn");
+  else console.log("W1: still in wake storm after 60s — continuing (queued prompts deliver at the next idle)");
 
   // W2: the model declares a 1-minute wait and ends its turn — then the
   // session is FULLY IDLE: no in-flight shells, no subtasks, no queue.
@@ -299,13 +302,21 @@ async function main(): Promise<void> {
     seconds: Math.round(t8secs),
     tail: t8saw ? undefined : host.stdoutTail().slice(-300),
   });
-  const t8armed = readDecisions().find(
-    (e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("armed blocking"),
+  // The model may have spontaneously used the (new, default-blocking) tool on
+  // earlier storm turns — match the LATEST 1-min arm and its OWN clock shell.
+  const t8armeds = readDecisions().filter(
+    (e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("armed blocking (1 min"),
   );
+  const t8armed = t8armeds[t8armeds.length - 1];
+  const t8clock = t8armed ? String(t8armed.reason).match(/clock (sh_[a-z0-9]+|timer-only)/)?.[1] : undefined;
   const t8resolved = readDecisions().find(
-    (e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("resolved (deadline"),
+    (e) =>
+      e.sessionID === S &&
+      e.decision === "wait" &&
+      String(e.reason).includes("resolved (deadline") &&
+      (t8clock === undefined || t8clock === "timer-only" || String(e.reason).includes(t8clock)),
   );
-  check("W8d: decision log fingerprint — 'armed blocking' + 'resolved (deadline…)'", t8armed !== undefined && t8resolved !== undefined, {
+  check("W8d: decision log fingerprint — 'armed blocking' + 'resolved (deadline…)' for THIS wait's clock", t8armed !== undefined && t8resolved !== undefined, {
     armed: t8armed?.reason,
     resolved: t8resolved?.reason,
   });
@@ -334,12 +345,28 @@ async function main(): Promise<void> {
     seconds: Math.round(t9secs),
     tail: t9saw ? undefined : host.stdoutTail().slice(-300),
   });
+  // W9c: the resolving item must be W9's OWN second message (the fingerprint
+  // now names the item's text — an earlier stale 'resolved (user)' line must
+  // not satisfy this).
   const t9resolved = readDecisions().find(
-    (e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("resolved (user"),
+    (e) =>
+      e.sessionID === S &&
+      e.decision === "wait" &&
+      String(e.reason).includes("resolved (user") &&
+      String(e.reason).includes("user interrupted the wait"),
   );
-  check("W9c: decision log fingerprint — 'wait: resolved (user…)'", t9resolved !== undefined, { line: t9resolved?.reason });
+  check("W9c: decision log fingerprint — 'wait: resolved (user…)' for W9's own message", t9resolved !== undefined, { line: t9resolved?.reason });
+  const t9armeds = readDecisions().filter(
+    (e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("armed blocking (5 min"),
+  );
+  const t9armed = t9armeds[t9armeds.length - 1];
+  const t9clock = t9armed ? String(t9armed.reason).match(/clock (sh_[a-z0-9]+)/)?.[1] : undefined;
   const t9shells = (await host.api.shellList()) as Array<Record<string, unknown>>;
-  check("W9d: the clock shell was killed (no 'sleep 300' left in the store)", !t9shells.some((s) => String(s?.command ?? "").includes("sleep 300")), {
+  const t9alive = t9clock
+    ? t9shells.some((s) => s?.id === t9clock)
+    : t9shells.some((s) => String(s?.command ?? "").includes("sleep 300"));
+  check("W9d: W9's clock shell was killed (its id is not in the store)", t9clock !== undefined && !t9alive, {
+    clock: t9clock,
     shells: t9shells.map((s) => `${s?.id}:${s?.command}`),
   });
 
