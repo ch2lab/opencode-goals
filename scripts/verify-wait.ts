@@ -87,7 +87,10 @@ async function main(): Promise<void> {
   // the countdown loop runs autonomously and would burn a 20-turn cap mid-test.
   const stSet = await host.api.command(S, "goal", "set Endless countdown: each turn reply with the next integer counting DOWN from 100, nothing else. This goal is never completed. --turns 1000");
   check("W0: /goal set accepted", stSet >= 200, { status: stSet });
-  check("W1: session idle after the kick turn", await waitUntil(idle, 90_000));
+  // 150s: the first lab-model turn is the slowest (cold vLLM) — idle means
+  // "not mid-turn right now", which the 1s poll can legitimately keep missing
+  // while the countdown loop stays busy (2026-10-26 run flaked at 90s).
+  check("W1: session idle after the kick turn", await waitUntil(idle, 150_000));
 
   // W2: the model declares a 1-minute wait and ends its turn — then the
   // session is FULLY IDLE: no in-flight shells, no subtasks, no queue.
@@ -110,8 +113,16 @@ async function main(): Promise<void> {
     tail: saw ? undefined : host.stdoutTail().slice(-300),
   });
   await sleep(ONE_SHOT_GRACE_MS);
-  const all = await expiryMessages();
-  check("W4: ONE-SHOT — no second expiry wake within the grace window", all.length === 1, { count: all.length });
+  // Sample the grace window several times: the count must NEVER exceed 1. A
+  // single sample can race the host's message store (2026-10-26 run read 0
+  // right after reading 1) — the invariant is "no second expiry", not "this
+  // exact read saw the first one".
+  let maxCount = 0;
+  for (let i = 0; i < 5; i++) {
+    maxCount = Math.max(maxCount, (await expiryMessages()).length);
+    await sleep(4_000);
+  }
+  check("W4: ONE-SHOT — no second expiry wake within the grace window", maxCount === 1, { maxCount });
 
   // W5: the decision log carries the watchdog line (the 129 "silent no-op"
   // anti-pattern: a line = a decision actually made).

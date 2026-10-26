@@ -18,7 +18,7 @@
 
 ### Verification
 - Stub layer: 9 new `wait-blocking` tests (deadline via clock-shell exit / killed / other-shell early return / user-message early return (with goalControl-no-op) / clock-fire degradation / one-shot race / tick skip + no double-fire / non-inactivity interrupt abandons / inactivity interrupt preserves the reload fallback).
-- Real host (isolated 2.1.4, `verify-wait`): W8 — a bare `goal_wait(1)` turn really stays RUNNING ~60s with the clock shell live in the shell store, then "wait complete" + both fingerprint lines; W9 — a user message enqueued mid-wait returns a 5-minute wait in ~20s, the clock shell is killed, `resolved (user…)` line present.
+- Real host (isolated 2.1.4, `verify-wait`): W8 — a bare `goal_wait(1)` turn really stays RUNNING ~60s with the clock shell live in the shell store, then "wait complete" + both fingerprint lines; W9 — a user message enqueued mid-wait returns a 5-minute wait in ~20s, the clock shell is killed, `resolved (user…)` line present. The first real-host run surfaced two development-cycle bugs, fixed before publication: (1) **clock-shell claim race** — the single `shellList` query immediately after the (empty-body) POST raced the store write and silently degraded the wait to timer-only (no kill, no clock sensing); the claim now polls the store up to ~3s; (2) **own-wake misclassification** — an `injectWake` item whose id no longer sat in the single `wakeInbox` slot (a wake storm overwrites it) was classified `kind "user"` and killed an in-flight blocking wait early; the payload `goalWake` marker now authoritatively reclassifies our loop traffic as "wake" (same payload-authoritative discipline as the `goalControl` signal, §50).
 
 ## [1.1.12] - 2026-10-25
 
