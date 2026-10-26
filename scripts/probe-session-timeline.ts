@@ -14,10 +14,6 @@ for (const r of rows) {
     // keep scanning
   }
 }
-  } catch {
-    // keep scanning
-  }
-}
 for (const [ses, msgs] of bySes) {
   if (!msgs.length) continue;
   console.log(`\n=== session ${ses} ===`);
@@ -30,7 +26,7 @@ for (const [ses, msgs] of bySes) {
       .map((p) => {
         const pt = String(p?.type ?? "");
         if (pt === "text") return `text="${String(p?.text ?? "").slice(0, 70).replace(/\n/g, " ")}"`;
-        if (pt === "tool") return `tool=${String(p?.name ?? p?.tool ?? "?")}${p?.state?.status ? ` [${p.state.status}]` : ""}`;
+        if (pt === "tool") return `tool=${String(p?.name ?? p?.tool ?? "?")}${(p?.state as { status?: string } | undefined)?.status ? ` [${(p.state as { status?: string }).status}]` : ""}`;
         return pt;
       })
       .filter(Boolean)
