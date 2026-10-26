@@ -81,6 +81,21 @@ async function main(): Promise<void> {
     }
     return out;
   };
+  // MODEL-reply text only (2026-10-26 verify bug: a user prompt containing a
+  // magic phrase matched `m.text` and faked a "reply arrived" — user/synthetic
+  // items carry top-level `text`, assistant replies carry content parts).
+  const assistantText = async (): Promise<string> => {
+    const msgs = (await host.api.context(S)) as Array<Record<string, unknown>>;
+    let out = "";
+    for (const m of msgs) {
+      if (m?.type !== "assistant") continue;
+      const content = (Array.isArray(m.content) ? m.content : []) as Array<Record<string, unknown>>;
+      for (const p of content) {
+        if (p?.type === "text" && typeof p.text === "string") out += p.text + "\n";
+      }
+    }
+    return out;
+  };
 
   // W0: set the goal (kick turn). --turns 1000: with the service.json registry
   // the boundaries actually arbitrate (no more "host context dead" skips), so
@@ -278,10 +293,7 @@ async function main(): Promise<void> {
   check("W8b: host-side clock shell live in the shell store mid-wait", t8clock !== undefined, {
     shells: t8shells.map((s) => `${s?.id}:${s?.command}`),
   });
-  const t8saw = await waitUntil(async () => {
-    const msgs = (await host.api.context(S)) as Array<Record<string, unknown>>;
-    return msgs.some((m) => String(m?.text ?? "").includes("blocking wait complete"));
-  }, WAIT_TIMEOUT_MS);
+  const t8saw = await waitUntil(async () => (await assistantText()).includes("blocking wait complete"), WAIT_TIMEOUT_MS);
   const t8secs = (Date.now() - t8) / 1000;
   check("W8c: the wait really blocked ~60s before the turn finished", t8saw && t8secs >= 55, {
     seconds: Math.round(t8secs),
@@ -313,10 +325,7 @@ async function main(): Promise<void> {
     S,
     "Automated test user message: reply with exactly: user interrupted the wait — and stop. Do not call any tool.",
   );
-  const t9saw = await waitUntil(async () => {
-    const msgs = (await host.api.context(S)) as Array<Record<string, unknown>>;
-    return msgs.some((m) => String(m?.text ?? "").includes("user interrupted the wait"));
-  }, 120_000);
+  const t9saw = await waitUntil(async () => (await assistantText()).includes("user interrupted the wait"), 120_000);
   const t9secs = (Date.now() - t9) / 1000;
   check("W9a: turn was RUNNING (blocked in goal_wait(5m)) when the user message was sent", t9active === "running", {
     active: t9active,
