@@ -4,15 +4,16 @@ import { Database } from "bun:sqlite";
 
 const dir = process.argv[2];
 const db = new Database(`${dir}\\data\\opencode\\opencode.db`, { readonly: true });
-const rows = db.query("SELECT value FROM message_table WHERE data LIKE '%ses_%'").all() as Array<{ value: string }>;
-const bySes = new Map<string, Array<Record<string, unknown>>>();
+const rows = db.query("SELECT session_id, data FROM session_message").all() as Array<{ session_id: string; data: string }>;
+const bySes = new Map<string, any[]>();
 for (const r of rows) {
   try {
-    const m = JSON.parse(r.value) as Record<string, unknown>;
-    const props = m?.properties as Record<string, unknown> | undefined;
-    const data = (m?.data ?? props ?? {}) as Record<string, unknown>;
-    const ses = String(data.sessionID ?? m?.aggregateID ?? "?");
-    bySes.set(ses, [...(bySes.get(ses) ?? []), data]);
+    const data = JSON.parse(r.data) as Record<string, unknown>;
+    bySes.set(r.session_id, [...(bySes.get(r.session_id) ?? []), data]);
+  } catch {
+    // keep scanning
+  }
+}
   } catch {
     // keep scanning
   }

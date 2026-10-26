@@ -308,13 +308,13 @@ async function main(): Promise<void> {
     (e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("armed blocking (1 min"),
   );
   const t8armed = t8armeds[t8armeds.length - 1];
-  const t8clock = t8armed ? String(t8armed.reason).match(/clock (sh_[a-z0-9]+|timer-only)/)?.[1] : undefined;
+  const t8clockID = t8armed ? String(t8armed.reason).match(/clock (sh_[a-z0-9]+|timer-only)/)?.[1] : undefined;
   const t8resolved = readDecisions().find(
     (e) =>
       e.sessionID === S &&
       e.decision === "wait" &&
       String(e.reason).includes("resolved (deadline") &&
-      (t8clock === undefined || t8clock === "timer-only" || String(e.reason).includes(t8clock)),
+      (t8clockID === undefined || t8clockID === "timer-only" || String(e.reason).includes(t8clockID)),
   );
   check("W8d: decision log fingerprint — 'armed blocking' + 'resolved (deadline…)' for THIS wait's clock", t8armed !== undefined && t8resolved !== undefined, {
     armed: t8armed?.reason,
