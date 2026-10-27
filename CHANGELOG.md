@@ -7,7 +7,7 @@
 - 语言：**英文**（2026-10-22 裁定，适用于此后所有新版本：小节用 `### Added` / `### Fixed` / `### Optimizations & Design` / `### Verification`）；[1.1.7] 及更早章节保留原文。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
-## [Unreleased]
+## [1.1.16] - 2026-10-28
 
 ### Added
 - **`goal_wait` now wakes early when a SUBTASK (child session) you started ends** (2026-10-28 ruling, spec §64: the wait is a true blocking await — a one-shot deadline timer + event subscription, no polling). At arm, the in-flight subtasks of this session are snapshotted once; when one of them goes terminal (`session.idle` / execution succeeded / failed / interrupted), the pending wait resolves immediately — the deadline timer stops, the host clock shell is killed, the window closes, and the tool returns `wait interrupted: subtask ses_… ended — check its result` (the loop gets no separate wake — the tool return is the wake). The full `goal_wait` early-return set is now: deadline / user message / another shell of this session ends / **a subtask session ends** / the wait is cancelled. Only subtasks running at arm time can wake the wait — one spawned mid-wait is invisible. Real-host verified on 2.2.0: `verify-wait.ts` W10 (background subagent + 4-min wait → early subtask return + decision-log fingerprint).
