@@ -983,3 +983,9 @@ goal_wait(minutes, background=false)   [codemode: true —— 12 个 goal 工具
 
 **测试**：stub（挂起/期限返回/用户消息提前/其它 shell 提前/killed 提前/background 回归/重载兜底不双发）+ `verify-wait.ts` 真宿主扩展（2.1.4 隔离宿主：goal_wait(1) 挂起 60s 实测 + 等待中用户消息提前返回 + 决策指纹行）。
 **发布**：1.1.13（含 §59 遗留的 sweep waitUntil 回填，若同批落地）。
+
+## 61. 2026-10-27 裁定 — 建目标默认无预算 + 前台 shell 转后台阈值 10 分钟
+
+1. **建立目标默认不限制预算**：defaultCapTurns / defaultCapTokens 两个插件选项**移除**（旧配置键失效，同 wakeDetail 纪律）。预算只来自显式输入（/goal set --turns N --tokens N / goal_set 的 turns/tokens/unbounded 参数）。
+   起因（129，2026-10-27）：用户"取消预算限制"前，g_mvph90a1_0（500K-IMA 修复，长时无人值守）被 129 配置里的 defaultCapTurns: 10 在第 10 轮以 udget_limited 静默终止——工作完成前数小时熄火，用户才发现。默认值不应替用户做"这活干 10 轮该停了"的决定。
+2. **前台任务检查（§52 转后台阈值）默认 30min → 10min**：oregroundShellBackgroundMs 默认 600000。前台阻塞 shell 挂 30 分钟才转后台 + 通知，等于卡死 30 分钟循环；10 分钟足够合法长任务，又能让 hang 住的前台 shell 在半小时内把循环救回来（§52 语义不变：转后台 + 宿主 synthetic 释放阻塞 turn + 插件即时通知）。

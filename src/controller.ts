@@ -2801,11 +2801,15 @@ export class GoalController {
     }
     const objective = objectiveParts.join(" ");
     if (objective === "") return { text: "missing objective: /goal set <objective> [--turns N] [--tokens N] [--unbounded]", ok: false };
+    // 2026-10-27 ruling: goal creation defaults to NO budget — a cap only
+    // ever comes from explicit input (--turns/--tokens; unbounded = {}).
+    // (defaultCapTurns/defaultCapTokens options removed: 129's configured
+    // default silently ended a long goal at turn 10.)
     const cap: GoalRecord["cap"] = unbounded
       ? {}
       : {
-          turns: turns ?? this.options.defaultCapTurns,
-          tokens: tokenCap ?? this.options.defaultCapTokens,
+          turns,
+          tokens: tokenCap,
         };
     return this.setGoal(sessionID, objective, cap);
   }
@@ -2863,11 +2867,15 @@ export class GoalController {
       }
       unbounded = true;
     }
+    // 2026-10-27 ruling: goal creation defaults to NO budget — a cap only
+    // ever comes from explicit input (--turns/--tokens; unbounded = {}).
+    // (defaultCapTurns/defaultCapTokens options removed: 129's configured
+    // default silently ended a long goal at turn 10.)
     const cap: GoalRecord["cap"] = unbounded
       ? {}
       : {
-          turns: turns ?? this.options.defaultCapTurns,
-          tokens: tokenCap ?? this.options.defaultCapTokens,
+          turns,
+          tokens: tokenCap,
         };
     return (await this.setGoal(sessionID, rec.objective, cap)).text;
   }

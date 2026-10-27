@@ -2,13 +2,12 @@
 
 export interface Options {
   stallLimit: number;
-  /** 2026-10-20 ruling: goals are UNBOUNDED by default (no default cap).
-   *  Explicit opt-in: when set (positive integer), goal_set / `/goal set`
-   *  without an explicit turns value caps at this. */
-  defaultCapTurns?: number;
-  /** 2026-10-16 ruling: tokens are statistics by default — no token cap unless
-   *  explicitly set (this option or `--tokens`). */
-  defaultCapTokens?: number;
+  // defaultCapTurns / defaultCapTokens were REMOVED (2026-10-27 ruling):
+  // goal creation is UNBOUNDED by default, and a cap only ever comes from an
+  // explicit --turns/--tokens (or goal_set turns/tokens) input. Legacy config
+  // keys are ignored like wakeDetail (2026-10-20). Motivating incident: 129's
+  // `defaultCapTurns: 10` silently ended a long-running 500K-IMA fix goal at
+  // turn 10 (budget_limited) hours before the work was done.
   judgeEnabled: boolean;
   judgeMaxPerGoal: number;
   watchdogTickMs: number;
@@ -22,8 +21,9 @@ export interface Options {
    * session that runs longer than this is moved to background observation via
    * the host's session.background endpoint (the Ctrl+B server action — the work
    * keeps running; the host injects its own synthetic so the blocked turn is
-   * released). 0 = disabled. Default 30 min. The only numeric option that
-   * accepts 0. */
+   * released). 0 = disabled. Default 10 min (2026-10-27 ruling: shortened from
+   * 30 min — a hung foreground shell must not freeze the loop for half an
+   * hour). The only numeric option that accepts 0. */
   foregroundShellBackgroundMs: number;
   /** §54 (2026-10-22 ruling): the §52 immediate-notice command text is
    * truncated to this many characters (newlines flattened to spaces). 0 = no
@@ -53,8 +53,9 @@ export interface Options {
 
 const DEFAULT_OPTIONS: Options = {
   stallLimit: 3,
-  // 2026-10-20 ruling: no default cap — goals are unbounded unless the user
-  // opts in via defaultCapTurns / defaultCapTokens or an explicit flag.
+  // 2026-10-27 ruling: goal creation is UNBOUNDED by default — no default cap
+  // options exist anymore (defaultCapTurns/defaultCapTokens removed; a cap
+  // only ever comes from explicit --turns/--tokens or goal_set input).
   // 2026-10-17 ruling: default OFF. The side-channel judge's only exclusive
   // value is rescuing a stalled goal (continue + instruction); its failure
   // mode degrades to exactly the no-judge behavior (fail-closed → stalled),
@@ -66,9 +67,9 @@ const DEFAULT_OPTIONS: Options = {
   watchdogTickMs: 30000,
   checkInDelaySec: 300,
   timeoutWrap: false,
-  // §52: 30 min — long enough for legitimate blocking shells, short enough
-  // that a hung one cannot freeze the goal loop for the rest of the night.
-  foregroundShellBackgroundMs: 30 * 60 * 1000,
+  // §52: 10 min (2026-10-27 ruling, shortened from 30) — a hung foreground
+  // shell must not freeze the goal loop for half an hour.
+  foregroundShellBackgroundMs: 10 * 60 * 1000,
   // §54: 300 chars — enough to identify what the shell was doing without
   // dumping a multi-page script into one message line.
   foregroundNoticeCommandChars: 300,
@@ -86,11 +87,6 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
   const num = (key: string, fallback: number): number => {
     const v = o[key];
     return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : fallback;
-  };
-  // Optional numeric field: positive integer or undefined (no fallback).
-  const numOpt = (key: string): number | undefined => {
-    const v = o[key];
-    return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : undefined;
   };
   // Boolean fields accept only boolean literals; anything else falls back.
   const bool = (key: string, fallback: boolean): boolean =>
@@ -113,8 +109,6 @@ export function resolveOptions(pluginOptions: Record<string, unknown>): Options 
 
   return {
     stallLimit: num("stallLimit", DEFAULT_OPTIONS.stallLimit),
-    defaultCapTurns: numOpt("defaultCapTurns"),
-    defaultCapTokens: numOpt("defaultCapTokens"),
     judgeEnabled: bool("judgeEnabled", DEFAULT_OPTIONS.judgeEnabled),
     judgeMaxPerGoal: num("judgeMaxPerGoal", DEFAULT_OPTIONS.judgeMaxPerGoal),
     watchdogTickMs: num("watchdogTickMs", DEFAULT_OPTIONS.watchdogTickMs),

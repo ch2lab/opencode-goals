@@ -3,8 +3,6 @@ import { resolveOptions, parseModelRef, selectJudgeModel, type Options } from ".
 
 const EXPECTED_DEFAULTS: Options = {
   stallLimit: 3,
-  defaultCapTurns: undefined, // 2026-10-20 ruling: unbounded by default (explicit opt-in only)
-  defaultCapTokens: undefined,
   judgeEnabled: false,
   judgeMaxPerGoal: 1,
   watchdogTickMs: 30000,
@@ -12,7 +10,7 @@ const EXPECTED_DEFAULTS: Options = {
   timeoutWrap: false,
   providerFailLimit: 2,
   providerPauseMs: 30 * 60 * 1000,
-  foregroundShellBackgroundMs: 30 * 60 * 1000, // §52 (0 = disabled is a valid value)
+  foregroundShellBackgroundMs: 10 * 60 * 1000, // §52 (0 = disabled is a valid value); 2026-10-27: 30 → 10 min
   foregroundNoticeCommandChars: 300, // §54 (0 = no command text is a valid value)
   livenessMs: 5 * 60_000, // §54: §50 windows option ized
   livenessCheckMs: 30_000,
@@ -22,8 +20,6 @@ const EXPECTED_DEFAULTS: Options = {
 test("empty input yields every default exactly", () => {
   const o = resolveOptions({});
   expect(o.stallLimit).toBe(3);
-  expect(o.defaultCapTurns).toBeUndefined(); // unbounded by default
-  expect(o.defaultCapTokens).toBeUndefined();
   expect(o.judgeEnabled).toBe(false);
   expect(o.judgeMaxPerGoal).toBe(1);
   expect(o.watchdogTickMs).toBe(30000);
@@ -31,7 +27,7 @@ test("empty input yields every default exactly", () => {
   expect(o.timeoutWrap).toBe(false);
   expect(o.providerFailLimit).toBe(2);
   expect(o.providerPauseMs).toBe(30 * 60 * 1000);
-  expect(o.foregroundShellBackgroundMs).toBe(30 * 60 * 1000); // §52: 30 min default
+  expect(o.foregroundShellBackgroundMs).toBe(10 * 60 * 1000); // §52: 10 min default (2026-10-27)
   expect(o.foregroundNoticeCommandChars).toBe(300); // §54
   expect(o.livenessMs).toBe(5 * 60 * 1000); // §54
   expect(o.livenessCheckMs).toBe(30_000); // §54
@@ -42,9 +38,9 @@ test("empty input yields every default exactly", () => {
 test("§52: foregroundShellBackgroundMs — 0 is a valid value (disabled); non-integers fall back", () => {
   expect(resolveOptions({ foregroundShellBackgroundMs: 0 }).foregroundShellBackgroundMs).toBe(0);
   expect(resolveOptions({ foregroundShellBackgroundMs: 5000 }).foregroundShellBackgroundMs).toBe(5000);
-  expect(resolveOptions({ foregroundShellBackgroundMs: -1 }).foregroundShellBackgroundMs).toBe(30 * 60 * 1000);
-  expect(resolveOptions({ foregroundShellBackgroundMs: 1.5 }).foregroundShellBackgroundMs).toBe(30 * 60 * 1000);
-  expect(resolveOptions({ foregroundShellBackgroundMs: "30000" }).foregroundShellBackgroundMs).toBe(30 * 60 * 1000);
+  expect(resolveOptions({ foregroundShellBackgroundMs: -1 }).foregroundShellBackgroundMs).toBe(10 * 60 * 1000);
+  expect(resolveOptions({ foregroundShellBackgroundMs: 1.5 }).foregroundShellBackgroundMs).toBe(10 * 60 * 1000);
+  expect(resolveOptions({ foregroundShellBackgroundMs: "30000" }).foregroundShellBackgroundMs).toBe(10 * 60 * 1000);
 });
 
 test("§54: foregroundNoticeCommandChars — 0 is valid (no command text); non-integers fall back", () => {
@@ -66,8 +62,6 @@ test("§54: livenessMs / livenessCheckMs — positive integers take effect, inva
 test("partial overrides take effect, the rest stay default", () => {
   const o = resolveOptions({
     stallLimit: 5,
-    defaultCapTurns: 20,
-    defaultCapTokens: 250000,
     judgeEnabled: false,
     judgeMaxPerGoal: 2,
     watchdogTickMs: 15000,
@@ -75,8 +69,6 @@ test("partial overrides take effect, the rest stay default", () => {
     wakeText: "continue the goal",
   });
   expect(o.stallLimit).toBe(5);
-  expect(o.defaultCapTurns).toBe(20);
-  expect(o.defaultCapTokens).toBe(250000);
   expect(o.judgeEnabled).toBe(false);
   expect(o.judgeMaxPerGoal).toBe(2);
   expect(o.watchdogTickMs).toBe(15000);
@@ -87,16 +79,19 @@ test("partial overrides take effect, the rest stay default", () => {
 test("non-number / invalid numeric input falls back to defaults", () => {
   const o = resolveOptions({
     stallLimit: "3",
-    defaultCapTurns: 10.5,
-    defaultCapTokens: null,
     judgeMaxPerGoal: 0,
     watchdogTickMs: -1,
   });
   expect(o.stallLimit).toBe(3);
-  expect(o.defaultCapTurns).toBeUndefined(); // invalid input -> no cap (unbounded), not a fallback
-  expect(o.defaultCapTokens).toBeUndefined();
   expect(o.judgeMaxPerGoal).toBe(1);
   expect(o.watchdogTickMs).toBe(30000);
+});
+
+test("2026-10-27 ruling: legacy defaultCapTurns/defaultCapTokens config keys are IGNORED — goal creation is unbounded by default (cap only via explicit --turns/--tokens)", () => {
+  // 129 incident: a configured defaultCapTurns: 10 silently ended a long
+  // unattended goal at turn 10. The options no longer exist; stale config
+  // keys are inert (same discipline as the removed wakeDetail key).
+  expect(resolveOptions({ defaultCapTurns: 10, defaultCapTokens: 100000 })).toEqual(EXPECTED_DEFAULTS);
 });
 
 test("stallLimit accepts integers >= 1 only", () => {
