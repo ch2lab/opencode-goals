@@ -277,3 +277,43 @@ test("B10: incident regression — an OWN injectWake enqueued mid-wait (the wake
   expect(reply).toContain("user message");
   await stop();
 });
+
+test("B11: §64 a snapshotted subtask session goes terminal mid-wait — its event returns the wait EARLY ('subtask … ended'); the deadline timer stops, the clock shell is killed, the window closes", async () => {
+  const { h, stop } = await boot();
+  await armGoal(h);
+  // A subtask in flight AT ARM (parentID chain + active map — the §51 query).
+  h.setSession("ses_subtask", { location: { directory: "/w" }, parentID: S });
+  h.setActiveSessions({ [S]: "running", ses_subtask: "running" });
+  const p = fireWait(h);
+  await sleep(100); // armed: the snapshot contains ses_subtask
+  // The subtask's turn ends — the host emits its terminal boundary.
+  await h.emit({ type: "session.idle", id: "b11a", properties: { sessionID: "ses_subtask" } });
+  const reply = await p;
+  expect(reply).toContain("subtask");
+  expect(reply).toContain("ses_subtask");
+  expect(reply).toContain("ended");
+  expect(goalOf(h).waitUntil).toBeUndefined(); // early exit closes the window (no ghost deadline)
+  expect(h.shellKillCalls).toContain(clockShell(h)); // the clock does not outlive the wait
+  await sleep(400);
+  expect(h.prompts.length).toBe(0); // no loop wake — the tool return is the wake
+  await stop();
+});
+
+test("B12: §64 snapshot semantics — a subtask started AFTER the arm is invisible to the wait (no spurious wake); the clock's natural exit still owns the deadline return", async () => {
+  const { h, stop } = await boot();
+  await armGoal(h);
+  const p = fireWait(h);
+  await sleep(100); // armed: the snapshot is EMPTY (no subtask at arm)
+  // A subtask appears mid-wait, then ends — it must NOT wake the wait.
+  h.setSession("ses_late", { location: { directory: "/w" }, parentID: S });
+  h.setActiveSessions({ [S]: "running", ses_late: "running" });
+  await h.emit({ type: "session.idle", id: "b12a", properties: { sessionID: "ses_late" } });
+  await sleep(150);
+  expect(h.shellKillCalls).toEqual([]); // still hanging — the late subtask is not in the snapshot
+  // The clock shell's natural exit returns the deadline as before.
+  await h.emit({ type: "shell.exited", id: "b12b", properties: { id: clockShell(h), exit: 0, status: "exited" } });
+  const reply = await p;
+  expect(reply).toContain("wait complete");
+  expect(goalOf(h).waitWakeSent).toBe(true);
+  await stop();
+});

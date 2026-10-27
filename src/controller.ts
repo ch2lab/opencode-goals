@@ -296,8 +296,8 @@ export class GoalController {
   /** §60: in-flight BLOCKING goal_wait — the tool handler's await state. The
    * host-side `sleep` shell is the clock; the persisted waitUntil is the
    * reload fallback; resolve() comes from an event handler (user input /
-   * shell exit) or the JS fallback timer. One per session (a turn holds at
-   * most one tool call). */
+   * shell exit / §64 subtask terminal) or the JS fallback timer. One per
+   * session (a turn holds at most one tool call). */
   private pendingWaits = new Map<
     string,
     {
@@ -305,7 +305,13 @@ export class GoalController {
       due: number;
       timer: ReturnType<typeof setTimeout>;
       shells: Set<string>; // session shells created during the wait (shell.created)
-      resolve: (r: { reason: "deadline" | "user" | "shell" | "cancelled"; shellID?: string; exit?: number }) => void;
+      tasks: Set<string>; // §64: subtask sessions in flight AT ARM — their terminal events wake the wait
+      resolve: (r: {
+        reason: "deadline" | "user" | "shell" | "task" | "cancelled";
+        shellID?: string;
+        taskID?: string;
+        exit?: number;
+      }) => void;
     }
   >();
   /** warn-once set: shell-store query failures (safe direction keeps the gate armed). */
@@ -552,9 +558,8 @@ export class GoalController {
         // goal_next_step = the model's mid-work recorder (the only tool the
         // model is expected to call spontaneously during work); the other
         // eleven are lifecycle/management — all twelve share
-        // GOAL_TOOL_OPTIONS (gate + goal namespace). §60: goal_wait is the
-        // one exception to native-only exposure (codemode:true, its
-        // registration below).
+        // GOAL_TOOL_OPTIONS (gate + goal namespace, codemode:false — ONE
+        // native surface for every goal tool, §63).
         ...GOAL_TOOL_OPTIONS,
         run: (input, sessionID) => this.guarded("goal_next_step", () => this.toolNextStep(sessionID, input)),
       },
@@ -563,7 +568,8 @@ export class GoalController {
         description:
           "Wait up to N minutes (integer 1..60) — a BLOCKING call by default: it does not return until the " +
           "deadline OR an event returns it early: a user message arrives, another shell of this session ends, " +
-          "or the wait is cancelled (its wait shell is killed). The result says which happened. " +
+          "a subtask session you started while waiting ends, or the wait is cancelled (its wait shell is killed). " +
+          "The result says which happened. " +
           "No polling: set minutes to your real expected duration and let the call hang. " +
           "background=true keeps the classic non-blocking window (returns immediately; the loop re-wakes you " +
           "at the deadline with a 'Goal wait period ended' notice). " +
@@ -576,12 +582,19 @@ export class GoalController {
           },
           required: ["minutes"],
         },
-        // §60: the ONLY goal tool catalogued for Code Mode (codemode:true) —
-        // the model composes `await tools.goal.wait(...)` / Promise.race in
-        // execute() (host Code Mode has no default timeout). The other eleven
-        // lifecycle tools stay GOAL_TOOL_OPTIONS (codemode:false, native).
+        // §63 (2026-10-28, 178 incident): unified NATIVE surface — no
+        // codemode override: goal_wait inherits codemode:false from
+        // GOAL_TOOL_OPTIONS like the other eleven. The §60 codemode:true
+        // exception (sole Code Mode catalog entry) is REMOVED: the two-surface
+        // split made models call the native goal tools INSIDE Code Mode and
+        // eat "Unknown tool" walls (178: goal_view/set/complete deemed
+        // "unavailable in this runtime"). The blocking semantics (race:
+        // deadline / user message / other-shell ended / subtask ended / clock
+        // killed) live in toolWait and are surface-independent; long native
+        // blocking is
+        // verified on a real host (scripts/verify-native-wait.ts — no host
+        // timeout kill).
         ...GOAL_TOOL_OPTIONS,
-        codemode: true,
         run: (input, sessionID) => this.guarded("goal_wait", () => this.toolWait(sessionID, input)),
       },
       {
@@ -1104,9 +1117,11 @@ export class GoalController {
         // session.idle is a valid terminal boundary (brief ruling): the
         // payload carries sessionID (schema/dist/event-manifest.d.ts:
         // session.idle data = { sessionID }, ephemeral) — not unreliable.
+        this.taskTerminalWake(sessionID, event.type); // §64: snapshotted subtask ended → wake its parent's wait
         await this.arbitrateBoundary(sessionID, event);
         return;
       case "session.execution.interrupted":
+        this.taskTerminalWake(sessionID, event.type); // §64: an interrupted subtask ended too
         await this.onInterrupted(sessionID, event);
         return;
       // session.shell.* (session-scoped model shells) are no longer consumed
@@ -3355,12 +3370,27 @@ export class GoalController {
   // waitUntil (§57) is the reload fallback for the same deadline.
   // ------------------------------------------------------------------
 
+  /** §64 (2026-10-28 ruling): a snapshotted SUBTASK session went terminal
+   * (execution succeeded/failed, idle, interrupted) → resolve the waiting
+   * parent's BLOCKING wait NOW. Pure event-driven (no polling): the wait's
+   * one-shot deadline timer stops and the host clock shell is killed inside
+   * resolveWait. Only subtasks running AT ARM are in the snapshot — a
+   * session started mid-wait cannot wake the wait. */
+  private taskTerminalWake(subtaskID: string, type: string): void {
+    for (const [parent, wait] of this.pendingWaits) {
+      if (wait.tasks.has(subtaskID)) {
+        void this.resolveWait(parent, { reason: "task", taskID: subtaskID }, type);
+        return;
+      }
+    }
+  }
+
   /** §60: one-shot resolution of a pending BLOCKING wait. Safe to call from
    * event handlers, the tick store scan, the fallback timer, and interrupts:
    * whoever deletes the entry first wins, later calls are no-ops. */
   private async resolveWait(
     sessionID: string,
-    r: { reason: "deadline" | "user" | "shell" | "cancelled"; shellID?: string; exit?: number },
+    r: { reason: "deadline" | "user" | "shell" | "task" | "cancelled"; shellID?: string; taskID?: string; exit?: number },
     detail?: string,
   ): Promise<void> {
     const wait = this.pendingWaits.get(sessionID);
@@ -3400,7 +3430,7 @@ export class GoalController {
       sessionID,
       ownKnown: true,
       decision: "wait",
-      reason: `resolved (${r.reason}${r.shellID !== undefined ? `; shell ${r.shellID}` : ""}${r.exit !== undefined ? `; exit ${r.exit}` : ""}${detail ? `; ${detail}` : ""})`,
+      reason: `resolved (${r.reason}${r.shellID !== undefined ? `; shell ${r.shellID}` : ""}${r.taskID !== undefined ? `; subtask ${r.taskID}` : ""}${r.exit !== undefined ? `; exit ${r.exit}` : ""}${detail ? `; ${detail}` : ""})`,
     });
     wait.resolve(r);
   }
@@ -3475,6 +3505,7 @@ export class GoalController {
     // kill IS the cancellation). Fire/claim failure degrades to timer-only.
     let shellID = "";
     let shells = new Set<string>();
+    let tasks = new Set<string>();
     try {
       const session = await this.probe.sessionGet(sessionID);
       const directory = session?.location?.directory ?? this.probe.locationDirectory;
@@ -3498,25 +3529,43 @@ export class GoalController {
         if (shellID === "") {
           console.warn(`opencode-goal: §60 wait clock shell not found in the store (timer-only fallback)`);
         }
+        // §64: snapshot the in-flight subtasks ONCE at arm (one query — not a
+        // per-tick poll): their terminal events are the wait's task wake source.
+        // Query failure = empty snapshot (no task sensor; the clock still owns
+        // the deadline).
+        try {
+          tasks = new Set(await this.listSubtasksInFlight(sessionID, directory));
+        } catch {
+          tasks = new Set();
+        }
       }
     } catch (err) {
       shellID = "";
       shells = new Set();
+      tasks = new Set();
       console.warn(`opencode-goal: §60 wait clock shell fire failed (timer-only fallback):`, err);
     }
 
-    let resolve!: (r: { reason: "deadline" | "user" | "shell" | "cancelled"; shellID?: string; exit?: number }) => void;
-    const result = new Promise<{ reason: "deadline" | "user" | "shell" | "cancelled"; shellID?: string; exit?: number }>(
-      (res) => {
-        resolve = res;
-      },
-    );
+    let resolve!: (r: {
+      reason: "deadline" | "user" | "shell" | "task" | "cancelled";
+      shellID?: string;
+      taskID?: string;
+      exit?: number;
+    }) => void;
+    const result = new Promise<{
+      reason: "deadline" | "user" | "shell" | "task" | "cancelled";
+      shellID?: string;
+      taskID?: string;
+      exit?: number;
+    }>((res) => {
+      resolve = res;
+    });
     // Fallback timer: due + 5s slack — covers a LOST clock-shell event; the
     // persisted waitUntil (tick) covers a dead process.
     const timer = setTimeout(() => {
       void this.resolveWait(sessionID, { reason: "deadline" });
     }, minutes * 60_000 + 5_000);
-    this.pendingWaits.set(sessionID, { shellID, due, timer, shells, resolve });
+    this.pendingWaits.set(sessionID, { shellID, due, timer, shells, tasks, resolve });
     void appendDecision({
       ts: new Date().toISOString(),
       sessionID,
@@ -3534,6 +3583,8 @@ export class GoalController {
         return `wait interrupted: a user message arrived — respond to it now (the wait window is closed).`;
       case "shell":
         return `wait interrupted: shell ${r.shellID ?? "?"} in this session ended (exit ${r.exit ?? "n/a"}) before the ${minutes}-min deadline — check its result.`;
+      case "task":
+        return `wait interrupted: subtask ${r.taskID ?? "?"} in this session ended before the ${minutes}-min deadline — check its result.`;
       case "cancelled":
         return `wait cancelled (the wait shell was killed). The wait window is closed — re-arm with goal_wait if you still need to wait.`;
     }

@@ -1009,3 +1009,31 @@ goal_wait(minutes, background=false)   [codemode: true —— 12 个 goal 工具
 - scripts/probe-steer3.ts（端到端，触发真实 §52→§54）：插件自己注入的 steer 通知 delivered@63s（会话仍 busy），模型 REPORT 确认看见"moved it to background"通知。
 
 **发布**：1.1.15 候选（版本号待用户当轮明令，不自动发布；§54 行为变更，双机播种后旧 queue 通知不再产生）。
+
+## 63. 2026-10-28 裁定 — goal 工具统一单一原生面（goal_wait 去特殊化）
+
+**事故（178，2026-10-27/28）**：模型（deepseek-v4.1-flash）在自己的原生工具列表里看得到 goal_view/set/complete，却持续在 Code Mode（execute → tools.*）里调它们——§60 设计只把 goal.wait 编目进 Code Mode——每次调用撞 "Unknown tool … Did you mean tools.goal.wait?"，最终得出"只有 goal.wait 可调用、其余本 runtime 不可用"的错误结论（并写进 compaction 摘要持久化），回退到 git 归档做纪律记录。本会话实测（同 2.2.0 + 1.1.15）可逐字复现：原生直调 goal_view 成功；Code Mode 里调同形错误。
+
+**裁定（用户 2026-10-28）**：不搞特殊，12 个 goal 工具统一一个面。全 codemode:true 被否——会把 goal_set/view/complete 等"一句话"操作全推去代码面，LLM 最熟的是原生直调（像 shell/read）；**统一 codemode:false（原生面）**。
+
+**前提核验（§60 当年 codemode:true 的两条理由）**：
+1. JS await/race 组合（execute 里 `await tools.goal.wait()`）——nice-to-have；原生面靠"每 turn 重新调用"功能等价（goal 循环本来就是 turn 制的），放弃可接受。
+2. Code Mode 无默认超时（真风险：原生长阻塞 tool call 可能被宿主超时杀）——实证排除：129 生产原生前台 shell 跑过 10–16min 无人杀；verify-wait.ts W8 升级为**原生阻塞 3min**（排除 120s/180s 量级默认超时）+ 全套 resolver（期限/用户消息提前/background 回归）在原生面真宿主回跑。
+
+**改动**：controller.ts goal_wait 注册去掉 `codemode: true`（继承 GOAL_TOOL_OPTIONS 的 codemode:false）；goal-loop.test.ts 期望 12 个全 false（TDD RED→GREEN）；Code Mode 编目从此**不含任何 goal 工具**（"Did you mean tools.goal.wait" 陷阱整类消失）。阻塞语义（race：期限/用户消息/其它 shell 结束/时钟被杀）在 toolWait 内，与面无关，不变。
+
+**发布**：1.1.16。
+
+## 64. 2026-10-28 裁定 — goal_wait 唤醒集加入"任务（子任务 session）结束"（事件驱动，无轮询）
+
+**裁定（用户 2026-10-28）**：goal.wait 真正做成阻塞等待，要允许被任务和 shell 通知唤醒。等待机器的逻辑收敛为三种：① 一次性 Timer（期限，deadline 到点触发 resolve）；② 订阅事件（shell / task）；③ 收到事件 → 停止 Timer → 触发 resolve。**不加 tick 轮询、不加 grace 防抖**（此前草案的"连续 ≥2 tick 不在 running 才唤醒"被否——那是轮询；subagent 是单次 run，其 idle 即终态，瞬态 idle 不成立）。
+
+**实现**：
+- **arm 时（`waitGoalBlocking`）**：快照本会话 in-flight 子任务名单一次（`listSubtasksInFlight` —— parentID 链 + active map，§51 门禁同款查询）。单次查询，非周期性。查询失败 = 空快照（task 传感器失效，期限仍由时钟壳持有）。
+- **事件路**：子任务 session 的终态边界事件（`session.execution.succeeded` / `session.execution.failed` / `session.idle` / `session.execution.interrupted`，全部经 onEvent 的既有归属守卫）→ `taskTerminalWake`：事件 sessionID 命中某个 pending wait 的快照 → `resolveWait(parent, { reason: "task", taskID })` —— resolveWait 内部停一次性 Timer（`clearTimeout`）+ kill 宿主时钟壳 + 关 waitUntil 窗口（提前退出结算，与 shell 提前返回同路径）+ 决策行 `resolved (task; subtask ses_x; session.idle)`。
+- **结果**：`wait interrupted: subtask ses_x in this session ended before the N-min deadline — check its result.`（工具返回即唤醒，loop 不另发 wake）。
+- **快照语义（B12）**：只有 arm 时在 running 的子任务能唤醒；等待期间才 spawn 的子任务对等待不可见（防误唤醒）。
+
+**前提（宿主契约）**：2.2.0 宿主对子任务 session 发终态事件到 server 级事件流（`session.idle` manifest 实证 `data = { sessionID }`；controller onEvent 既有 case）；归属守卫放行（plugin 未设 projectID → `sessionBelongs` 恒 true；子任务与父同 project）。真宿主实证：`verify-wait.ts` W10（background subagent sleep 60 + goal_wait(4) 原生阻塞 → 提前返回 + 决策行指纹 + 时钟壳被 kill）。若 W10 失败（宿主对子任务静默），回退方案 = tick 存储扫描（§56 model-origin shell 同款传感器）——但那是下策，事件路优先。
+
+**发布**：1.1.16（与 §63 同批）。

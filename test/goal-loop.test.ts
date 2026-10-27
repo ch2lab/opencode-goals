@@ -714,12 +714,12 @@ test("10: all twelve goal_* tools register with permission goal.control", async 
   // (codemode:false) and grouped under the `goal` namespace (MCP-server
   // style) — registration names are prefix-free; the host flattens to
   // goal_<name>, so the model-visible names (the map keys above) are unchanged.
-  // §60 revision (2026-10-26): goal_wait is the SOLE Code Mode catalogued
-  // tool (codemode:true) — the model composes its blocking await in
-  // execute(); the other eleven stay native-only.
+  // §63 revision (2026-10-28, 178 incident): the §60 codemode:true exception
+  // for goal_wait is REMOVED — all twelve sit on ONE native surface. The
+  // two-surface split made models call native goal tools inside Code Mode
+  // and eat "Unknown tool" walls (178: goal_view/set/complete "unavailable").
   for (const name of names) {
-    const expectedCodemode = name === "goal_wait";
-    expect(h.tools.get(name)!.spec.codemode, `${name} codemode must be ${expectedCodemode}`).toBe(expectedCodemode);
+    expect(h.tools.get(name)!.spec.codemode, `${name} must be codemode:false (native-only, §63)`).toBe(false);
     expect(h.tools.get(name)!.spec.namespace, `${name} must sit in the goal namespace`).toBe("goal");
   }
   expect(

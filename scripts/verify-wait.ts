@@ -287,16 +287,21 @@ async function main(): Promise<void> {
   // BLOCKS the turn: W8 the full window (host-side sleep clock visible in the
   // shell store mid-wait), W9 an early return on a user message enqueued
   // mid-wait (NOT the 5-minute deadline).
+  // §63 (2026-10-28): goal_wait is now a NATIVE tool (codemode:false) — W8
+  // blocks a full 3 minutes natively to rule out any host-side default tool-
+  // call timeout (the §60 rationale for codemode:true was "Code Mode has no
+  // default timeout"; 129 production precedent: native foreground shells ran
+  // 10–16 min unharmed, but the native WAIT surface needs its own proof).
   const t8 = Date.now();
   await host.api.prompt(
     S,
-    "Automated goal-loop test. Call the goal_wait tool with minutes set to 1 and NO other parameters " +
+    "Automated goal-loop test. Call the goal_wait tool with minutes set to 3 and NO other parameters " +
       "(do NOT set background). This call BLOCKS until it returns — wait for it. " +
       "After it returns, reply with exactly: blocking wait complete — and stop. " +
       "Do NOT call any other tool and do NOT call goal_set/goal_complete/goal_block.",
   );
   // Mid-wait (~15s): the turn is still RUNNING (blocked inside the tool call)
-  // and the clock shell (`sleep 60`) is live in the host shell store.
+  // and the clock shell (`sleep 180`) is live in the host shell store.
   while (Date.now() - t8 < 15_000) await sleep(1000);
   const t8active = (await host.api.sessionActive())[S];
   const t8shells = (await host.api.shellList()) as Array<Record<string, unknown>>;
@@ -305,16 +310,17 @@ async function main(): Promise<void> {
   check("W8b: host-side clock shell live in the shell store mid-wait", t8clock !== undefined, {
     shells: t8shells.map((s) => `${s?.id}:${s?.command}`),
   });
-  const t8saw = await waitUntil(async () => (await assistantText()).includes("blocking wait complete"), WAIT_TIMEOUT_MS);
+  const T8_TIMEOUT_MS = 300_000; // 180s block + generous LLM margin (§63: 3-min native block)
+  const t8saw = await waitUntil(async () => (await assistantText()).includes("blocking wait complete"), T8_TIMEOUT_MS);
   const t8secs = (Date.now() - t8) / 1000;
-  check("W8c: the wait really blocked ~60s before the turn finished", t8saw && t8secs >= 55, {
+  check("W8c: the wait really blocked ~3min (>=170s) before the turn finished — no host timeout kill on the native surface (§63)", t8saw && t8secs >= 170, {
     seconds: Math.round(t8secs),
     tail: t8saw ? undefined : host.stdoutTail().slice(-300),
   });
   // The model may have spontaneously used the (new, default-blocking) tool on
-  // earlier storm turns — match the LATEST 1-min arm and its OWN clock shell.
+  // earlier storm turns — match the LATEST 3-min arm and its OWN clock shell.
   const t8armeds = readDecisions().filter(
-    (e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("armed blocking (1 min"),
+    (e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("armed blocking (3 min"),
   );
   const t8armed = t8armeds[t8armeds.length - 1];
   const t8clockID = t8armed ? String(t8armed.reason).match(/clock (sh_[a-z0-9]+|timer-only)/)?.[1] : undefined;
@@ -377,6 +383,55 @@ async function main(): Promise<void> {
   check("W9d: W9's clock shell was killed (its id is not in the store)", t9clock !== undefined && !t9alive, {
     clock: t9clock,
     shells: t9shells.map((s) => `${s?.id}:${s?.command}`),
+  });
+
+  // W10: §64 TASK WAKE — the model spawns a BACKGROUND subagent (a child
+  // session, ~60s of work) and IMMEDIATELY arms a 4-min blocking wait. The
+  // wait must return EARLY with "subtask … ended" when the child session goes
+  // terminal — proof that the 2.2.0 host emits the child's terminal event and
+  // the plugin resolves the wait from it (no polling). Fails (deadline return)
+  // if the host is silent about subtask sessions.
+  const t10 = Date.now();
+  await host.api.prompt(
+    S,
+    "Automated goal-loop test (subtask wake). Do EXACTLY this, in order:\n" +
+      "1. Call the subagent tool with agent 'general' and background set to TRUE. Its task: " +
+      "'Run the shell command: sleep 60. After it completes, reply with exactly: subagent done. Do nothing else.'\n" +
+      "2. As soon as that call returns (the subagent keeps running in its own session — do NOT wait for it), " +
+      "call the goal_wait tool with minutes set to 4 and NO other parameters. It BLOCKS — wait for its return.\n" +
+      "3. After goal_wait returns, reply with EXACTLY the tool's result text — and stop. " +
+      "Do NOT call any other tool and do NOT call goal_set/goal_complete/goal_block.",
+  );
+  const t10saw = await waitUntil(
+    async () => {
+      const t = await assistantText();
+      return t.includes("subtask") && t.includes("ended");
+    },
+    300_000, // 240s deadline + margin
+  );
+  const t10secs = (Date.now() - t10) / 1000;
+  check("W10a: the blocking wait returned EARLY on the subtask's end — the model's reply carries the tool result", t10saw, {
+    seconds: Math.round(t10secs),
+    tail: t10saw ? undefined : host.stdoutTail().slice(-300),
+  });
+  check("W10b: well under the 4-min deadline (subtask ~60s + margin) — the wake is the event, not the clock", t10saw && t10secs < 200, {
+    seconds: Math.round(t10secs),
+  });
+  const t10armed = (
+    readDecisions().filter((e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("armed blocking (4 min"))
+  ).at(-1);
+  const t10resolved = readDecisions().find(
+    (e) => e.sessionID === S && e.decision === "wait" && String(e.reason).includes("resolved (task; subtask ses_"),
+  );
+  check("W10c: decision log fingerprint — 'armed blocking (4 min)' + 'resolved (task; subtask ses_…)'", t10armed !== undefined && t10resolved !== undefined, {
+    armed: t10armed?.reason,
+    resolved: t10resolved?.reason,
+  });
+  const t10clock = t10armed ? String(t10armed?.reason).match(/clock (sh_[a-z0-9]+)/)?.[1] : undefined;
+  const t10shells = (await host.api.shellList()) as Array<Record<string, unknown>>;
+  check("W10d: W10's clock shell was killed on the early return (not in the store)", t10clock !== undefined && !t10shells.some((s) => s?.id === t10clock), {
+    clock: t10clock,
+    shells: t10shells.map((s) => `${s?.id}:${s?.command}`),
   });
 
   await host.stop();

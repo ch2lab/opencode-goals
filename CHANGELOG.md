@@ -7,6 +7,14 @@
 - 语言：**英文**（2026-10-22 裁定，适用于此后所有新版本：小节用 `### Added` / `### Fixed` / `### Optimizations & Design` / `### Verification`）；[1.1.7] 及更早章节保留原文。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
+## [Unreleased]
+
+### Added
+- **`goal_wait` now wakes early when a SUBTASK (child session) you started ends** (2026-10-28 ruling, spec §64: the wait is a true blocking await — a one-shot deadline timer + event subscription, no polling). At arm, the in-flight subtasks of this session are snapshotted once; when one of them goes terminal (`session.idle` / execution succeeded / failed / interrupted), the pending wait resolves immediately — the deadline timer stops, the host clock shell is killed, the window closes, and the tool returns `wait interrupted: subtask ses_… ended — check its result` (the loop gets no separate wake — the tool return is the wake). The full `goal_wait` early-return set is now: deadline / user message / another shell of this session ends / **a subtask session ends** / the wait is cancelled. Only subtasks running at arm time can wake the wait — one spawned mid-wait is invisible. Real-host verified on 2.2.0: `verify-wait.ts` W10 (background subagent + 4-min wait → early subtask return + decision-log fingerprint).
+
+### Optimizations & Design
+- **All twelve goal tools now sit on ONE native tool surface — the §60 `codemode: true` exception for `goal_wait` is REMOVED** (2026-10-28 ruling, spec §63; motivating incident: 192.168.8.178, where a model saw `goal_view`/`goal_set`/`goal_complete` in its native tool list but kept calling them INSIDE Code Mode — where only `goal.wait` was catalogued — ate "Unknown tool" walls, and baked "unavailable in this runtime" into its compaction summary). `goal_wait` is now a regular native tool like the other eleven: direct tool call, unchanged blocking semantics (race: deadline / user message / other-shell ended / clock killed — the resolvers live in the plugin and are surface-independent). The Code Mode catalog contains NO goal tools anymore, so the "Did you mean tools.goal.wait" trap is gone by construction. Long native blocking verified on a real 2.2.0 host: `verify-wait.ts` W8 now blocks 3 minutes natively (no host timeout kill; 129 production precedent: native foreground shells ran 10–16 min unharmed).
+
 ## [1.1.15] - 2026-10-27
 
 ### Fixed
