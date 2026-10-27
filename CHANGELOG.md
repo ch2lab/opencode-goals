@@ -7,7 +7,7 @@
 - 语言：**英文**（2026-10-22 裁定，适用于此后所有新版本：小节用 `### Added` / `### Fixed` / `### Optimizations & Design` / `### Verification`）；[1.1.7] 及更早章节保留原文。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
-## [Unreleased]
+## [1.1.14] - 2026-10-27
 
 ### Optimizations & Design
 - **Goal creation is UNBOUNDED by default — the `defaultCapTurns` / `defaultCapTokens` plugin options are REMOVED** (2026-10-27 ruling; motivating incident: 129's configured `defaultCapTurns: 10` silently ended a long unattended 500K-IMA fix goal at turn 10 — `budget_limited` — hours before the work was done). A cap now only ever comes from explicit input (`--turns N` / `--tokens N` on `/goal set`, or `turns`/`tokens` in `goal_set`); stale config keys are inert (same discipline as the earlier `wakeDetail` removal).
