@@ -7,7 +7,7 @@
 - 语言：**英文**（2026-10-22 裁定，适用于此后所有新版本：小节用 `### Added` / `### Fixed` / `### Optimizations & Design` / `### Verification`）；[1.1.7] 及更早章节保留原文。
 - npm publish 成功后，CI 自动创建 GitHub Release：标题 `vX.Y.Z`，正文 = 本章内容（重跑幂等 edit）。
 
-## [Unreleased]
+## [1.1.15] - 2026-10-27
 
 ### Fixed
 - **The §54 foreground-shell auto-background notice no longer parks forever in an active goal session** (2026-10-27, 129 incident: the "moved it to background automatically" reminder sat in the queue and never reached the model while the goal loop kept the session busy). The notice is now injected with `delivery: "steer"` instead of `delivery: "queue"`. Steer lands at the step boundary where `session.background` releases the blocked turn — while the session is still BUSY (the model proceeds into goal_wait / keeps working). A `queue` delivery waits for an idle that a busy goal session never offers, so the old notice parked indefinitely. Other watchdog wakes (goal_wait expiry, provider-pause retry, boundary wake) keep `queue` — they target a STOPPED (idle) session, where queue is correct. Verified live on a 2.2.0 host: `scripts/probe-steer2.ts` (steer delivered into a busy session mid-turn, queue parked until idle, the model reported it only "received" the steer) and `scripts/probe-steer3.ts` (the plugin's real §52→§54 path: the steer notice was delivered and the model confirmed it saw it).
