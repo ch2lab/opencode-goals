@@ -907,9 +907,15 @@ export class GoalController {
           );
           // §54 (2026-10-22 ruling): the host's own synthetic releases the
           // blocked turn, but the USER ruled for an IMMEDIATE plugin notice
-          // too — one per shell, via the watchdog wake path (delivery "queue":
-          // if the host's turn is not released yet it simply lines up behind
-          // the host's synthetic — accepted).
+          // too — one per shell, via the watchdog wake path. 2026-10-27
+          // (129 incident, spec §62): delivery "steer", not "queue" — the
+          // notice lands at the step boundary when session.background just
+          // released the turn, while the session is STILL BUSY (the model
+          // proceeds into goal_wait / keeps working). A "queue" delivery
+          // waits for an idle a busy goal session never offers, so the notice
+          // parked forever (the 129 500K-IMA incident). Verified live on 2.2.0:
+          // scripts/probe-steer2.ts (steer delivered mid-turn at a busy
+          // session; the model replied it only "received" the steer).
           await this.deliverWatchdogWake(
             goal,
             foregroundBackgroundNoticeText(
@@ -920,6 +926,7 @@ export class GoalController {
               this.durationLabel(cap),
             ),
             `foreground shell auto-backgrounded (cap ${this.durationLabel(cap)})`,
+            "steer",
           );
         } catch (err) {
           // NOT added to the dedupe set: a failed POST retries on the next scan.
@@ -2620,10 +2627,22 @@ export class GoalController {
    * "唤醒注入仍置 pending") with the watchdog flag so the boundary fast path
    * can keep normal arbitration for a reply to OUR wake.
    */
-  private async deliverWatchdogWake(goal: GoalRecord, text: string, reason: string): Promise<void> {
+  private async deliverWatchdogWake(
+    goal: GoalRecord,
+    text: string,
+    reason: string,
+    delivery: "steer" | "queue" = "queue",
+  ): Promise<void> {
     // Task 14 Fix 3a note: this wake path (check-in / shell exit / lost) uses
     // its own watchdog text family — options.wakeText intentionally does NOT
     // apply here (ruling: check-in wakes are independent copy).
+    // 2026-10-27 ruling (129 incident): delivery is now a parameter. Most
+    // watchdog wakes target an IDLE (stopped) session → "queue" is correct
+    // (default). The §54 auto-background notice is the exception: it is
+    // injected at the step boundary when session.background releases the
+    // blocked turn, while the session is still BUSY (the model proceeds into
+    // goal_wait / keeps working) — "queue" would park it forever, so it uses
+    // "steer" (verified live on 2.2.0: probe-steer2.ts).
     const sessionID = goal.sessionID;
     goal.used.turns += 1;
     goal.continuations += 1;
@@ -2631,7 +2650,7 @@ export class GoalController {
       const ref = await this.probe.prompt({
         sessionID,
         text,
-        delivery: "queue",
+        delivery,
         metadata: { goalControl: true },
       });
       this.lastInbox.set(sessionID, { id: ref.id, kind: "wake", goalID: goal.id, watchdog: true });

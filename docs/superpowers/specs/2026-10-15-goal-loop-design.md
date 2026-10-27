@@ -989,3 +989,23 @@ goal_wait(minutes, background=false)   [codemode: true —— 12 个 goal 工具
 1. **建立目标默认不限制预算**：defaultCapTurns / defaultCapTokens 两个插件选项**移除**（旧配置键失效，同 wakeDetail 纪律）。预算只来自显式输入（/goal set --turns N --tokens N / goal_set 的 turns/tokens/unbounded 参数）。
    起因（129，2026-10-27）：用户"取消预算限制"前，g_mvph90a1_0（500K-IMA 修复，长时无人值守）被 129 配置里的 defaultCapTurns: 10 在第 10 轮以 udget_limited 静默终止——工作完成前数小时熄火，用户才发现。默认值不应替用户做"这活干 10 轮该停了"的决定。
 2. **前台任务检查（§52 转后台阈值）默认 30min → 10min**：oregroundShellBackgroundMs 默认 600000。前台阻塞 shell 挂 30 分钟才转后台 + 通知，等于卡死 30 分钟循环；10 分钟足够合法长任务，又能让 hang 住的前台 shell 在半小时内把循环救回来（§52 语义不变：转后台 + 宿主 synthetic 释放阻塞 turn + 插件即时通知）。
+
+## 62. 2026-10-27 裁定 — §54 自动后台通知 queue → steer（129 事故：通知永久 parked）
+
+**事故（129，2026-10-27）**：SM70x8 dev goal 的前台 shell（ab_topk_fast_500k.sh）跑超 10min 阈值，§52 成功转后台（turn 释放、shell 后台跑完、决策日志有 watchdog 行）。但 §54 即时通知（delivery:"queue"）一直 parked 在 inbox 投不出去——goal 循环（连续 goal_wait）让会话持续 busy、从不 idle，queue 投递等的是永不来的 idle。通知内容也变陈旧（让模型"等完成通知"，可 shell 早跑完了）。用户反馈："这条提醒一直在队列中发不出去，界面状态还是阻塞"。
+
+**诊断（delivery 语义，2.2.0 实机实证）**：
+- queue = 会话 idle 时投递。busy 的 goal 会话（连续 goal_wait）无 idle 窗口 → queue 永久 parked。
+- steer = 投递进正在跑的 execution 的 step 边界（会话 busy 也能到模型眼前）。
+- **关键**：turn 卡在单个工具调用（前台 shell / goal_wait，无 step 边界）时，**steer 也进不去**——steer 和 queue 都等该工具调用返回。所以注入点必须是 step 边界。§54 恰在"session.background 转后台、turn 刚释放"的边界注入，steer 在那里生效。
+
+**裁定**：§54 自动后台通知改 delivery:"steer"。其余 watchdog 唤醒（goal_wait 到期 / provider-pause 重试 / 边界唤醒）面向 idle（已停止）会话，保持 queue（对它们 steer 无益且语义不符）。
+
+**实现**：deliverWatchdogWake 加可选参数 delivery（默认 "queue"），§54 调用点传 "steer"（controller.ts）。test/shell-bg.test.ts T6 断言 §54 通知 delivery==="steer"（RED→GREEN）；顺带修 T5 既有 flake（h.prompts[0] 竞态 → 等特定通知）。
+
+**验证（2.2.0 隔离真宿主，三层）**：
+- scripts/probe-steer.ts（工具调用卡壳）：steer 与 queue 都 parked（无边界）→ 印证"注入必须在边界"。
+- scripts/probe-steer2.ts（事故精确复现）：session.background 后立即注入 → **steer delivered@18s（会话仍 busy running）、queue 全程 parked 直到 idle@81s**，模型只"收到"steer。
+- scripts/probe-steer3.ts（端到端，触发真实 §52→§54）：插件自己注入的 steer 通知 delivered@63s（会话仍 busy），模型 REPORT 确认看见"moved it to background"通知。
+
+**发布**：1.1.15 候选（版本号待用户当轮明令，不自动发布；§54 行为变更，双机播种后旧 queue 通知不再产生）。
